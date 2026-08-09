@@ -1,0 +1,7 @@
+*.py text diff=python
+*.pyi text diff=python
+
+*.pyc binary
+*.pyo binary
+*.pyd binary
+*.so binary
