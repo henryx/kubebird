@@ -1,0 +1,122 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: instances.kubebird.github.io
+spec:
+  group: kubebird.github.io
+  scope: Namespaced
+  names:
+    kind: Instance
+    listKind: InstanceList
+    plural: instances
+    singular: instance
+    shortNames:
+      - fbinst
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Image
+          type: string
+          jsonPath: .spec.image
+        - name: Version
+          type: string
+          jsonPath: .spec.version
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - image
+                - version
+                - databases
+                - storage
+              properties:
+                image:
+                  type: string
+                  description: Container image used for the Firebird instance.
+                version:
+                  type: string
+                  description: Tag of the Firebird image to deploy.
+                databases:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - name
+                    properties:
+                      name:
+                        type: string
+                        description: File name of the database, e.g. "instance.fdb".
+                      shadow:
+                        type: boolean
+                        default: false
+                        description: Whether the database is instantiated in shadow mode.
+                service:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      default: ClusterIP
+                      enum:
+                        - ClusterIP
+                        - NodePort
+                        - LoadBalancer
+                  default:
+                    type: ClusterIP
+                storage:
+                  type: object
+                  required:
+                    - size
+                  properties:
+                    class:
+                      type: string
+                      default: ""
+                      description: StorageClass name. Empty string uses the cluster default StorageClass.
+                    size:
+                      type: string
+                      description: Requested size of the PVC, e.g. "3Gi".
+                authentication:
+                  type: object
+                  properties:
+                    sysdba:
+                      type: object
+                      properties:
+                        secretRef:
+                          type: string
+                          default: ""
+                          description: >-
+                            Name of an existing Secret holding the SYSDBA password.
+                            If empty, the operator generates "<instance-name>-sysdba".
+                    user:
+                      type: object
+                      properties:
+                        secretRef:
+                          type: string
+                          default: ""
+                          description: >-
+                            Name of an existing Secret holding a non-SYSDBA user's
+                            credentials. If empty, no additional user is created.
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Current lifecycle phase of the Instance as observed by the operator.
+                message:
+                  type: string
+                  description: Human-readable detail about the current phase.

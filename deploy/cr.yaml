@@ -1,0 +1,21 @@
+apiVersion: kubebird.github.io/v1
+kind: Instance
+metadata:
+  name: test
+  namespace: default
+spec:
+  image: firebirdsql/firebird
+  version: 3.0.14
+  databases:
+    - name: "instance.fdb"
+      shadow: false
+  service:
+    type: ClusterIP
+  storage:
+    class: "" # if empty, uses the default storage class
+    size: 3Gi
+  authentication:
+    sysdba:
+      secretRef: ""
+    user:
+      secretRef: ""
