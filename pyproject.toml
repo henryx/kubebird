@@ -3,6 +3,14 @@ name = "kubebird"
 version = "0.1.0"
 description = "Kubebird - A Kubernetes operator for Firebird"
 requires-python = ">=3.14"
+authors = [
+    { name = "Enrico Bianchi", email = "enrico.bianchi@gmail.com" }
+]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "kopf>=1.44.6",
 ]
