@@ -10,8 +10,10 @@ Kubebird is a Kubernetes operator, built in Python on top of `kopf`, that instal
 The project is at an early stage but `create_fn` (`src/kubebird/create.py`, `@kopf.on.create(
 kind="Instance", version="v1", group="kubebird.github.io")`) now implements the full reconciliation
 described in "Architecture" below. `kopf` and `kubernetes` (the official Python client) are
-declared dependencies; there is no `on.update`/`on.delete` handler yet (deletion relies entirely on
-Kubernetes garbage-collecting the owned objects via `kopf.adopt()`).
+declared dependencies. `src/kubebird/update.py` also implements two real handlers now (`update_fn`
+for `Instance` spec changes, `sysdba_secret_update_fn` for SYSDBA secret rotations — see
+"Architecture"); `src/kubebird/delete.py` still declares an unimplemented `@kopf.on.delete` stub, so
+deletion still relies entirely on Kubernetes garbage-collecting the owned objects via `kopf.adopt()`.
 
 The implementation is split across three modules:
 - `src/kubebird/k8s.py` — builds the `Secret`/`PersistentVolumeClaim`/`Service`/`StatefulSet`
@@ -20,15 +22,21 @@ The implementation is split across three modules:
 - `src/kubebird/firebird.py` — provisions the instance over `kubectl exec`-style pod exec, using
   `isql` piped through `/bin/sh -c`: waits for the pod to be `Ready`, then separately waits for
   SYSDBA authentication to actually work (see gotcha below), then runs `CREATE DATABASE`/`CREATE
-  SHADOW`/`CREATE USER`.
+  SHADOW`/`CREATE USER`. Also runs `gsec` the same way to change the live SYSDBA password
+  (`change_sysdba_password`).
 - `src/kubebird/create.py` — the `@kopf.on.create` handler that orchestrates the two modules above
   and reports progress via `status.phase` (`Provisioning` → `WaitingForPod` →
   `ProvisioningDatabases` → `Ready`).
+- `src/kubebird/update.py` — `update_fn` (`@kopf.on.update` on `Instance`) reconciles `Service`
+  type and `StatefulSet` image/version changes and provisions any databases newly added to
+  `spec.databases`; `sysdba_secret_update_fn` (`@kopf.on.update` on core `Secret`, filtered by the
+  `kubebird.github.io/role: sysdba` label) pushes a rotated SYSDBA secret password to the live
+  server via `gsec`.
 
 There is currently no CLI entry point: `pyproject.toml` has no `[project.scripts]` section, and
-`src/kubebird/__init__.py` only declares `__all__ = ["create", "firebird", "k8s"]` (no `main()`).
-Until an entry point is added, run the operator directly via `kopf`, e.g.
-`uv run kopf run -m kubebird.create`.
+`src/kubebird/__init__.py` only declares `__all__ = ["create", "delete", "firebird", "k8s",
+"update"]` (no `main()`). Until an entry point is added, run the operator directly via `kopf`, e.g.
+`uv run kopf run -m kubebird.create -m kubebird.update`.
 
 Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
 - A bare local path (e.g. `/var/lib/firebird/data/x.fdb`) makes `isql` connect through Firebird's
@@ -46,6 +54,16 @@ Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
   password, but if the secret already exists (409, from a prior attempt) it must re-read that
   secret's *actual* stored password rather than using the freshly generated one that was never
   written anywhere — otherwise a retry uses a password that no longer matches the live server.
+- The `kubernetes` client's generated `patch_namespaced_*` methods (e.g.
+  `patch_namespaced_service`/`patch_namespaced_stateful_set`, used by `update_fn`) default a
+  dict-bodied `PATCH` to `Content-Type: application/json-patch+json` — which expects a JSON-Patch
+  *list* of operations, not a merge dict — unless `_content_type="application/merge-patch+json"`
+  (or `.../strategic-merge-patch+json`) is passed explicitly. `CustomObjectsApi.patch_namespaced_*`
+  is unaffected (it already defaults to merge-patch).
+- `gsec -user SYSDBA -password <old> -modify SYSDBA -pw <new>` (no `-database` needed — it talks to
+  the running server via the Services API, unlike `isql`'s embedded-vs-network distinction) is how
+  `firebird.change_sysdba_password` rotates the live SYSDBA password; like `isql -quiet`, it prints
+  nothing on success, so any non-empty output is treated as a failure.
 
 ## Development commands
 
@@ -120,6 +138,31 @@ Since the CRD is cluster-scoped, both tests need it created but only one can act
 `_ensure_crd_established` (not `_wait_established` — renamed when this became shared) tolerates a
 409 from `create_custom_resource_definition` for exactly this reason.
 
+`tests/test_update.py` covers `update_fn`/`sysdba_secret_update_fn` the same way, importing
+`CR_PATH`/`CRD_PATH`/`_ensure_crd_established`/`_wait_ready`/`_assert_database_file_exists` directly
+from `test_create` (pytest's default "rootless" import mode makes each test file a top-level
+module, so `from test_create import ...` — not `tests.test_create` — is what actually resolves).
+Its `KopfRunner` invocations load both `-m kubebird.create -m kubebird.update` (`click`'s `-m`
+option is `multiple=True`), since an update needs `create_fn` to have provisioned the `Instance`
+first. Five tests, each patching a freshly `_wait_ready`-confirmed `Instance` and then waiting for
+the change to actually land before asserting anything:
+- `test_update_instance_service_type` / `test_update_instance_version` — patch
+  `spec.service.type`/`spec.version` and check the live `Service`/`StatefulSet` directly.
+- `test_update_instance_add_database` — patches `spec.databases` to add an entry and checks the new
+  `.fdb` file exists on the pod.
+- `test_update_sysdba_secret_password_autogenerated` / `_secretref` — rotate the SYSDBA secret
+  (auto-generated, and a manually-created one wired via `secretRef`, respectively) and confirm the
+  *live* server now accepts the new password (`firebird.wait_for_sysdba_ready`).
+
+Each of these polls `status.message == "Instance updated."` (`_wait_status_message`) rather than
+reusing `_wait_ready`'s `status.phase == "Ready"` check after the patch: since `create_fn` already
+left `status.phase` at `"Ready"`, polling for that alone would return on the very first check —
+*before* `update_fn` has actually run — letting the test's own assertions race the handler. This
+was a real, previously-shipped bug in `test_update_instance_add_database` (it looked flaky/broken
+even though `update_fn` itself was correct) — diagnosed by confirming the file *did* exist
+immediately after `firebird.create_database`'s own exec, within the same handler invocation, but
+was gone by the time the test's later, separate exec checked for it.
+
 Gotcha: as soon as the `kubernetes` package is importable, `kopf` prefers piggybacking on it for
 authentication (`kopf._core.intents.piggybacking.login_via_client`) over its own lightweight
 kubeconfig parsing. `kubernetes.config.kube_config` bakes `KUBECONFIG` into a module-level
@@ -185,17 +228,51 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   README.md's authentication bullets in sync if this ever changes.
 - Adopts every created object with `kopf.adopt()`, so deleting the `Instance` garbage-collects them
   via owner references.
+- Labels every created object (`PVC`(s), `Service`, `StatefulSet`, and the auto-generated SYSDBA
+  `Secret`) with `k8s.INSTANCE_LABEL` (`kubebird.github.io/instance: <name>`) — e.g.
+  `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one
+  `Instance`. `build_service`/`build_statefulset` already needed this label internally for the
+  Service→Pod selector and the StatefulSet's pod template; it's now also stamped on each object's
+  own `metadata.labels`, not just used internally.
 
 `storage.primary.size` and `storage.shadow.size` in `deploy/crd.yaml` carry a `pattern` validating
 the standard Kubernetes resource-quantity grammar (e.g. `3Gi`, `500Mi`, `1.5G`), so the API server
 itself rejects malformed sizes (e.g. `"banana"`) with a 422 before `create_fn` ever runs.
 
-`src/kubebird/update.py` and `src/kubebird/delete.py` declare `@kopf.on.update`/`@kopf.on.delete`
-handlers, but both are still stubs that unconditionally `raise NotImplementedError` — treat them
-as not implemented (worse than a no-op: they'll error kopf's handling loop if ever triggered).
-Both also mistakenly name their function `create_fn` (copy-paste from `create.py`); kopf registers
-by decorator, not by name, so this doesn't break anything, but rename them (`update_fn`/`delete_fn`)
-if implementing.
+Updating an `Instance` (`update_fn` in `src/kubebird/update.py`, `@kopf.on.update` on `Instance`):
+
+- Re-resolves the SYSDBA password the same way `create_fn` does (`k8s.ensure_sysdba_secret`), then
+  unconditionally reconciles the `Service` type and the `StatefulSet`'s container image/version via
+  `patch_namespaced_service`/`patch_namespaced_stateful_set` (idempotent no-ops when unchanged).
+- Waits for the pod to be `Ready` and SYSDBA-live again (relevant when `spec.version` changed and
+  the `StatefulSet` rolled the pod).
+- Diffs `old.spec.databases` (kopf's own kwarg, the previously-handled body) against
+  `spec.databases` and provisions only the newly-added entries — pre-existing ones are left alone.
+- Reports progress via `status.phase`/`status.message` the same way `create_fn` does, ending in
+  `status.message == "Instance updated."` (a distinct value from `create_fn`'s `"Instance
+  provisioned."`, useful for tests/tooling to tell a genuine update apart from a stale `Ready`
+  status left over from creation).
+
+Rotating the SYSDBA secret's password (`sysdba_secret_update_fn` in `src/kubebird/update.py`,
+`@kopf.on.update` on core `Secret`, filtered by `labels={"kubebird.github.io/role": "sysdba"}`):
+
+- Compares the base64 `data.password` between kopf's `old`/`new` kwargs; no-ops if either is
+  missing (secret just created) or unchanged (some other field on the secret changed).
+- Otherwise decodes both and calls `firebird.change_sysdba_password` (`gsec`) against
+  `<instance-name>-0`, using the *old* password to authenticate and set the *new* one — so the live
+  server and the secret never drift apart.
+- The instance name comes from the secret's own `kubebird.github.io/instance` label, not from its
+  name, since a user-provided `authentication.sysdba.secretRef` secret can be named anything.
+- The auto-generated `<instance-name>-sysdba` secret gets both labels
+  (`kubebird.github.io/instance`, `kubebird.github.io/role: sysdba`) at creation. A user-provided
+  `secretRef` secret is *not* owned by kubebird (no `kopf.adopt()`), but `k8s.ensure_sysdba_secret`
+  still labels it the same way (`k8s._label_sysdba_secret`) on every reconcile, purely so this watch
+  covers it too — if the same secret is referenced by more than one `Instance`, the
+  `kubebird.github.io/instance` label just reflects whichever one reconciled it last.
+
+`src/kubebird/delete.py` still declares an unimplemented `@kopf.on.delete` stub (`delete_fn`) that
+unconditionally `raise NotImplementedError` — treat it as not implemented (worse than a no-op:
+it'll error kopf's handling loop if ever triggered).
 
 `deploy/crd.yaml` holds the `CustomResourceDefinition` (OpenAPI v3 schema for the `spec`/`status`
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
@@ -205,10 +282,11 @@ The README's Installation section documents `kubectl apply -f deploy/crd.yaml -f
 but `deploy/operator.yaml` (the Deployment/RBAC manifest for running the operator itself in-cluster)
 does not exist yet — only `crd.yaml` and `cr.yaml` are present under `deploy/`. Now that `create_fn`
 is implemented, that RBAC needs to grant (at least): `get`/`list`/`watch`/`patch` on `instances`
-(and their `status` subresource) for the CRD's group; `create` on `secrets`,
-`persistentvolumeclaims`, `services`, `statefulsets`; `get` on `secrets`; `get` on `pods` and
-`create` on `pods/exec` (needed for the `isql` provisioning in `firebird.py`); plus whatever kopf
-itself needs for peering/events (see kopf's own RBAC docs).
+(and their `status` subresource) for the CRD's group; `create`/`patch` on `secrets`,
+`persistentvolumeclaims`, `services`, `statefulsets`; `get`/`list`/`watch`/`patch` on `secrets`
+specifically (`update_fn` re-reads them, `sysdba_secret_update_fn` watches and labels them); `get`
+on `pods` and `create` on `pods/exec` (needed for the `isql`/`gsec` provisioning in
+`firebird.py`); plus whatever kopf itself needs for peering/events (see kopf's own RBAC docs).
 
 ## Requirements
 

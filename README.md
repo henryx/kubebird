@@ -45,8 +45,17 @@ With this CR, Kubebird can:
 - Authentication section is optional. If is specified, you can:
   - Declare a user using a secret. If secret isn't specified, no other users than SYSDBA are created. The secret must have `username` and `password` keys.
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
+- Label every object it creates (PVCs, Service, StatefulSet, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 
-There is no update/delete reconciliation yet: deleting an `Instance` relies on Kubernetes garbage
+Kubebird also reacts to updates on an existing `Instance`:
+- Changing `spec.service.type` or `spec.version` reconciles the `Service`/`StatefulSet` in place.
+- Adding an entry to `spec.databases` provisions just that new database (existing ones are left
+  alone).
+- Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
+  `authentication.sysdba.secretRef`) pushes the new password to the live server automatically, so
+  the secret and the running instance never drift apart.
+
+There is no delete reconciliation yet: deleting an `Instance` relies on Kubernetes garbage
 collection of the objects Kubebird created for it (they're all owned by the `Instance`).
 
 ## Installation
@@ -80,6 +89,11 @@ into the pod to confirm the relevant database file actually exists on disk befor
 `Instance`. There are two such tests: `test_create_instance` checks the primary database, and
 `test_create_instance_shadow_database` checks that a database with `shadow: true` gets its shadow
 file on the separate shadow PVC.
+
+`tests/test_update.py` covers the update-reconciliation behaviour the same way: patching an
+already-`Ready` `Instance`'s `service.type`/`version`/`databases`, and rotating its SYSDBA secret's
+password (both the auto-generated one and a user-provided `secretRef`), then confirming the change
+actually took effect against the live `Service`/`StatefulSet`/pod.
 
 ## License
 
