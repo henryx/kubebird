@@ -40,6 +40,13 @@ With this CR, Kubebird can:
   - Declare a user using a secret. If secret isn't specified, no other users than SYSDBA are created.
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password.
 
+## Installation
+
+To install Kubebird in the Kubernetes cluster, you can use these commands:
+```bash
+kubectl apply -f deploy/crd.yaml
+kubectl apply -f deploy/operator.yaml
+```
 
 
 ## Development Commands
@@ -48,6 +55,10 @@ With this CR, Kubebird can:
 $ uv init --name Kubebird --app --description "Kubebird - A Kubernetes operator for Firebird" --build-backend uv --no-readme
 $ uv add kopf
 $ uv add --dev pytest pytest-cov tox ruff
+$ uv add --dev testcontainers
 ```
-For e2e tests, is used testcontainers with k3s image, and deployed an `Instances` with 1 pod
+For e2e tests, `testcontainers` is used to run a k3s cluster: `tests/conftest.py` defines a
+session-scoped `k3s` fixture (`testcontainers.community.k3s.K3SContainer`). So far only the
+fixture itself is tested (`tests/test_k3s.py`); deploying an `Instances` with 1 pod against it
+is not implemented yet.
 
