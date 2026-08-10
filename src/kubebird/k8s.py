@@ -19,7 +19,13 @@ SYSDBA_ROLE_VALUE = "sysdba"
 
 
 def generate_password(length: int = 32) -> str:
-    return secrets.token_urlsafe(length)
+    # token_urlsafe's alphabet includes "-", which isql/gsec's argument
+    # parsers can mistake for the start of another switch (e.g. "-password
+    # -abc..." reads as two switches, not an option and its value).
+    while True:
+        password = secrets.token_urlsafe(length)
+        if not password.startswith("-"):
+            return password
 
 
 def create_or_ignore(
