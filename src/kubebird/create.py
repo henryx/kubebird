@@ -34,11 +34,30 @@ def create_fn(
         logger=logger,
     )
 
-    pvc_body = k8s.build_pvc(name=name, namespace=namespace, storage=spec["storage"])
+    storage = spec["storage"]
+    shadow_storage = storage.get("shadow")
+
+    pvc_body = k8s.build_pvc(
+        pvc_name=f"{name}-data", namespace=namespace, storage=storage["primary"]
+    )
     kopf.adopt(pvc_body, owner=body)
     k8s.create_or_ignore(
         core_api.create_namespaced_persistent_volume_claim, namespace, pvc_body, logger
     )
+
+    shadow_pvc_name = None
+    if shadow_storage:
+        shadow_pvc_body = k8s.build_pvc(
+            pvc_name=f"{name}-shadow", namespace=namespace, storage=shadow_storage
+        )
+        kopf.adopt(shadow_pvc_body, owner=body)
+        k8s.create_or_ignore(
+            core_api.create_namespaced_persistent_volume_claim,
+            namespace,
+            shadow_pvc_body,
+            logger,
+        )
+        shadow_pvc_name = shadow_pvc_body["metadata"]["name"]
 
     service_body = k8s.build_service(
         name=name, namespace=namespace, service_spec=spec.get("service") or {}
@@ -54,6 +73,7 @@ def create_fn(
         image=spec["image"],
         version=spec["version"],
         pvc_name=pvc_body["metadata"]["name"],
+        shadow_pvc_name=shadow_pvc_name,
         sysdba_secret_name=secret_name,
     )
     kopf.adopt(statefulset_body, owner=body)
@@ -85,6 +105,12 @@ def create_fn(
             path=db_path,
         )
         if database.get("shadow"):
+            if shadow_storage is None:
+                raise kopf.PermanentError(
+                    f"database {database['name']!r} has shadow: true but "
+                    "spec.storage.shadow is not configured."
+                )
+            shadow_path = f"{k8s.SHADOW_MOUNT_PATH}/{database['name']}.shadow"
             logger.info(f"Creating shadow for database {db_path!r}.")
             firebird.create_shadow(
                 core_api,
@@ -93,7 +119,7 @@ def create_fn(
                 container=CONTAINER_NAME,
                 sysdba_password=sysdba_password,
                 database_path=db_path,
-                shadow_path=f"{db_path}.shadow",
+                shadow_path=shadow_path,
             )
 
     user_secret_ref = (authentication.get("user") or {}).get("secretRef", "")

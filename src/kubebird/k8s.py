@@ -11,6 +11,7 @@ from kubernetes.client.exceptions import ApiException
 
 FIREBIRD_PORT = 3050
 DATA_MOUNT_PATH = "/var/lib/firebird/data"
+SHADOW_MOUNT_PATH = "/var/lib/firebird/shadow"
 
 
 def generate_password(length: int = 32) -> str:
@@ -86,7 +87,9 @@ def read_user_credentials(
     return read_secret_value(secret, "username"), read_secret_value(secret, "password")
 
 
-def build_pvc(*, name: str, namespace: str, storage: dict[str, Any]) -> dict[str, Any]:
+def build_pvc(
+    *, pvc_name: str, namespace: str, storage: dict[str, Any]
+) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "accessModes": ["ReadWriteOnce"],
         "resources": {"requests": {"storage": storage["size"]}},
@@ -96,7 +99,7 @@ def build_pvc(*, name: str, namespace: str, storage: dict[str, Any]) -> dict[str
     return {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
-        "metadata": {"name": f"{name}-data", "namespace": namespace},
+        "metadata": {"name": pvc_name, "namespace": namespace},
         "spec": spec,
     }
 
@@ -126,8 +129,16 @@ def build_statefulset(
     version: str,
     pvc_name: str,
     sysdba_secret_name: str,
+    shadow_pvc_name: str | None = None,
 ) -> dict[str, Any]:
     labels = {"kubebird.github.io/instance": name}
+    volume_mounts = [{"name": "data", "mountPath": DATA_MOUNT_PATH}]
+    volumes = [{"name": "data", "persistentVolumeClaim": {"claimName": pvc_name}}]
+    if shadow_pvc_name:
+        volume_mounts.append({"name": "shadow", "mountPath": SHADOW_MOUNT_PATH})
+        volumes.append(
+            {"name": "shadow", "persistentVolumeClaim": {"claimName": shadow_pvc_name}}
+        )
     return {
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
@@ -155,17 +166,10 @@ def build_statefulset(
                                     },
                                 }
                             ],
-                            "volumeMounts": [
-                                {"name": "data", "mountPath": DATA_MOUNT_PATH}
-                            ],
+                            "volumeMounts": volume_mounts,
                         }
                     ],
-                    "volumes": [
-                        {
-                            "name": "data",
-                            "persistentVolumeClaim": {"claimName": pvc_name},
-                        }
-                    ],
+                    "volumes": volumes,
                 },
             },
         },
