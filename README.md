@@ -72,3 +72,6 @@ utilities](https://docs.kopf.dev/en/stable/testing/), to apply `deploy/crd.yaml`
 `Ready` (StatefulSet + real Firebird image pull + database provisioning over `isql`), then execs
 into the pod to confirm the database file actually exists on disk before deleting the `Instance`.
 
+## License
+
+Kubebird is licensed under the [Apache License 2.0](LICENSE).
