@@ -53,12 +53,19 @@ kubectl apply -f deploy/operator.yaml
 ```bash
 # Setup
 $ uv init --name Kubebird --app --description "Kubebird - A Kubernetes operator for Firebird" --build-backend uv --no-readme
-$ uv add kopf
+$ uv add kopf kubernetes
 $ uv add --dev pytest pytest-cov tox ruff
 $ uv add --dev testcontainers
 ```
 For e2e tests, `testcontainers` is used to run a k3s cluster: `tests/conftest.py` defines a
-session-scoped `k3s` fixture (`testcontainers.community.k3s.K3SContainer`). So far only the
-fixture itself is tested (`tests/test_k3s.py`); deploying an `Instances` with 1 pod against it
-is not implemented yet.
+session-scoped `k3s` fixture (`testcontainers.community.k3s.K3SContainer`), tested on its own in
+`tests/test_k3s.py`. A `kubeconfig` fixture builds on it to point the `kubernetes` client library
+at the container.
+
+`tests/test_create.py` uses that fixture, together with [kopf's testing
+utilities](https://docs.kopf.dev/en/stable/testing/), to apply `deploy/crd.yaml` and
+`deploy/cr.yaml` against the k3s cluster and run the operator in-process via
+`kopf.testing.KopfRunner`, asserting that the `create_fn` handler runs successfully. Since
+`create_fn` is currently a no-op, this only exercises the create-event path — deploying an
+`Instance` with a real backing pod is not implemented yet.
 

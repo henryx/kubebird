@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Kubebird is a Kubernetes operator, built in Python on top of `kopf`, that installs and manages
 [Firebird RDBMS](https://firebirdsql.org/) instances via a namespaced `Instance` custom resource.
 
-The project is at an early stage. `kopf` is now a declared dependency, and `src/kubebird/create.py`
-holds the first handler, `create_fn` (`@kopf.on.create(kind="Instance", version="v1",
-group="kubebird.github.io")`). Its body is currently a no-op (`pass`), so no reconciliation logic
-exists yet — treat the README's architecture description as the design target, not as a
-description of existing code.
+The project is at an early stage. `kopf` and `kubernetes` (the official Python client) are declared
+dependencies, and `src/kubebird/create.py` holds the first handler, `create_fn` (`@kopf.on.create(
+kind="Instance", version="v1", group="kubebird.github.io")`). Its body is currently a no-op
+(`pass`), so no reconciliation logic exists yet — treat the README's architecture description as
+the design target, not as a description of existing code.
 
 There is currently no CLI entry point: `pyproject.toml` has no `[project.scripts]` section, and
 `src/kubebird/__init__.py` only declares `__all__ = ["create"]` (no `main()`). Until an entry point
@@ -56,9 +56,27 @@ commented out of `env_list` — add it back there to enable it.
 `tests/conftest.py` defines a session-scoped `k3s` fixture (via `testcontainers`'s
 `K3SContainer`, from `testcontainers.community.k3s` — `testcontainers.k3s` is deprecated) that
 starts a real k3s container per test session. `testcontainers` is a dev dependency for this.
-`tests/test_k3s.py` is currently the only test and only exercises the fixture itself (asserts
-`k3s.config_yaml()` returns a valid kubeconfig); no test yet deploys an `Instance` or exercises
-operator code, which is why coverage on `src/kubebird` is still 0%.
+`tests/test_k3s.py` only exercises the fixture itself (asserts `k3s.config_yaml()` returns a
+valid kubeconfig).
+
+`tests/conftest.py` also defines a function-scoped `kubeconfig` fixture, built on top of `k3s`,
+that writes the container's kubeconfig to a temp file, sets `KUBECONFIG` to it, and yields the
+path (deleting the file on teardown). `tests/test_create.py` uses it for a functional test per
+kopf's [testing docs](https://docs.kopf.dev/en/stable/testing/): it applies `deploy/crd.yaml` and
+`deploy/cr.yaml` via the `kubernetes` client library (a direct, non-dev dependency — used here as
+the test client and, incidentally, by kopf itself as an optional auth piggyback, see below), runs
+the operator in-process with `kopf.testing.KopfRunner(["run", ..., "-m", "kubebird.create"])`, and
+asserts the `create_fn` handler logs success. This exercises `create_fn` for the first time, so
+`src/kubebird` coverage is no longer 0%, even though the handler itself is still a no-op.
+
+Gotcha: as soon as the `kubernetes` package is importable, `kopf` prefers piggybacking on it for
+authentication (`kopf._core.intents.piggybacking.login_via_client`) over its own lightweight
+kubeconfig parsing. `kubernetes.config.kube_config` bakes `KUBECONFIG` into a module-level
+constant (`KUBE_CONFIG_DEFAULT_LOCATION`) the first time it is imported — which happens as soon as
+`kopf` itself is imported (pytest imports test modules, hence `kopf`, at collection time, before
+any fixture runs). Setting the `KUBECONFIG` env var alone is therefore too late; the `kubeconfig`
+fixture also monkeypatches that constant directly so kopf's client-based login connects to the
+`k3s` container instead of the real `~/.kube/config`.
 
 ## Architecture
 
@@ -100,9 +118,11 @@ Reconciling this CR is expected to:
   generates a `<instance-name>-sysdba` secret with a random password; if
   `authentication.user.secretRef` is unset, no non-SYSDBA user is created.
 
-End-to-end tests are intended to eventually deploy a real `Instance` backed by a single pod on
-top of the `k3s` fixture (see "Development commands" above); see README.md for the manual
-`docker run` equivalent used to exercise a Firebird container directly.
+`tests/test_create.py` deploys a real `Instance` CR on top of the `k3s` fixture (see "Development
+commands" above) and runs the operator against it, but since `create_fn` is a no-op, no actual
+Firebird pod gets created yet — that end-to-end step (a real pod backing the `Instance`) is still
+to come. See README.md for the manual `docker run` equivalent used to exercise a Firebird
+container directly.
 
 `deploy/crd.yaml` holds the `CustomResourceDefinition` (OpenAPI v3 schema for the `spec`/`status`
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
