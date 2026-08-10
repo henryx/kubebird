@@ -143,7 +143,7 @@ def read_user_credentials(
 
 
 def build_pvc(
-    *, pvc_name: str, namespace: str, storage: dict[str, Any]
+    *, pvc_name: str, namespace: str, instance_name: str, storage: dict[str, Any]
 ) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "accessModes": ["ReadWriteOnce"],
@@ -154,7 +154,11 @@ def build_pvc(
     return {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
-        "metadata": {"name": pvc_name, "namespace": namespace},
+        "metadata": {
+            "name": pvc_name,
+            "namespace": namespace,
+            "labels": {INSTANCE_LABEL: instance_name},
+        },
         "spec": spec,
     }
 
@@ -165,10 +169,14 @@ def build_service(
     return {
         "apiVersion": "v1",
         "kind": "Service",
-        "metadata": {"name": name, "namespace": namespace},
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {INSTANCE_LABEL: name},
+        },
         "spec": {
             "type": service_spec.get("type") or "ClusterIP",
-            "selector": {"kubebird.github.io/instance": name},
+            "selector": {INSTANCE_LABEL: name},
             "ports": [
                 {"name": "firebird", "port": FIREBIRD_PORT, "targetPort": FIREBIRD_PORT}
             ],
@@ -186,7 +194,7 @@ def build_statefulset(
     sysdba_secret_name: str,
     shadow_pvc_name: str | None = None,
 ) -> dict[str, Any]:
-    labels = {"kubebird.github.io/instance": name}
+    labels = {INSTANCE_LABEL: name}
     volume_mounts = [{"name": "data", "mountPath": DATA_MOUNT_PATH}]
     volumes = [{"name": "data", "persistentVolumeClaim": {"claimName": pvc_name}}]
     if shadow_pvc_name:
@@ -197,7 +205,7 @@ def build_statefulset(
     return {
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
-        "metadata": {"name": name, "namespace": namespace},
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
         "spec": {
             "serviceName": name,
             "replicas": 1,

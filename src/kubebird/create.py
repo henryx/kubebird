@@ -38,7 +38,10 @@ def create_fn(
     shadow_storage = storage.get("shadow")
 
     pvc_body = k8s.build_pvc(
-        pvc_name=f"{name}-data", namespace=namespace, storage=storage["primary"]
+        pvc_name=f"{name}-data",
+        namespace=namespace,
+        instance_name=name,
+        storage=storage["primary"],
     )
     kopf.adopt(pvc_body, owner=body)
     k8s.create_or_ignore(
@@ -48,7 +51,10 @@ def create_fn(
     shadow_pvc_name = None
     if shadow_storage:
         shadow_pvc_body = k8s.build_pvc(
-            pvc_name=f"{name}-shadow", namespace=namespace, storage=shadow_storage
+            pvc_name=f"{name}-shadow",
+            namespace=namespace,
+            instance_name=name,
+            storage=shadow_storage,
         )
         kopf.adopt(shadow_pvc_body, owner=body)
         k8s.create_or_ignore(
