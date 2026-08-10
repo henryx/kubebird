@@ -8,7 +8,16 @@ from testcontainers.community.k3s import K3SContainer
 
 @pytest.fixture(scope="session")
 def k3s() -> Iterator[K3SContainer]:
-    with K3SContainer() as container:
+    container = K3SContainer()
+    # On cgroup v2 hosts with the systemd cgroup driver, Docker gives the
+    # container its own (private) cgroup namespace, which k3s's embedded
+    # kubelet cannot reconcile with the host cgroup paths bind-mounted in --
+    # every pod (even built-in ones like coredns) then stays Pending forever
+    # with "FailedCreatePodSandBox: ... cgroup.procs: no such file or
+    # directory". Sharing the host's cgroup namespace fixes it. K3SContainer
+    # has no public API for extra `docker run` kwargs, hence the private attr.
+    container._kwargs["cgroupns"] = "host"
+    with container:
         yield container
 
 
