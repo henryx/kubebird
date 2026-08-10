@@ -98,15 +98,27 @@ attribute — `K3SContainer` has no public API for extra `docker run` kwargs).
 
 `tests/conftest.py` also defines a function-scoped `kubeconfig` fixture, built on top of `k3s`,
 that writes the container's kubeconfig to a temp file, sets `KUBECONFIG` to it, and yields the
-path (deleting the file on teardown). `tests/test_create.py` uses it for a functional test per
-kopf's [testing docs](https://docs.kopf.dev/en/stable/testing/): it applies `deploy/crd.yaml` and
-`deploy/cr.yaml` via the `kubernetes` client library (a direct, non-dev dependency — used here as
-the test client and, incidentally, by kopf itself as an optional auth piggyback, see below), runs
-the operator in-process with `kopf.testing.KopfRunner(["run", ..., "-m", "kubebird.create"])`,
-waits for `status.phase` to reach `Ready` (up to 420s — provisioning involves an image pull, a real
-Firebird startup, and one expected retry while waiting for SYSDBA auth to become live), and execs
-into the pod to confirm the database file actually exists on disk before deleting the CR. This is a
-real, non-mocked run — it takes ~80s end-to-end on a warm image cache.
+path (deleting the file on teardown). `tests/test_create.py` uses it for functional tests per
+kopf's [testing docs](https://docs.kopf.dev/en/stable/testing/): each applies `deploy/crd.yaml`
+and a variant of `deploy/cr.yaml` via the `kubernetes` client library (a direct, non-dev dependency
+— used here as the test client and, incidentally, by kopf itself as an optional auth piggyback,
+see below), runs the operator in-process with `kopf.testing.KopfRunner(["run", ..., "-m",
+"kubebird.create"])`, waits for `status.phase` to reach `Ready` (up to 420s — provisioning involves
+an image pull, a real Firebird startup, and one expected retry while waiting for SYSDBA auth to
+become live), and execs into the pod to confirm the relevant database file actually exists on disk
+before deleting the `Instance`. These are real, non-mocked runs — each takes roughly a minute
+end-to-end on a warm image cache.
+
+There are two such tests, run independently against the same `Instance` CRD:
+- `test_create_instance` — the CR as shipped in `deploy/cr.yaml`; checks that the primary
+  (non-shadow) database file exists under `k8s.DATA_MOUNT_PATH`.
+- `test_create_instance_shadow_database` — the same CR but with `metadata.name` overridden to
+  `test-shadow` (so it can't collide with the other test's still-being-garbage-collected objects);
+  checks that the shadow database's `.shadow` file exists under `k8s.SHADOW_MOUNT_PATH`.
+
+Since the CRD is cluster-scoped, both tests need it created but only one can actually create it;
+`_ensure_crd_established` (not `_wait_established` — renamed when this became shared) tolerates a
+409 from `create_custom_resource_definition` for exactly this reason.
 
 Gotcha: as soon as the `kubernetes` package is importable, `kopf` prefers piggybacking on it for
 authentication (`kopf._core.intents.piggybacking.login_via_client`) over its own lightweight
@@ -137,8 +149,12 @@ spec:
   service:
     type: ClusterIP
   storage:
-    class: ""
-    size: 3Gi
+    primary:
+      class: ""
+      size: 3Gi
+    shadow:
+      class: ""
+      size: 3Gi
   authentication:
     sysdba:
       secretRef: ""
@@ -149,14 +165,17 @@ spec:
 Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
 
 - Deploys the Firebird instance as a `StatefulSet` (1 replica) using the given `image`/`version`,
-  mounting the PVC below at `k8s.DATA_MOUNT_PATH` (`/var/lib/firebird/data`).
+  mounting the primary-data PVC at `k8s.DATA_MOUNT_PATH` (`/var/lib/firebird/data`) and, only if
+  `storage.shadow` is set, a second PVC at `k8s.SHADOW_MOUNT_PATH` (`/var/lib/firebird/shadow`).
 - Creates a `Service` for the instance (type from `spec.service.type`, default `ClusterIP`),
   targeting port 3050.
-- Creates a `PVC` sized per `storage.size`, using the cluster default `StorageClass` when
-  `storage.class` is empty (a plain PVC referenced by the pod's `volumes`, not a
-  `volumeClaimTemplate`, since the CR describes exactly one instance/pod).
+- Creates a `PVC` for `storage.primary` (required) and, if present, a second one for
+  `storage.shadow`, each sized per `.size` and using the cluster default `StorageClass` when
+  `.class` is empty. Both are plain PVCs referenced by the pod's `volumes`, not
+  `volumeClaimTemplate`s, since the CR describes exactly one instance/pod.
 - Instantiates every entry in `databases` via `isql` exec'd into the pod, creating a `CREATE
-  SHADOW 1` file (`<path>.shadow`) for any entry with `shadow: true`.
+  SHADOW 1` file under the shadow mount for any entry with `shadow: true` — raising a
+  `kopf.PermanentError` if `storage.shadow` isn't configured in that case.
 - Manages authentication: if `authentication.sysdba.secretRef` is unset, generates a
   `<instance-name>-sysdba` secret (keys `username: SYSDBA`, `password: <random>`) and wires it
   into the `StatefulSet` via `FIREBIRD_ROOT_PASSWORD`/`secretKeyRef`; if set, reads that secret's
@@ -165,11 +184,18 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   `username`/`password` key names are a kubebird convention, not documented anywhere else — keep
   README.md's authentication bullets in sync if this ever changes.
 - Adopts every created object with `kopf.adopt()`, so deleting the `Instance` garbage-collects them
-  via owner references — there is no `@kopf.on.delete` handler (or `@kopf.on.update`) yet.
+  via owner references.
 
-`tests/test_create.py` deploys a real `Instance` CR on top of the `k3s` fixture (see "Development
-commands" above), runs `create_fn` against it, and confirms the database file actually exists in
-the pod — a genuine end-to-end run, not a mock.
+`storage.primary.size` and `storage.shadow.size` in `deploy/crd.yaml` carry a `pattern` validating
+the standard Kubernetes resource-quantity grammar (e.g. `3Gi`, `500Mi`, `1.5G`), so the API server
+itself rejects malformed sizes (e.g. `"banana"`) with a 422 before `create_fn` ever runs.
+
+`src/kubebird/update.py` and `src/kubebird/delete.py` declare `@kopf.on.update`/`@kopf.on.delete`
+handlers, but both are still stubs that unconditionally `raise NotImplementedError` — treat them
+as not implemented (worse than a no-op: they'll error kopf's handling loop if ever triggered).
+Both also mistakenly name their function `create_fn` (copy-paste from `create.py`); kopf registers
+by decorator, not by name, so this doesn't break anything, but rename them (`update_fn`/`delete_fn`)
+if implementing.
 
 `deploy/crd.yaml` holds the `CustomResourceDefinition` (OpenAPI v3 schema for the `spec`/`status`
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync

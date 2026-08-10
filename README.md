@@ -19,11 +19,17 @@ spec:
   databases:
     - name: "instance.fdb"
       shadow: false
+    - name: "shadowed.fdb"
+      shadow: true
   service:
     type: ClusterIP
   storage:
-    class: "" # if empty, uses the default storage class
-    size: 3Gi
+    primary:
+      class: "" # if empty, uses the default storage class
+      size: 3Gi
+    shadow: # can be omitted if no database below has "shadow: true"
+      class: ""
+      size: 3Gi
   authentication:
     sysdba:
       secretRef: ""
@@ -34,8 +40,8 @@ spec:
 With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified. Deployment is made in default namespace.
 - Create a service for the instance. Default service type is `ClusterIP`.
-- Define the PVC used for the instance with specified size and storage class. If storage class isn't specified, it uses the default storage class.
-- Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode.
+- Define the PVC used for the instance's primary data (`storage.primary`) with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
+- Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`.
 - Authentication section is optional. If is specified, you can:
   - Declare a user using a secret. If secret isn't specified, no other users than SYSDBA are created. The secret must have `username` and `password` keys.
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
@@ -68,9 +74,12 @@ at the container.
 `tests/test_create.py` uses that fixture, together with [kopf's testing
 utilities](https://docs.kopf.dev/en/stable/testing/), to apply `deploy/crd.yaml` and
 `deploy/cr.yaml` against the k3s cluster and run the operator in-process via
-`kopf.testing.KopfRunner`. It's a real end-to-end run: it waits for `status.phase` to reach
+`kopf.testing.KopfRunner`. These are real end-to-end runs: each waits for `status.phase` to reach
 `Ready` (StatefulSet + real Firebird image pull + database provisioning over `isql`), then execs
-into the pod to confirm the database file actually exists on disk before deleting the `Instance`.
+into the pod to confirm the relevant database file actually exists on disk before deleting the
+`Instance`. There are two such tests: `test_create_instance` checks the primary database, and
+`test_create_instance_shadow_database` checks that a database with `shadow: true` gets its shadow
+file on the separate shadow PVC.
 
 ## License
 
