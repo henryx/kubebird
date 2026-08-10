@@ -7,4 +7,4 @@ import kopf
 def create_fn(
     spec: kopf.Spec, name: str, namespace: str | None, logger: kopf.Logger, **_: Any
 ) -> None:
-    pass
+    raise NotImplementedError("Not implemented")

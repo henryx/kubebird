@@ -1,0 +1,57 @@
+import time
+from pathlib import Path
+
+import yaml
+from kopf.testing import KopfRunner
+from kubernetes import client, config
+
+DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
+CRD_PATH = DEPLOY_DIR / "crd.yaml"
+CR_PATH = DEPLOY_DIR / "cr.yaml"
+
+
+def _wait_established(
+    api: client.ApiextensionsV1Api, name: str, timeout: float = 30.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        crd = api.read_custom_resource_definition(name)
+        conditions = crd.status.conditions or []
+        if any(c.type == "Established" and c.status == "True" for c in conditions):
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"CustomResourceDefinition {name!r} did not become Established")
+
+
+def test_create_instance(kubeconfig: Path) -> None:
+    config.load_kube_config(config_file=str(kubeconfig))
+
+    crd_body = yaml.safe_load(CRD_PATH.read_text())
+    cr_body = yaml.safe_load(CR_PATH.read_text())
+
+    group, version = cr_body["apiVersion"].split("/")
+    plural = crd_body["spec"]["names"]["plural"]
+    namespace = cr_body["metadata"]["namespace"]
+    name = cr_body["metadata"]["name"]
+
+    extensions_api = client.ApiextensionsV1Api()
+    extensions_api.create_custom_resource_definition(crd_body)
+    _wait_established(extensions_api, crd_body["metadata"]["name"])
+
+    objects_api = client.CustomObjectsApi()
+
+    with KopfRunner(
+        ["run", "-n", namespace, "--verbose", "-m", "kubebird.create"]
+    ) as runner:
+        objects_api.create_namespaced_custom_object(
+            group, version, namespace, plural, cr_body
+        )
+        time.sleep(3)
+        objects_api.delete_namespaced_custom_object(
+            group, version, namespace, plural, name
+        )
+        time.sleep(1)
+
+    assert runner.exit_code == 0
+    assert runner.exception is None
+    assert "Handler 'create_fn' succeeded." in runner.output

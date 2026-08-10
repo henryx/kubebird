@@ -13,6 +13,7 @@ classifiers = [
 ]
 dependencies = [
     "kopf>=1.44.6",
+    "kubernetes>=36.0.3",
 ]
 
 [build-system]
