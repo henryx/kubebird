@@ -55,8 +55,9 @@ Kubebird also reacts to updates on an existing `Instance`:
   `authentication.sysdba.secretRef`) pushes the new password to the live server automatically, so
   the secret and the running instance never drift apart.
 
-There is no delete reconciliation yet: deleting an `Instance` relies on Kubernetes garbage
-collection of the objects Kubebird created for it (they're all owned by the `Instance`).
+Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
+it (they're all owned by the `Instance`); the operator itself just logs the deletion and reports
+`status.phase: Deleting` while that garbage collection runs.
 
 ## Installation
 
@@ -94,6 +95,10 @@ file on the separate shadow PVC.
 already-`Ready` `Instance`'s `service.type`/`version`/`databases`, and rotating its SYSDBA secret's
 password (both the auto-generated one and a user-provided `secretRef`), then confirming the change
 actually took effect against the live `Service`/`StatefulSet`/pod.
+
+`tests/test_delete.py` covers deletion the same way: deletes a `Ready` `Instance` and confirms it
+actually disappears (not just that the delete call returned) and that Kubernetes garbage-collects
+the `StatefulSet` it owned.
 
 ## License
 

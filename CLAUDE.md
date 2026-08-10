@@ -11,11 +11,10 @@ The project is at an early stage but `create_fn` (`src/kubebird/create.py`, `@ko
 kind="Instance", version="v1", group="kubebird.github.io")`) now implements the full reconciliation
 described in "Architecture" below. `kopf` and `kubernetes` (the official Python client) are
 declared dependencies. `src/kubebird/update.py` also implements two real handlers now (`update_fn`
-for `Instance` spec changes, `sysdba_secret_update_fn` for SYSDBA secret rotations — see
-"Architecture"); `src/kubebird/delete.py` still declares an unimplemented `@kopf.on.delete` stub, so
-deletion still relies entirely on Kubernetes garbage-collecting the owned objects via `kopf.adopt()`.
+for `Instance` spec changes, `sysdba_secret_update_fn` for SYSDBA secret rotations), and
+`src/kubebird/delete.py`'s `delete_fn` (`@kopf.on.delete`) is implemented too — see "Architecture".
 
-The implementation is split across three modules:
+The implementation is split across five modules:
 - `src/kubebird/k8s.py` — builds the `Secret`/`PersistentVolumeClaim`/`Service`/`StatefulSet`
   manifests (plain dicts, not typed client models) and idempotent creation helpers
   (`create_or_ignore` treats a 409 Conflict as "already created by a previous handler retry").
@@ -32,6 +31,12 @@ The implementation is split across three modules:
   `spec.databases`; `sysdba_secret_update_fn` (`@kopf.on.update` on core `Secret`, filtered by the
   `kubebird.github.io/role: sysdba` label) pushes a rotated SYSDBA secret password to the live
   server via `gsec`.
+- `src/kubebird/delete.py` — `delete_fn` (`@kopf.on.delete` on `Instance`). Deliberately minimal:
+  it just logs and patches `status.phase`, since every object `create_fn`/`update_fn` create is
+  already `kopf.adopt()`-ed, so Kubernetes garbage-collects all of them (Secret, PVC(s), Service,
+  StatefulSet) through their owner references as soon as this handler returns. Its only real effect
+  is the finalizer kopf attaches for having *any* `on.delete` handler registered at all, which
+  blocks the `Instance`'s own removal until the handler completes.
 
 There is currently no CLI entry point: `pyproject.toml` has no `[project.scripts]` section, and
 `src/kubebird/__init__.py` only declares `__all__ = ["create", "delete", "firebird", "k8s",
@@ -193,6 +198,12 @@ even though `update_fn` itself was correct) — diagnosed by confirming the file
 immediately after `firebird.create_database`'s own exec, within the same handler invocation, but
 was gone by the time the test's later, separate exec checked for it.
 
+`tests/test_delete.py` covers `delete_fn` the same way (one test, `test_delete_instance`), loading
+`-m kubebird.create -m kubebird.delete`: creates the `Instance`, waits `Ready`, deletes it, then
+waits for the `Instance` object itself to actually disappear (`_wait_gone`, polling for a 404 —
+not just for the delete call to return, since the finalizer keeps it present until `delete_fn`
+completes) and for the owned `StatefulSet` to be garbage-collected (`_wait_statefulset_gone`).
+
 Gotcha: as soon as the `kubernetes` package is importable, `kopf` prefers piggybacking on it for
 authentication (`kopf._core.intents.piggybacking.login_via_client`) over its own lightweight
 kubeconfig parsing. `kubernetes.config.kube_config` bakes `KUBECONFIG` into a module-level
@@ -302,9 +313,14 @@ Rotating the SYSDBA secret's password (`sysdba_secret_update_fn` in `src/kubebir
   covers it too — if the same secret is referenced by more than one `Instance`, the
   `kubebird.github.io/instance` label just reflects whichever one reconciled it last.
 
-`src/kubebird/delete.py` still declares an unimplemented `@kopf.on.delete` stub (`delete_fn`) that
-unconditionally `raise NotImplementedError` — treat it as not implemented (worse than a no-op:
-it'll error kopf's handling loop if ever triggered).
+Deleting an `Instance` (`delete_fn` in `src/kubebird/delete.py`, `@kopf.on.delete` on `Instance`):
+logs and sets `status.phase = "Deleting"`, then returns. Registering any `@kopf.on.delete` handler
+at all is what makes kopf attach the `kopf.zalando.org/KopfFinalizerMarker` finalizer to the
+`Instance` in the first place, so the object stays present (with `metadata.deletionTimestamp` set)
+until this handler returns without raising; kopf then drops the finalizer, the `Instance` actually
+disappears, and Kubernetes garbage-collects every `kopf.adopt()`-ed object through its owner
+references — the same outcome as before `delete_fn` existed, just no longer racing the `Instance`
+object's own removal against that garbage collection.
 
 `deploy/crd.yaml` holds the `CustomResourceDefinition` (OpenAPI v3 schema for the `spec`/`status`
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
