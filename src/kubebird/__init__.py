@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from kubebird!")
+__all__ = ["create"]
