@@ -1,9 +1,14 @@
+import shlex
 import time
 from pathlib import Path
 
 import yaml
 from kopf.testing import KopfRunner
 from kubernetes import client, config
+from kubernetes.stream import stream
+
+from kubebird.create import CONTAINER_NAME
+from kubebird.k8s import DATA_MOUNT_PATH
 
 DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 CRD_PATH = DEPLOY_DIR / "crd.yaml"
@@ -21,6 +26,43 @@ def _wait_established(
             return
         time.sleep(0.5)
     raise TimeoutError(f"CustomResourceDefinition {name!r} did not become Established")
+
+
+def _wait_ready(
+    api: client.CustomObjectsApi,
+    *,
+    group: str,
+    version: str,
+    namespace: str,
+    plural: str,
+    name: str,
+    timeout: float = 420.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        obj = api.get_namespaced_custom_object(group, version, namespace, plural, name)
+        phase = (obj.get("status") or {}).get("phase")
+        if phase == "Ready":
+            return obj
+        time.sleep(2)
+    raise TimeoutError(f"Instance {name!r} did not reach phase Ready in time")
+
+
+def _assert_database_file_exists(
+    core_api: client.CoreV1Api, *, namespace: str, pod_name: str, path: str
+) -> None:
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=CONTAINER_NAME,
+        command=["/bin/sh", "-c", f"test -f {shlex.quote(path)} && echo EXISTS"],
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    assert "EXISTS" in output, f"database file {path!r} was not created: {output}"
 
 
 def test_create_instance(kubeconfig: Path) -> None:
@@ -46,7 +88,23 @@ def test_create_instance(kubeconfig: Path) -> None:
         objects_api.create_namespaced_custom_object(
             group, version, namespace, plural, cr_body
         )
-        time.sleep(3)
+        instance = _wait_ready(
+            objects_api,
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+        )
+        assert instance["status"]["phase"] == "Ready"
+
+        db_name = cr_body["spec"]["databases"][0]["name"]
+        _assert_database_file_exists(
+            client.CoreV1Api(),
+            namespace=namespace,
+            pod_name=f"{name}-0",
+            path=f"{DATA_MOUNT_PATH}/{db_name}",
+        )
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name
         )
