@@ -98,6 +98,9 @@ def update_fn(
             container=CONTAINER_NAME,
             sysdba_password=sysdba_password,
             path=db_path,
+            page_size=database.get("pageSize", 8192),
+            charset=database.get("charset", "UTF8"),
+            collation=database.get("collation", "UTF8"),
             logger=logger,
         )
         if database.get("shadow"):

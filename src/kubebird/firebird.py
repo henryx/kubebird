@@ -166,9 +166,15 @@ def create_database(
     container: str,
     sysdba_password: str,
     path: str,
+    page_size: int,
+    charset: str,
+    collation: str,
     logger: kopf.Logger,
 ) -> str:
-    sql = f"CREATE DATABASE 'localhost:{path}' USER 'SYSDBA' PASSWORD '{sysdba_password}';"
+    sql = (
+        f"CREATE DATABASE 'localhost:{path}' USER 'SYSDBA' PASSWORD '{sysdba_password}' "
+        f"PAGE_SIZE {page_size} DEFAULT CHARACTER SET {charset} COLLATION {collation};"
+    )
     return run_isql(
         core_api,
         namespace=namespace,
