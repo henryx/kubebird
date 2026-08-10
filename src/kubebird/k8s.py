@@ -13,6 +13,10 @@ FIREBIRD_PORT = 3050
 DATA_MOUNT_PATH = "/var/lib/firebird/data"
 SHADOW_MOUNT_PATH = "/var/lib/firebird/shadow"
 
+INSTANCE_LABEL = "kubebird.github.io/instance"
+SYSDBA_ROLE_LABEL = "kubebird.github.io/role"
+SYSDBA_ROLE_VALUE = "sysdba"
+
 
 def generate_password(length: int = 32) -> str:
     return secrets.token_urlsafe(length)
@@ -55,6 +59,13 @@ def ensure_sysdba_secret(
     """Return (secret_name, password) for the SYSDBA user, creating a secret if needed."""
     if secret_ref:
         secret = core_api.read_namespaced_secret(secret_ref, namespace)
+        _label_sysdba_secret(
+            core_api,
+            namespace=namespace,
+            secret=secret,
+            instance_name=name,
+            logger=logger,
+        )
         return secret_ref, read_secret_value(secret, "password")
 
     secret_name = f"{name}-sysdba"
@@ -62,7 +73,11 @@ def ensure_sysdba_secret(
     secret_body: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {"name": secret_name, "namespace": namespace},
+        "metadata": {
+            "name": secret_name,
+            "namespace": namespace,
+            "labels": {INSTANCE_LABEL: name, SYSDBA_ROLE_LABEL: SYSDBA_ROLE_VALUE},
+        },
         "stringData": {"username": "SYSDBA", "password": password},
     }
     kopf.adopt(secret_body, owner=body)
@@ -78,6 +93,46 @@ def ensure_sysdba_secret(
         existing = core_api.read_namespaced_secret(secret_name, namespace)
         password = read_secret_value(existing, "password")
     return secret_name, password
+
+
+def _label_sysdba_secret(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    secret: client.V1Secret,
+    instance_name: str,
+    logger: kopf.Logger,
+) -> None:
+    """Label a user-referenced SYSDBA secret so a rotation on it is noticed.
+
+    We don't own this secret (no kopf.adopt()), just tag it with the same
+    labels the auto-generated secret gets, so sysdba_secret_update_fn's watch
+    (filtered by SYSDBA_ROLE_LABEL) also covers it. If the same secret is
+    referenced by more than one Instance, INSTANCE_LABEL reflects whichever
+    one last reconciled it.
+    """
+    labels = secret.metadata.labels or {}
+    if (
+        labels.get(SYSDBA_ROLE_LABEL) == SYSDBA_ROLE_VALUE
+        and labels.get(INSTANCE_LABEL) == instance_name
+    ):
+        return
+    core_api.patch_namespaced_secret(
+        secret.metadata.name,
+        namespace,
+        {
+            "metadata": {
+                "labels": {
+                    INSTANCE_LABEL: instance_name,
+                    SYSDBA_ROLE_LABEL: SYSDBA_ROLE_VALUE,
+                }
+            }
+        },
+        _content_type="application/merge-patch+json",
+    )
+    logger.debug(
+        f"Labeled secret {secret.metadata.name!r} for SYSDBA password-change watching."
+    )
 
 
 def read_user_credentials(

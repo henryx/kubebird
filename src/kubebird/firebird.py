@@ -88,6 +88,7 @@ def run_isql(
     container: str,
     sysdba_password: str,
     sql: str,
+    logger: kopf.Logger,
     database: str | None = None,
 ) -> str:
     # A bare local path makes isql open the database through Firebird's
@@ -111,11 +112,49 @@ def run_isql(
         stdout=True,
         tty=False,
     )
+    logger.debug(f"isql command={command!r} output={output!r}")
     # The exec exit-code channel varies across negotiated websocket
     # subprotocol versions and is unreliable here; isql itself always
     # prints this marker on a failed statement, so check for it instead.
     if "Statement failed" in output:
         raise kopf.PermanentError(f"isql failed (sql={sql!r}): {output}")
+    return output
+
+
+def change_sysdba_password(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    old_password: str,
+    new_password: str,
+    logger: kopf.Logger,
+) -> str:
+    """Change the live SYSDBA password via `gsec`, given the currently-live password."""
+    shell_command = (
+        f"gsec -user SYSDBA -password {shlex.quote(old_password)} "
+        f"-modify SYSDBA -pw {shlex.quote(new_password)}"
+    )
+    command = ["/bin/sh", "-c", shell_command]
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=container,
+        command=command,
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    logger.debug(f"gsec command={command!r} output={output!r}")
+    # gsec prints nothing on success; any output is an error (e.g. the old
+    # password no longer matching what's actually live).
+    if output.strip():
+        raise kopf.PermanentError(
+            f"gsec failed to change the SYSDBA password: {output}"
+        )
     return output
 
 
@@ -127,6 +166,7 @@ def create_database(
     container: str,
     sysdba_password: str,
     path: str,
+    logger: kopf.Logger,
 ) -> str:
     sql = f"CREATE DATABASE 'localhost:{path}' USER 'SYSDBA' PASSWORD '{sysdba_password}';"
     return run_isql(
@@ -136,6 +176,7 @@ def create_database(
         container=container,
         sysdba_password=sysdba_password,
         sql=sql,
+        logger=logger,
     )
 
 
@@ -148,6 +189,7 @@ def create_shadow(
     sysdba_password: str,
     database_path: str,
     shadow_path: str,
+    logger: kopf.Logger,
 ) -> str:
     sql = f"CREATE SHADOW 1 '{shadow_path}';"
     return run_isql(
@@ -158,6 +200,7 @@ def create_shadow(
         sysdba_password=sysdba_password,
         sql=sql,
         database=database_path,
+        logger=logger,
     )
 
 
@@ -171,6 +214,7 @@ def create_user(
     database_path: str,
     username: str,
     password: str,
+    logger: kopf.Logger,
 ) -> str:
     sql = f"CREATE USER \"{username}\" PASSWORD '{password}';"
     return run_isql(
@@ -181,4 +225,5 @@ def create_user(
         sysdba_password=sysdba_password,
         sql=sql,
         database=database_path,
+        logger=logger,
     )

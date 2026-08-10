@@ -103,6 +103,7 @@ def create_fn(
             container=CONTAINER_NAME,
             sysdba_password=sysdba_password,
             path=db_path,
+            logger=logger,
         )
         if database.get("shadow"):
             if shadow_storage is None:
@@ -120,6 +121,7 @@ def create_fn(
                 sysdba_password=sysdba_password,
                 database_path=db_path,
                 shadow_path=shadow_path,
+                logger=logger,
             )
 
     user_secret_ref = (authentication.get("user") or {}).get("secretRef", "")
@@ -138,6 +140,7 @@ def create_fn(
             database_path=first_db_path,
             username=username,
             password=password,
+            logger=logger,
         )
 
     patch.status["phase"] = "Ready"
