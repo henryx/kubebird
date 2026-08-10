@@ -69,7 +69,7 @@ spec:
                       pageSize:
                         type: integer
                         default: 8192
-                        enum: [4096, 8192, 16384]
+                        enum: [4096, 8192, 16384, 32768]
                         description: Database page size, in bytes.
                       charset:
                         type: string
@@ -138,15 +138,6 @@ spec:
                           description: >-
                             Name of an existing Secret holding the SYSDBA password.
                             If empty, the operator generates "<instance-name>-sysdba".
-                    user:
-                      type: object
-                      properties:
-                        secretRef:
-                          type: string
-                          default: ""
-                          description: >-
-                            Name of an existing Secret holding a non-SYSDBA user's
-                            credentials. If empty, no additional user is created.
             status:
               type: object
               properties:

@@ -208,28 +208,3 @@ def create_shadow(
         database=database_path,
         logger=logger,
     )
-
-
-def create_user(
-    core_api: client.CoreV1Api,
-    *,
-    namespace: str,
-    pod_name: str,
-    container: str,
-    sysdba_password: str,
-    database_path: str,
-    username: str,
-    password: str,
-    logger: kopf.Logger,
-) -> str:
-    sql = f"CREATE USER \"{username}\" PASSWORD '{password}';"
-    return run_isql(
-        core_api,
-        namespace=namespace,
-        pod_name=pod_name,
-        container=container,
-        sysdba_password=sysdba_password,
-        sql=sql,
-        database=database_path,
-        logger=logger,
-    )

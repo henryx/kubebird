@@ -141,13 +141,6 @@ def _label_sysdba_secret(
     )
 
 
-def read_user_credentials(
-    core_api: client.CoreV1Api, *, namespace: str, secret_ref: str
-) -> tuple[str, str]:
-    secret = core_api.read_namespaced_secret(secret_ref, namespace)
-    return read_secret_value(secret, "username"), read_secret_value(secret, "password")
-
-
 def build_pvc(
     *, pvc_name: str, namespace: str, instance_name: str, storage: dict[str, Any]
 ) -> dict[str, Any]:

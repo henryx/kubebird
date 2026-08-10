@@ -9,7 +9,7 @@ spec:
   databases:
     - name: "instance.fdb"
       shadow: false
-      pageSize: 8192 # can be 4096, 8192 or 16384. default is 8192
+      pageSize: 8192 # can be 4096, 8192, 16384 or 32768. default is 8192
       charset: "UTF8"
       collation: "UTF8"
     - name: "shadowed.fdb"
@@ -25,6 +25,4 @@ spec:
       size: 3Gi
   authentication:
     sysdba:
-      secretRef: ""
-    user:
       secretRef: ""

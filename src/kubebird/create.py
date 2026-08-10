@@ -114,6 +114,7 @@ def create_fn(
             collation=database.get("collation", "UTF8"),
             logger=logger,
         )
+
         if database.get("shadow"):
             if shadow_storage is None:
                 raise kopf.PermanentError(
@@ -132,25 +133,6 @@ def create_fn(
                 shadow_path=shadow_path,
                 logger=logger,
             )
-
-    user_secret_ref = (authentication.get("user") or {}).get("secretRef", "")
-    if user_secret_ref:
-        username, password = k8s.read_user_credentials(
-            core_api, namespace=namespace, secret_ref=user_secret_ref
-        )
-        first_db_path = f"{k8s.DATA_MOUNT_PATH}/{spec['databases'][0]['name']}"
-        logger.info(f"Creating user {username!r}.")
-        firebird.create_user(
-            core_api,
-            namespace=namespace,
-            pod_name=pod_name,
-            container=CONTAINER_NAME,
-            sysdba_password=sysdba_password,
-            database_path=first_db_path,
-            username=username,
-            password=password,
-            logger=logger,
-        )
 
     patch.status["phase"] = "Ready"
     patch.status["message"] = "Instance provisioned."
