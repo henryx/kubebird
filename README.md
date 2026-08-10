@@ -19,6 +19,9 @@ spec:
   databases:
     - name: "instance.fdb"
       shadow: false
+      pageSize: 8192 # defaults to 8192; one of 4096, 8192, 16384
+      charset: UTF8 # defaults to UTF8
+      collation: UTF8 # defaults to UTF8
     - name: "shadowed.fdb"
       shadow: true
   service:
@@ -33,17 +36,14 @@ spec:
   authentication:
     sysdba:
       secretRef: ""
-    user:
-      secretRef: ""
 ```
 
 With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified. Deployment is made in default namespace.
 - Create a service for the instance. Default service type is `ClusterIP`.
 - Define the PVC used for the instance's primary data (`storage.primary`) with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
-- Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`.
+- Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Authentication section is optional. If is specified, you can:
-  - Declare a user using a secret. If secret isn't specified, no other users than SYSDBA are created. The secret must have `username` and `password` keys.
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
 - Label every object it creates (PVCs, Service, StatefulSet, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 
