@@ -37,8 +37,11 @@ With this CR, Kubebird can:
 - Define the PVC used for the instance with specified size and storage class. If storage class isn't specified, it uses the default storage class.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode.
 - Authentication section is optional. If is specified, you can:
-  - Declare a user using a secret. If secret isn't specified, no other users than SYSDBA are created.
-  - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password.
+  - Declare a user using a secret. If secret isn't specified, no other users than SYSDBA are created. The secret must have `username` and `password` keys.
+  - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
+
+There is no update/delete reconciliation yet: deleting an `Instance` relies on Kubernetes garbage
+collection of the objects Kubebird created for it (they're all owned by the `Instance`).
 
 ## Installation
 
@@ -65,7 +68,7 @@ at the container.
 `tests/test_create.py` uses that fixture, together with [kopf's testing
 utilities](https://docs.kopf.dev/en/stable/testing/), to apply `deploy/crd.yaml` and
 `deploy/cr.yaml` against the k3s cluster and run the operator in-process via
-`kopf.testing.KopfRunner`, asserting that the `create_fn` handler runs successfully. Since
-`create_fn` is currently a no-op, this only exercises the create-event path — deploying an
-`Instance` with a real backing pod is not implemented yet.
+`kopf.testing.KopfRunner`. It's a real end-to-end run: it waits for `status.phase` to reach
+`Ready` (StatefulSet + real Firebird image pull + database provisioning over `isql`), then execs
+into the pod to confirm the database file actually exists on disk before deleting the `Instance`.
 
