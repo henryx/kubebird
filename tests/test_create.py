@@ -5,19 +5,28 @@ from pathlib import Path
 import yaml
 from kopf.testing import KopfRunner
 from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 from kubernetes.stream import stream
 
 from kubebird.create import CONTAINER_NAME
-from kubebird.k8s import DATA_MOUNT_PATH
+from kubebird.k8s import DATA_MOUNT_PATH, SHADOW_MOUNT_PATH
 
 DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 CRD_PATH = DEPLOY_DIR / "crd.yaml"
 CR_PATH = DEPLOY_DIR / "cr.yaml"
 
 
-def _wait_established(
-    api: client.ApiextensionsV1Api, name: str, timeout: float = 30.0
+def _ensure_crd_established(
+    api: client.ApiextensionsV1Api, crd_body: dict, timeout: float = 30.0
 ) -> None:
+    """Create the (cluster-scoped) CRD, tolerating it already existing from another test."""
+    name = crd_body["metadata"]["name"]
+    try:
+        api.create_custom_resource_definition(crd_body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         crd = api.read_custom_resource_definition(name)
@@ -77,8 +86,7 @@ def test_create_instance(kubeconfig: Path) -> None:
     name = cr_body["metadata"]["name"]
 
     extensions_api = client.ApiextensionsV1Api()
-    extensions_api.create_custom_resource_definition(crd_body)
-    _wait_established(extensions_api, crd_body["metadata"]["name"])
+    _ensure_crd_established(extensions_api, crd_body)
 
     objects_api = client.CustomObjectsApi()
 
@@ -98,12 +106,64 @@ def test_create_instance(kubeconfig: Path) -> None:
         )
         assert instance["status"]["phase"] == "Ready"
 
-        db_name = cr_body["spec"]["databases"][0]["name"]
+        primary_db = next(
+            db for db in cr_body["spec"]["databases"] if not db.get("shadow")
+        )
         _assert_database_file_exists(
             client.CoreV1Api(),
             namespace=namespace,
             pod_name=f"{name}-0",
-            path=f"{DATA_MOUNT_PATH}/{db_name}",
+            path=f"{DATA_MOUNT_PATH}/{primary_db['name']}",
+        )
+        objects_api.delete_namespaced_custom_object(
+            group, version, namespace, plural, name
+        )
+        time.sleep(1)
+
+    assert runner.exit_code == 0
+    assert runner.exception is None
+    assert "Handler 'create_fn' succeeded." in runner.output
+
+
+def test_create_instance_shadow_database(kubeconfig: Path) -> None:
+    config.load_kube_config(config_file=str(kubeconfig))
+
+    crd_body = yaml.safe_load(CRD_PATH.read_text())
+    cr_body = yaml.safe_load(CR_PATH.read_text())
+    cr_body["metadata"]["name"] = "test-shadow"
+
+    group, version = cr_body["apiVersion"].split("/")
+    plural = crd_body["spec"]["names"]["plural"]
+    namespace = cr_body["metadata"]["namespace"]
+    name = cr_body["metadata"]["name"]
+
+    extensions_api = client.ApiextensionsV1Api()
+    _ensure_crd_established(extensions_api, crd_body)
+
+    objects_api = client.CustomObjectsApi()
+
+    with KopfRunner(
+        ["run", "-n", namespace, "--verbose", "-m", "kubebird.create"]
+    ) as runner:
+        objects_api.create_namespaced_custom_object(
+            group, version, namespace, plural, cr_body
+        )
+        instance = _wait_ready(
+            objects_api,
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+        )
+        assert instance["status"]["phase"] == "Ready"
+
+        shadow_db = next(db for db in cr_body["spec"]["databases"] if db.get("shadow"))
+        _assert_database_file_exists(
+            client.CoreV1Api(),
+            namespace=namespace,
+            pod_name=f"{name}-0",
+            path=f"{SHADOW_MOUNT_PATH}/{shadow_db['name']}.shadow",
         )
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name
