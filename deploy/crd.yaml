@@ -81,15 +81,38 @@ spec:
                 storage:
                   type: object
                   required:
-                    - size
+                    - primary
                   properties:
-                    class:
-                      type: string
-                      default: ""
-                      description: StorageClass name. Empty string uses the cluster default StorageClass.
-                    size:
-                      type: string
-                      description: Requested size of the PVC, e.g. "3Gi".
+                    primary:
+                      type: object
+                      required:
+                        - size
+                      description: Storage for the primary database files.
+                      properties:
+                        class:
+                          type: string
+                          default: ""
+                          description: StorageClass name. Empty string uses the cluster default StorageClass.
+                        size:
+                          type: string
+                          description: Requested size of the primary-data PVC, e.g. "3Gi".
+                          pattern: '^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkKMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$'
+                    shadow:
+                      type: object
+                      required:
+                        - size
+                      description: >-
+                        Storage for shadow database files, on a separate PVC from the primary
+                        data. Can be omitted if no entry in "databases" has "shadow: true".
+                      properties:
+                        class:
+                          type: string
+                          default: ""
+                          description: StorageClass name. Empty string uses the cluster default StorageClass.
+                        size:
+                          type: string
+                          description: Requested size of the shadow-files PVC, e.g. "3Gi".
+                          pattern: '^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkKMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$'
                 authentication:
                   type: object
                   properties:

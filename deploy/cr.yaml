@@ -9,11 +9,17 @@ spec:
   databases:
     - name: "instance.fdb"
       shadow: false
+    - name: "shadowed.fdb"
+      shadow: true
   service:
     type: ClusterIP
   storage:
-    class: "" # if empty, uses the default storage class
-    size: 3Gi
+    primary:
+      class: "" # if empty, uses the default storage class
+      size: 3Gi
+    shadow: # can be omitted if no database above has "shadow: true"
+      class: ""
+      size: 3Gi
   authentication:
     sysdba:
       secretRef: ""
