@@ -5,12 +5,17 @@ import kopf
 
 @kopf.on.delete(kind="Instance", version="v1", group="kubebird.github.io")
 def delete_fn(
-    spec: kopf.Spec,
     name: str,
     namespace: str,
     logger: kopf.Logger,
-    body: kopf.Body,
     patch: kopf.Patch,
     **_: Any,
 ) -> None:
-    raise NotImplementedError("Not implemented")
+    """Nothing to actively clean up here: every object create_fn/update_fn
+    made was adopted via kopf.adopt(), so Kubernetes garbage-collects all of
+    them (Secret, PVC(s), Service, StatefulSet) through their owner
+    references as soon as this handler returns and kopf drops the finalizer
+    it adds for having any on.delete handler registered at all.
+    """
+    logger.info(f"Deleting instance {name!r} in namespace {namespace!r}.")
+    patch.status["phase"] = "Deleting"
