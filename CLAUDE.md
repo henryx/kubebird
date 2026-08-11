@@ -7,12 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Kubebird is a Kubernetes operator, built in Python on top of `kopf`, that installs and manages
 [Firebird RDBMS](https://firebirdsql.org/) instances via a namespaced `Instance` custom resource.
 
-The project is at an early stage but `create_fn` (`src/kubebird/create.py`, `@kopf.on.create(
-kind="Instance", version="v1", group="kubebird.github.io")`) now implements the full reconciliation
-described in "Architecture" below. `kopf` and `kubernetes` (the official Python client) are
-declared dependencies. `src/kubebird/update.py` also implements two real handlers now (`update_fn`
-for `Instance` spec changes, `sysdba_secret_update_fn` for SYSDBA secret rotations), and
-`src/kubebird/delete.py`'s `delete_fn` (`@kopf.on.delete`) is implemented too — see "Architecture".
+Kubebird implements the full `Instance` lifecycle described in "Architecture" below: `create_fn`
+(`src/kubebird/create.py`, `@kopf.on.create(kind="Instance", version="v1",
+group="kubebird.github.io")`) provisions it, `update_fn`/`sysdba_secret_update_fn`
+(`src/kubebird/update.py`) reconcile spec changes and SYSDBA secret rotations, and `delete_fn`
+(`src/kubebird/delete.py`) handles deletion. `kopf` and `kubernetes` (the official Python client)
+are declared dependencies. Still missing: a `deploy/operator.yaml` for running the operator
+in-cluster (Deployment + RBAC), and `update_fn` support for changes to `authentication`/`storage`
+(only `service`/`version`/`databases` are reconciled today).
 
 The implementation is split across five modules:
 - `src/kubebird/k8s.py` — builds the `Secret`/`PersistentVolumeClaim`/`Service`/`StatefulSet`
@@ -38,10 +40,21 @@ The implementation is split across five modules:
   is the finalizer kopf attaches for having *any* `on.delete` handler registered at all, which
   blocks the `Instance`'s own removal until the handler completes.
 
-There is currently no CLI entry point: `pyproject.toml` has no `[project.scripts]` section, and
-`src/kubebird/__init__.py` only declares `__all__ = ["create", "delete", "firebird", "k8s",
-"update"]` (no `main()`). Until an entry point is added, run the operator directly via `kopf`, e.g.
-`uv run kopf run -m kubebird.create -m kubebird.update`.
+`src/kubebird_operator.py` is the CLI entry point (a standalone module, sibling to the `kubebird`
+package, not inside it — `pyproject.toml`'s `[project.scripts]` maps `kubebird-operator` to
+`kubebird_operator:main`). It imports `kubebird.create`/`delete`/`update` purely for their
+`@kopf.on.*` decorators' side effect of registering handlers in kopf's default registry — required
+because, unlike the CLI's `-m` flag, `kopf.run()` only sees handlers from modules already imported
+by the time it's called. It also runs the operator on `uvloop`: kopf's own CLI auto-detects and
+injects uvloop, but only for the CLI (`kopf._kits.loops.proper_loop`) — `kopf.run()` itself does
+not manage the event loop when embedded like this, so `main()` replicates that CLI-internal
+mechanism explicitly (`asyncio.Runner(loop_factory=uvloop.new_event_loop)`, then
+`kopf.run(loop=runner.get_loop())`). It also reads a `NAMESPACE` env var and, if set, passes it as
+`kopf.run(namespaces=[NAMESPACE])` to scope the operator to one namespace (e.g. via the pod's
+Downward API); left unset, `kopf.run()` falls back to its own default (cluster-wide/current
+context), matching `kopf run` with neither `-n` nor `-A`. It has a `#!/usr/bin/env python3` shebang
+and is `chmod +x`'d, so `./src/kubebird_operator.py` also works directly, not just through the
+`kubebird-operator` console script.
 
 Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
 - A bare local path (e.g. `/var/lib/firebird/data/x.fdb`) makes `isql` connect through Firebird's
@@ -127,14 +140,33 @@ Equivalent tox environments (each runs in its own venv via `uv`):
 ```bash
 tox -e lint      # ruff check
 tox -e format    # ruff format
+tox -e type      # mypy src/kubebird tests
 tox -e py3       # uv sync + pytest with coverage (--cov=src/kubebird)
 tox -e report    # coverage report + html
 tox -e clean     # coverage erase
 ```
 
-Run the full default suite (`clean, lint, format, py3, report`) with plain `tox`. There is a
-`type` env defined in `tox.ini` for `mypy` (targets `src/kubebird tests`), but it is currently
-commented out of `env_list` — add it back there to enable it.
+Run the full default suite (`clean, lint, format, type, py3, report`) with plain `tox`.
+`[testenv:type]` originally just declared `deps = mypy>=0.991` with no `skip_install`/`uv sync`
+step (unlike every other testenv here), so it ran in an isolated venv missing even `kopf` and
+`kubernetes` — producing ~25 of its ~31 errors as bogus `import-not-found` noise. Fixed by making it
+match `[testenv]`'s pattern (`skip_install = True`, `deps = uv`, `uv sync --active` before the bare
+`mypy` command) and adding `mypy` itself to the `dev` dependency-group, plus `pyyaml`/`types-pyyaml`
+(tests do `import yaml`) and a `[[tool.mypy.overrides]] module = "kubernetes.*" ignore_missing_imports
+= true` in `pyproject.toml` (`kubernetes` genuinely ships no stubs/`py.typed` marker at all; `kopf`
+and `testcontainers` both do, so they only needed the env fix). That leaves 8 real errors, not yet
+fixed, confined to `create.py`/`update.py`/`delete.py`:
+- 4 `@kopf.on.*` handlers flagged as incompatible with `ChangingFn`, since kopf's
+  `ChangingFn.__call__` protocol types every handler kwarg as `namespace: str | None` (cluster-scoped
+  resources have none) — our handlers all declare `namespace: str`, which is narrower and so not a
+  valid substitute, even though `Instance` (and the `Secret` in `sysdba_secret_update_fn`) are always
+  namespaced in practice.
+- `update.py`: `_, sysdba_password = k8s.ensure_sysdba_secret(...)` reuses `_` as the throwaway
+  tuple-unpack target, but `_` is *also* the function's own `**_: Any` catch-all parameter name (a
+  `dict[str, Any]`) — reassigning it to a `str` is a genuine type conflict, not a stub issue.
+- `update.py`: three `dict.get()` "no overload variant matches" errors chained off `old.get("spec")`
+  and `meta["labels"]`-adjacent code — still investigating whether this is a real narrowing bug or
+  another `kopf.Body`/`Meta` (`dicts.MappingView`) stub-overload mismatch.
 
 `tests/conftest.py` defines a session-scoped `k3s` fixture (via `testcontainers`'s
 `K3SContainer`, from `testcontainers.community.k3s` — `testcontainers.k3s` is deprecated) that
@@ -338,5 +370,8 @@ on `pods` and `create` on `pods/exec` (needed for the `isql`/`gsec` provisioning
 
 ## Requirements
 
-Python >= 3.14 (see `.python-version`, pinned to 3.14). `pyproject.toml` currently defines no
-`[project.scripts]` entry point (see "Development commands" above for how to run the operator).
+Python >= 3.14 (see `.python-version`, pinned to 3.14). `uv run kubebird-operator` (or
+`NAMESPACE=default uv run kubebird-operator` to scope it to one namespace) runs the operator via
+the `kubebird-operator` console script (`src/kubebird_operator.py`, on `uvloop`); the tests
+themselves still drive it via `kopf.testing.KopfRunner` and `-m kubebird.<module>` instead (see
+"Development commands" above), not through this entry point.

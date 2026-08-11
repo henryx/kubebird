@@ -67,13 +67,22 @@ kubectl apply -f deploy/crd.yaml
 kubectl apply -f deploy/operator.yaml
 ```
 
+The operator itself runs via the `kubebird-operator` console script (on `uvloop`):
+```bash
+uv run kubebird-operator
+# or, to scope it to a single namespace instead of the whole cluster:
+NAMESPACE=default uv run kubebird-operator
+# src/kubebird_operator.py is also directly executable:
+./src/kubebird_operator.py
+```
+
 
 ## Development Commands
 ```bash
 # Setup
 $ uv init --name Kubebird --app --description "Kubebird - A Kubernetes operator for Firebird" --build-backend uv --no-readme
-$ uv add kopf kubernetes
-$ uv add --dev pytest pytest-cov tox ruff
+$ uv add kopf kubernetes uvloop
+$ uv add --dev pytest pytest-cov tox ruff mypy pyyaml types-pyyaml
 $ uv add --dev testcontainers
 ```
 For e2e tests, `testcontainers` is used to run a k3s cluster: `tests/conftest.py` defines a
