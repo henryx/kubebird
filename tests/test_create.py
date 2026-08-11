@@ -82,7 +82,7 @@ def test_create_instance(kubeconfig: Path) -> None:
 
     group, version = cr_body["apiVersion"].split("/")
     plural = crd_body["spec"]["names"]["plural"]
-    namespace = cr_body["metadata"]["namespace"]
+    namespace = "default"
     name = cr_body["metadata"]["name"]
 
     extensions_api = client.ApiextensionsV1Api()
@@ -134,7 +134,7 @@ def test_create_instance_shadow_database(kubeconfig: Path) -> None:
 
     group, version = cr_body["apiVersion"].split("/")
     plural = crd_body["spec"]["names"]["plural"]
-    namespace = cr_body["metadata"]["namespace"]
+    namespace = "default"
     name = cr_body["metadata"]["name"]
 
     extensions_api = client.ApiextensionsV1Api()

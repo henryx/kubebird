@@ -92,7 +92,9 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
 
     auth_api = client.AuthorizationV1Api()
 
-    def can(verb: str, resource: str, **kwargs: object) -> bool:
+    def can(
+        verb: str, resource: str, *, group: str = "", subresource: str | None = None
+    ) -> bool:
         return _can(
             auth_api,
             service_account=service_account,
@@ -100,10 +102,13 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
             resource_namespace=namespace,
             verb=verb,
             resource=resource,
-            **kwargs,
+            group=group,
+            subresource=subresource,
         )
 
-    def can_cluster(verb: str, resource: str, **kwargs: object) -> bool:
+    def can_cluster(
+        verb: str, resource: str, *, group: str = "", subresource: str | None = None
+    ) -> bool:
         return _can(
             auth_api,
             service_account=service_account,
@@ -111,7 +116,8 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
             resource_namespace="",
             verb=verb,
             resource=resource,
-            **kwargs,
+            group=group,
+            subresource=subresource,
         )
 
     # Application-level: exactly what create.py/update.py/k8s.py/firebird.py call.
