@@ -72,9 +72,14 @@ The operator itself runs via the `kubebird-operator` console script (on `uvloop`
 uv run kubebird-operator
 # or, to scope it to a single namespace instead of the whole cluster:
 NAMESPACE=default uv run kubebird-operator
-# src/kubebird_operator.py is also directly executable:
-./src/kubebird_operator.py
 ```
+
+To build the container image instead:
+```bash
+docker build --build-arg VERSION=0.1.0 -t kubebird:0.1.0 .
+```
+The image runs as a non-root `appuser` (uid 8877) on a Red Hat UBI10 base and starts
+`kubebird-operator` by default.
 
 
 ## Development Commands

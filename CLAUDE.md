@@ -40,10 +40,10 @@ The implementation is split across five modules:
   is the finalizer kopf attaches for having *any* `on.delete` handler registered at all, which
   blocks the `Instance`'s own removal until the handler completes.
 
-`src/kubebird_operator.py` is the CLI entry point (a standalone module, sibling to the `kubebird`
-package, not inside it — `pyproject.toml`'s `[project.scripts]` maps `kubebird-operator` to
-`kubebird_operator:main`). It imports `kubebird.create`/`delete`/`update` purely for their
-`@kopf.on.*` decorators' side effect of registering handlers in kopf's default registry — required
+`src/kubebird/operator.py` is the CLI entry point (`pyproject.toml`'s `[project.scripts]` maps
+`kubebird-operator` to `kubebird.operator:main`). It imports `kubebird.create`/`delete`/`update`
+purely for their `@kopf.on.*` decorators' side effect of registering handlers in kopf's default
+registry — required
 because, unlike the CLI's `-m` flag, `kopf.run()` only sees handlers from modules already imported
 by the time it's called. It also runs the operator on `uvloop`: kopf's own CLI auto-detects and
 injects uvloop, but only for the CLI (`kopf._kits.loops.proper_loop`) — `kopf.run()` itself does
@@ -52,9 +52,11 @@ mechanism explicitly (`asyncio.Runner(loop_factory=uvloop.new_event_loop)`, then
 `kopf.run(loop=runner.get_loop())`). It also reads a `NAMESPACE` env var and, if set, passes it as
 `kopf.run(namespaces=[NAMESPACE])` to scope the operator to one namespace (e.g. via the pod's
 Downward API); left unset, `kopf.run()` falls back to its own default (cluster-wide/current
-context), matching `kopf run` with neither `-n` nor `-A`. It has a `#!/usr/bin/env python3` shebang
-and is `chmod +x`'d, so `./src/kubebird_operator.py` also works directly, not just through the
-`kubebird-operator` console script.
+context), matching `kopf run` with neither `-n` nor `-A`. It is a regular (non-executable) file
+with no `#!/usr/bin/env python3` shebang and no `if __name__ == "__main__": main()` guard, so it
+is *not* directly executable (`python -m kubebird.operator` would import it and define `main()`
+without calling it); the `kubebird-operator` console script (which calls `main()` itself via its
+generated wrapper) is the only way to run it.
 
 Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
 - A bare local path (e.g. `/var/lib/firebird/data/x.fdb`) makes `isql` connect through Firebird's
@@ -368,10 +370,37 @@ specifically (`update_fn` re-reads them, `sysdba_secret_update_fn` watches and l
 on `pods` and `create` on `pods/exec` (needed for the `isql`/`gsec` provisioning in
 `firebird.py`); plus whatever kopf itself needs for peering/events (see kopf's own RBAC docs).
 
+## Container image
+
+`Dockerfile` builds the operator into a container image via three stages, all based on the same
+`registry.access.redhat.com/ubi10/python-314-minimal` image:
+- `build` — creates a venv, installs `uv`, and runs `uv build --wheel` to produce
+  `dist/kubebird-<version>-py3-none-any.whl` from `pyproject.toml`/`src/`.
+- `user` — the minimal image ships no `useradd` (no `shadow-utils` package at all), so this stage
+  runs `microdnf install -y shadow-utils` first, then creates `appuser` (uid 8877). The final
+  stage only copies its resulting `/etc/passwd`/`/etc/group` over, not the installed package, to
+  avoid carrying `shadow-utils` (and its `microdnf` cache) into the final image.
+- The final (unnamed) stage installs the wheel from `build` into its own venv via
+  `pip install --no-cache-dir /app/*.whl` — a wildcard, not a version-pinned filename, so the
+  `VERSION` build-arg only affects the `LABEL version=$VERSION` metadata and is otherwise optional;
+  it used to also gate finding the right wheel file (`kubebird-${VERSION}-py3-none-any.whl`), which
+  broke the build entirely if omitted or mismatched. `chown`s `/app` to `appuser` and runs as that
+  non-root user from then on.
+- `CMD` is `/app/venv/bin/kubebird-operator` — must match `[project.scripts]`'s key exactly
+  (`kubebird-operator`, hyphenated). `pip install`s a wheel's console-script entry points under
+  that exact key, not the underscored module path it maps to (`kubebird.operator:main`) — a
+  previous version of this Dockerfile had `CMD ["/app/venv/bin/kubebird_operator"]` (underscore),
+  which doesn't exist and fails at container start with "exec format error"/"no such file".
+
+Build with `docker build --build-arg VERSION=<version> -t kubebird:<version> .`. Verified against
+a real `docker build`+`docker run`: the image builds, `id`/`whoami` inside it report `appuser`
+(uid 8877, not root), and `kubebird-operator` starts and gets exactly as far as attempting
+kopf's cluster login (expected to fail outside an actual cluster/kubeconfig).
+
 ## Requirements
 
 Python >= 3.14 (see `.python-version`, pinned to 3.14). `uv run kubebird-operator` (or
 `NAMESPACE=default uv run kubebird-operator` to scope it to one namespace) runs the operator via
-the `kubebird-operator` console script (`src/kubebird_operator.py`, on `uvloop`); the tests
+the `kubebird-operator` console script (`src/kubebird/operator.py`, on `uvloop`); the tests
 themselves still drive it via `kopf.testing.KopfRunner` and `-m kubebird.<module>` instead (see
 "Development commands" above), not through this entry point.
