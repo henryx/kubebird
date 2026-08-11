@@ -11,14 +11,17 @@ from .create import CONTAINER_NAME
 @kopf.on.update(kind="Instance", version="v1", group="kubebird.github.io")
 def update_fn(
     spec: kopf.Spec,
-    old: kopf.Body,
+    old: kopf.BodyEssence | Any | None,
     name: str,
-    namespace: str,
+    namespace: str | None,
     logger: kopf.Logger,
     body: kopf.Body,
     patch: kopf.Patch,
     **_: Any,
 ) -> None:
+    if namespace is None:
+        raise kopf.PermanentError("Instance is namespaced")
+
     core_api = client.CoreV1Api()
     apps_api = client.AppsV1Api()
 
@@ -26,7 +29,7 @@ def update_fn(
 
     authentication = spec.get("authentication") or {}
     sysdba_secret_ref = (authentication.get("sysdba") or {}).get("secretRef", "")
-    _, sysdba_password = k8s.ensure_sysdba_secret(
+    _secret_name, sysdba_password = k8s.ensure_sysdba_secret(
         core_api,
         namespace=namespace,
         name=name,
@@ -133,15 +136,22 @@ def update_fn(
     labels={k8s.SYSDBA_ROLE_LABEL: k8s.SYSDBA_ROLE_VALUE},
 )
 def sysdba_secret_update_fn(
-    old: kopf.Body,
-    new: kopf.Body,
+    old: kopf.BodyEssence | Any | None,
+    new: kopf.BodyEssence | Any | None,
     meta: kopf.Meta,
-    namespace: str,
+    namespace: str | None,
     logger: kopf.Logger,
     **_: Any,
 ) -> None:
-    old_password_b64 = ((old or {}).get("data") or {}).get("password")
-    new_password_b64 = ((new or {}).get("data") or {}).get("password")
+    if namespace is None:
+        raise kopf.PermanentError("the SYSDBA Secret is namespaced")
+
+    # "data" is a Secret-specific field, outside BodyEssence's generic
+    # metadata/spec/status schema, so its .get() falls back to `object`.
+    old_essence: Any = old or {}
+    new_essence: Any = new or {}
+    old_password_b64 = (old_essence.get("data") or {}).get("password")
+    new_password_b64 = (new_essence.get("data") or {}).get("password")
     if not old_password_b64 or not new_password_b64:
         return  # nothing to compare against yet (e.g. secret just created)
     if old_password_b64 == new_password_b64:

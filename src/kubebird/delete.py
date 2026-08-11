@@ -6,7 +6,7 @@ import kopf
 @kopf.on.delete(kind="Instance", version="v1", group="kubebird.github.io")
 def delete_fn(
     name: str,
-    namespace: str,
+    namespace: str | None,
     logger: kopf.Logger,
     patch: kopf.Patch,
     **_: Any,
@@ -17,5 +17,8 @@ def delete_fn(
     references as soon as this handler returns and kopf drops the finalizer
     it adds for having any on.delete handler registered at all.
     """
+    if namespace is None:
+        raise kopf.PermanentError("Instance is namespaced")
+
     logger.info(f"Deleting instance {name!r} in namespace {namespace!r}.")
     patch.status["phase"] = "Deleting"

@@ -12,12 +12,15 @@ CONTAINER_NAME = "firebird"
 def create_fn(
     spec: kopf.Spec,
     name: str,
-    namespace: str,
+    namespace: str | None,
     logger: kopf.Logger,
     body: kopf.Body,
     patch: kopf.Patch,
     **_: Any,
 ) -> None:
+    if namespace is None:
+        raise kopf.PermanentError("Instance is namespaced")
+
     core_api = client.CoreV1Api()
     apps_api = client.AppsV1Api()
 
