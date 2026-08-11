@@ -12,7 +12,6 @@ apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
   name: test
-  namespace: default
 spec:
   image: firebirdsql/firebird
   version: 3.0.14
@@ -39,7 +38,7 @@ spec:
 ```
 
 With this CR, Kubebird can:
-- Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified. Deployment is made in default namespace.
+- Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in.
 - Create a service for the instance. Default service type is `ClusterIP`.
 - Define the PVC used for the instance's primary data (`storage.primary`) with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
@@ -64,8 +63,13 @@ it (they're all owned by the `Instance`); the operator itself just logs the dele
 To install Kubebird in the Kubernetes cluster, you can use these commands:
 ```bash
 kubectl apply -f deploy/crd.yaml
-kubectl apply -f deploy/operator.yaml
+kubectl apply -n <namespace> -f deploy/operator.yaml
 ```
+`deploy/operator.yaml` deploys the operator itself (Deployment, ServiceAccount, and the RBAC it
+needs) scoped to a single namespace: `-n <namespace>` picks which one. The only manual step if you
+deploy outside the `default` namespace is updating the `ClusterRoleBinding`'s `subjects[].namespace`
+in `deploy/operator.yaml` to match — a plain cluster-scoped object can't infer that at apply-time
+the way the rest of the file does.
 
 The operator itself runs via the `kubebird-operator` console script (on `uvloop`):
 ```bash
@@ -113,6 +117,18 @@ actually took effect against the live `Service`/`StatefulSet`/pod.
 `tests/test_delete.py` covers deletion the same way: deletes a `Ready` `Instance` and confirms it
 actually disappears (not just that the delete call returned) and that Kubernetes garbage-collects
 the `StatefulSet` it owned.
+
+`tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies `deploy/operator.yaml`
+(ServiceAccount, ClusterRole/ClusterRoleBinding, Role/RoleBinding, Deployment) and checks, via
+`SubjectAccessReview`, that the resulting ServiceAccount actually gets every permission the
+operator's code calls for — much faster than the other suites since it doesn't need the container
+image to actually be pullable or any pod to schedule.
+
+## CI
+
+`.github/workflows/ci.yml` runs the full `tox` suite above on every push. If it passes, the image
+is built and pushed to `quay.io/kubebird/operator` — `:latest` for a plain push, or a tag-named
+image (e.g. `:v1.2.3`) for a tag push. Requires repo secrets `QUAY_USERNAME`/`QUAY_PASSWORD`.
 
 ## License
 

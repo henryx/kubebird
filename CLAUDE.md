@@ -12,9 +12,9 @@ Kubebird implements the full `Instance` lifecycle described in "Architecture" be
 group="kubebird.github.io")`) provisions it, `update_fn`/`sysdba_secret_update_fn`
 (`src/kubebird/update.py`) reconcile spec changes and SYSDBA secret rotations, and `delete_fn`
 (`src/kubebird/delete.py`) handles deletion. `kopf` and `kubernetes` (the official Python client)
-are declared dependencies. Still missing: a `deploy/operator.yaml` for running the operator
-in-cluster (Deployment + RBAC), and `update_fn` support for changes to `authentication`/`storage`
-(only `service`/`version`/`databases` are reconciled today).
+are declared dependencies. `deploy/operator.yaml` runs the operator in-cluster (Deployment + RBAC,
+see "Architecture" below); still missing: `update_fn` support for changes to
+`authentication`/`storage` (only `service`/`version`/`databases` are reconciled today).
 
 The implementation is split across five modules:
 - `src/kubebird/k8s.py` — builds the `Secret`/`PersistentVolumeClaim`/`Service`/`StatefulSet`
@@ -148,33 +148,53 @@ tox -e report    # coverage report + html
 tox -e clean     # coverage erase
 ```
 
-Run the full default suite (`clean, lint, format, type, py3, report`) with plain `tox`.
-`[testenv:type]` originally just declared `deps = mypy>=0.991` with no `skip_install`/`uv sync`
-step (unlike every other testenv here), so it ran in an isolated venv missing even `kopf` and
-`kubernetes` — producing ~25 of its ~31 errors as bogus `import-not-found` noise. Fixed by making it
-match `[testenv]`'s pattern (`skip_install = True`, `deps = uv`, `uv sync --active` before the bare
-`mypy` command) and adding `mypy` itself to the `dev` dependency-group, plus `pyyaml`/`types-pyyaml`
-(tests do `import yaml`) and a `[[tool.mypy.overrides]] module = "kubernetes.*" ignore_missing_imports
-= true` in `pyproject.toml` (`kubernetes` genuinely ships no stubs/`py.typed` marker at all; `kopf`
-and `testcontainers` both do, so they only needed the env fix). That leaves 8 real errors, not yet
-fixed, confined to `create.py`/`update.py`/`delete.py`:
-- 4 `@kopf.on.*` handlers flagged as incompatible with `ChangingFn`, since kopf's
+Run the full default suite (`clean, lint, format, type, py3, report`) with plain `tox`; all six
+pass cleanly. `[testenv:type]` originally just declared `deps = mypy>=0.991` with no
+`skip_install`/`uv sync` step (unlike every other testenv here), so it ran in an isolated venv
+missing even `kopf` and `kubernetes` — producing ~25 of its ~31 errors as bogus `import-not-found`
+noise. Fixed by making it match `[testenv]`'s pattern (`skip_install = True`, `deps = uv`,
+`uv sync --active` before the bare `mypy` command) and adding `mypy` itself to the `dev`
+dependency-group, plus `pyyaml`/`types-pyyaml` (tests do `import yaml`) and a
+`[[tool.mypy.overrides]] module = "kubernetes.*" ignore_missing_imports = true` in
+`pyproject.toml` (`kubernetes` genuinely ships no stubs/`py.typed` marker at all; `kopf` and
+`testcontainers` both do, so they only needed the env fix). That left 8 real errors, since fixed,
+confined to `create.py`/`update.py`/`delete.py`:
+- 4 `@kopf.on.*` handlers were flagged as incompatible with `ChangingFn`, since kopf's
   `ChangingFn.__call__` protocol types every handler kwarg as `namespace: str | None` (cluster-scoped
-  resources have none) — our handlers all declare `namespace: str`, which is narrower and so not a
+  resources have none) — our handlers all declared `namespace: str`, which is narrower and so not a
   valid substitute, even though `Instance` (and the `Secret` in `sysdba_secret_update_fn`) are always
-  namespaced in practice.
-- `update.py`: `_, sysdba_password = k8s.ensure_sysdba_secret(...)` reuses `_` as the throwaway
-  tuple-unpack target, but `_` is *also* the function's own `**_: Any` catch-all parameter name (a
-  `dict[str, Any]`) — reassigning it to a `str` is a genuine type conflict, not a stub issue.
-- `update.py`: three `dict.get()` "no overload variant matches" errors chained off `old.get("spec")`
-  and `meta["labels"]`-adjacent code — still investigating whether this is a real narrowing bug or
-  another `kopf.Body`/`Meta` (`dicts.MappingView`) stub-overload mismatch.
+  namespaced in practice. Fixed by widening to `namespace: str | None` and narrowing back with
+  `if namespace is None: raise kopf.PermanentError(...)` at the top of each handler — not a bare
+  `assert`, which `-O`/`PYTHONOPTIMIZE` strips at runtime and isn't kopf-retry-aware.
+- `update_fn`/`sysdba_secret_update_fn`'s `old`/`new` params had the exact same shape of problem:
+  the protocol types them `BodyEssence | Any | None`, but they were declared `kopf.Body | None` — a
+  looser-looking but *not* structurally-compatible type. Confirmed empirically (an isolated repro
+  script) that only the literal protocol union satisfies `ChangingFn`; widened to match exactly.
+- `update.py`: `_, sysdba_password = k8s.ensure_sysdba_secret(...)` reused `_` as the throwaway
+  tuple-unpack target, but `_` was *also* the function's own `**_: Any` catch-all parameter name (a
+  `dict[str, Any]`) — reassigning it to a `str` was a genuine type conflict, not a stub issue. Fixed
+  by renaming the unpack target to `_secret_name`.
+- `sysdba_secret_update_fn`'s `old.get("data")`/`new.get("data")` chain: `BodyEssence` (a
+  `TypedDict(total=False)`) only declares `metadata`/`spec`/`status` — `data` is Secret-specific and
+  outside that schema, so its `.get()` fell back to a plain `object` with no `.get()` of its own.
+  Fixed with explicit `Any`-typed locals (`old_essence`/`new_essence`) before chaining
+  `.get("data").get("password")`, matching the same `| Any` escape hatch the protocol itself uses.
 
 `tests/conftest.py` defines a session-scoped `k3s` fixture (via `testcontainers`'s
 `K3SContainer`, from `testcontainers.community.k3s` — `testcontainers.k3s` is deprecated) that
 starts a real k3s container per test session. `testcontainers` is a dev dependency for this.
-`tests/test_k3s.py` only exercises the fixture itself (asserts `k3s.config_yaml()` returns a
-valid kubeconfig).
+`tests/test_k3s.py::test_k3s_config_yaml` only exercises the fixture itself (asserts
+`k3s.config_yaml()` returns a valid kubeconfig).
+
+`tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies `deploy/crd.yaml`
+and every object in `deploy/operator.yaml` (ServiceAccount/ClusterRole/ClusterRoleBinding/
+Role/RoleBinding/Deployment, dispatched by `kind` since it's multi-document YAML) via the
+`kubernetes` client, then uses `AuthorizationV1Api.create_subject_access_review` (the API
+`kubectl auth can-i --as=...` itself calls) to confirm the ServiceAccount actually gets every
+permission `create_fn`/`update_fn`/`k8s.py`/`firebird.py` call for, plus kopf's own cluster-scoped
+framework needs. This only validates the manifest/RBAC, not full pod scheduling (the Deployment's
+`image: quay.io/kubebird/operator:latest` isn't expected to actually be pullable here), so it's
+fast (~15s) compared to the `test_create`/`test_update`/`test_delete` suites below.
 
 Gotcha: on cgroup v2 hosts using the systemd cgroup driver, Docker gives the k3s container its own
 private cgroup namespace, which its embedded kubelet can't reconcile with the host cgroup paths
@@ -257,7 +277,6 @@ apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
   name: test
-  namespace: default
 spec:
   image: firebirdsql/firebird
   version: 3.0.14
@@ -360,15 +379,35 @@ object's own removal against that garbage collection.
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
 with each other and with the README's sample whenever the CR shape changes.
 
-The README's Installation section documents `kubectl apply -f deploy/crd.yaml -f deploy/operator.yaml`,
-but `deploy/operator.yaml` (the Deployment/RBAC manifest for running the operator itself in-cluster)
-does not exist yet — only `crd.yaml` and `cr.yaml` are present under `deploy/`. Now that `create_fn`
-is implemented, that RBAC needs to grant (at least): `get`/`list`/`watch`/`patch` on `instances`
-(and their `status` subresource) for the CRD's group; `create`/`patch` on `secrets`,
-`persistentvolumeclaims`, `services`, `statefulsets`; `get`/`list`/`watch`/`patch` on `secrets`
-specifically (`update_fn` re-reads them, `sysdba_secret_update_fn` watches and labels them); `get`
-on `pods` and `create` on `pods/exec` (needed for the `isql`/`gsec` provisioning in
-`firebird.py`); plus whatever kopf itself needs for peering/events (see kopf's own RBAC docs).
+`deploy/operator.yaml` is the Deployment/RBAC manifest for running the operator itself in-cluster
+(the README's Installation section documents `kubectl apply -f deploy/crd.yaml -f
+deploy/operator.yaml`), following kopf's own [deployment](https://docs.kopf.dev/en/stable/deployment/)/
+[RBAC](https://docs.kopf.dev/en/stable/rbac/) guidance for a namespace-scoped operator:
+- A `ServiceAccount` plus a namespaced `Role`/`RoleBinding` granting exactly what the code above
+  calls: `get`/`list`/`watch`/`patch` on `instances` and `instances/status`; `get`/`list`/`watch`/
+  `create`/`patch` on `secrets` (covers `k8s.ensure_sysdba_secret`'s create-or-reuse, the labeling
+  of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create` on
+  `persistentvolumeclaims`; `create`/`patch` on `services` and `statefulsets`; `get` on `pods` and
+  `create` on `pods/exec` (the `isql`/`gsec` provisioning in `firebird.py`); `create` on `events`;
+  and a `kopfpeerings` rule kopf's own docs recommend (a harmless no-op unless a `KopfPeering` CRD
+  is separately installed — kubebird runs a single replica, so peering itself isn't required).
+- A thin cluster-scoped `ClusterRole`/`ClusterRoleBinding`, still needed even though the operator
+  itself is namespace-scoped: kopf's framework needs `list`/`watch` on `customresourcedefinitions`
+  and `namespaces`, both genuinely cluster-scoped resource types with no namespaced equivalent to
+  grant instead. No webhook-config permissions, since kubebird registers no admission handlers.
+- None of the namespaced objects (`ServiceAccount`/`Role`/`RoleBinding`/`Deployment`) hardcode a
+  namespace — `kubectl apply -n <namespace> -f deploy/operator.yaml` picks it at apply-time. The
+  one unavoidable exception is the `ClusterRoleBinding`'s `subjects[]` entry (defaults to
+  `default`): a cluster-scoped object has no "current namespace" to infer from, so it must be kept
+  in sync by hand with whatever namespace the rest of the file is actually applied into.
+- The `Deployment` runs 1 replica with `strategy: Recreate` (matching kopf's own "never run two
+  operators for the same objects" recommendation) and wires `NAMESPACE` via the Downward API
+  (`fieldRef: metadata.namespace`), which `src/kubebird/operator.py`'s existing namespace-scoping
+  logic already reads.
+
+Verified against a real cluster (both applying as-is and with `-n <other-namespace>`, plus
+`kubectl auth can-i --as=system:serviceaccount:...` for every rule above); see
+`tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac`.
 
 ## Container image
 
@@ -396,6 +435,23 @@ Build with `docker build --build-arg VERSION=<version> -t kubebird:<version> .`.
 a real `docker build`+`docker run`: the image builds, `id`/`whoami` inside it report `appuser`
 (uid 8877, not root), and `kubebird-operator` starts and gets exactly as far as attempting
 kopf's cluster login (expected to fail outside an actual cluster/kubeconfig).
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push (`on: push`, no branch filter — so *any* branch push
+that passes tests currently publishes `:latest`, not just the default branch; narrow this to
+`branches: [main]` if that's not wanted):
+- `test` job: `actions/setup-python` (3.14) + `pip install tox` + plain `tox` — the same full
+  `clean, lint, format, type, py3, report` suite as "Development commands" above, including the
+  real k3s/testcontainers end-to-end tests (Docker is preinstalled on GitHub-hosted Linux runners,
+  so no extra setup needed for that).
+- `release` job (`needs: test`, so it only runs if the suite is green): logs into `quay.io` via
+  `docker/login-action` using repo secrets `QUAY_USERNAME`/`QUAY_PASSWORD` (a quay.io robot
+  account's token works well as the latter), then `docker/build-push-action` builds this repo's
+  `Dockerfile` and pushes `quay.io/kubebird/operator:<tag>` — `<tag>` is `latest` for a plain
+  branch push, or the pushed tag's own name (e.g. `v1.2.3`) for a tag push (`github.ref_type ==
+  'tag'`). The same value is also passed as the `VERSION` build-arg (cosmetic only — see "Container
+  image" above).
 
 ## Requirements
 
