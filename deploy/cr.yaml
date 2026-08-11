@@ -2,7 +2,6 @@ apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
   name: test
-  namespace: default
 spec:
   image: firebirdsql/firebird
   version: 3.0.14
