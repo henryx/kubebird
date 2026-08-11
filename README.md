@@ -22,6 +22,7 @@ spec:
       charset: UTF8 # defaults to UTF8
       collation: UTF8 # defaults to UTF8
     - name: "shadowed.fdb"
+      alias: "enforced" # if not specified, uses database name as alias
       shadow: true
   service:
     type: ClusterIP
@@ -42,6 +43,7 @@ With this CR, Kubebird can:
 - Create a service for the instance. Default service type is `ClusterIP`.
 - Define the PVC used for the instance's primary data (`storage.primary`) with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
+- Register a Firebird alias for each database in `/opt/firebird/databases.conf`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`).
 - Authentication section is optional. If is specified, you can:
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
 - Label every object it creates (PVCs, Service, StatefulSet, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
@@ -49,7 +51,7 @@ With this CR, Kubebird can:
 Kubebird also reacts to updates on an existing `Instance`:
 - Changing `spec.service.type` or `spec.version` reconciles the `Service`/`StatefulSet` in place.
 - Adding an entry to `spec.databases` provisions just that new database (existing ones are left
-  alone).
+  alone) and registers its alias immediately, without needing a pod restart.
 - Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
   `authentication.sysdba.secretRef`) pushes the new password to the live server automatically, so
   the secret and the running instance never drift apart.
@@ -105,9 +107,10 @@ utilities](https://docs.kopf.dev/en/stable/testing/), to apply `deploy/crd.yaml`
 `kopf.testing.KopfRunner`. These are real end-to-end runs: each waits for `status.phase` to reach
 `Ready` (StatefulSet + real Firebird image pull + database provisioning over `isql`), then execs
 into the pod to confirm the relevant database file actually exists on disk before deleting the
-`Instance`. There are two such tests: `test_create_instance` checks the primary database, and
-`test_create_instance_shadow_database` checks that a database with `shadow: true` gets its shadow
-file on the separate shadow PVC.
+`Instance`. There are two such tests: `test_create_instance` checks the primary database and that
+its alias (plus the version-specific `security.db` alias) landed in `/opt/firebird/databases.conf`,
+and `test_create_instance_shadow_database` checks that a database with `shadow: true` gets its
+shadow file on the separate shadow PVC.
 
 `tests/test_update.py` covers the update-reconciliation behaviour the same way: patching an
 already-`Ready` `Instance`'s `service.type`/`version`/`databases`, and rotating its SYSDBA secret's

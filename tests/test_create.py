@@ -9,7 +9,7 @@ from kubernetes.client.exceptions import ApiException
 from kubernetes.stream import stream
 
 from kubebird.create import CONTAINER_NAME
-from kubebird.k8s import DATA_MOUNT_PATH, SHADOW_MOUNT_PATH
+from kubebird.k8s import DATA_MOUNT_PATH, DATABASES_CONF_PATH, SHADOW_MOUNT_PATH
 
 DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 CRD_PATH = DEPLOY_DIR / "crd.yaml"
@@ -74,6 +74,22 @@ def _assert_database_file_exists(
     assert "EXISTS" in output, f"database file {path!r} was not created: {output}"
 
 
+def _read_databases_conf(
+    core_api: client.CoreV1Api, *, namespace: str, pod_name: str
+) -> str:
+    return stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=CONTAINER_NAME,
+        command=["/bin/sh", "-c", f"cat {shlex.quote(DATABASES_CONF_PATH)}"],
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+
+
 def test_create_instance(kubeconfig: Path) -> None:
     config.load_kube_config(config_file=str(kubeconfig))
 
@@ -115,6 +131,19 @@ def test_create_instance(kubeconfig: Path) -> None:
             pod_name=f"{name}-0",
             path=f"{DATA_MOUNT_PATH}/{primary_db['name']}",
         )
+
+        databases_conf = _read_databases_conf(
+            client.CoreV1Api(), namespace=namespace, pod_name=f"{name}-0"
+        )
+        major_version = cr_body["spec"]["version"].split(".", 1)[0]
+        assert (
+            f"security.db = $(dir_secDb)/security{major_version}.fdb" in databases_conf
+        )
+        assert (
+            f"{primary_db['name']} = {DATA_MOUNT_PATH}/{primary_db['name']}"
+            in databases_conf
+        )
+
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name
         )
@@ -165,6 +194,19 @@ def test_create_instance_shadow_database(kubeconfig: Path) -> None:
             pod_name=f"{name}-0",
             path=f"{SHADOW_MOUNT_PATH}/{shadow_db['name']}.shadow",
         )
+
+        # deploy/cr.yaml sets an explicit "alias" on this database, distinct
+        # from its "name" -- the alias, not the name, must be the databases.conf
+        # key it's registered under.
+        databases_conf = _read_databases_conf(
+            client.CoreV1Api(), namespace=namespace, pod_name=f"{name}-0"
+        )
+        assert shadow_db["alias"] != shadow_db["name"]
+        assert (
+            f"{shadow_db['alias']} = {DATA_MOUNT_PATH}/{shadow_db['name']}"
+            in databases_conf
+        )
+
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name
         )

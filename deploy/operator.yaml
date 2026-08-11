@@ -1,6 +1,6 @@
 # Namespaced deployment of the Kubebird operator: the ServiceAccount/Role/RoleBinding below scope
-# its own workload (Instances, Secrets, PVCs, Services, StatefulSets, pod exec) to a single
-# namespace. None of the namespaced objects below hardcode one -- apply with
+# its own workload (Instances, Secrets, ConfigMaps, PVCs, Services, StatefulSets, pod exec) to a
+# single namespace. None of the namespaced objects below hardcode one -- apply with
 # `kubectl apply -n <namespace> -f deploy/operator.yaml` (or against a context whose current
 # namespace is already set) to pick it. The one exception is the ClusterRoleBinding's `subjects[]`
 # entry: a cluster-scoped object has no "current namespace" to infer from, so Kubernetes requires
@@ -73,6 +73,12 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list, watch, create, patch]
+  # Application: the databases.conf ConfigMap (one alias per spec.databases entry, plus the
+  # version-specific security.db alias) -- created by create_fn, patched by update_fn whenever
+  # spec.databases/spec.version change.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create, patch]
   # Application: the primary/shadow PersistentVolumeClaims -- created once, never patched/deleted
   # (deletion happens via Kubernetes garbage-collecting kopf.adopt()-ed owner references).
   - apiGroups: [""]

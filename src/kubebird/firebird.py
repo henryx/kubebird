@@ -1,11 +1,14 @@
 """Firebird database/user provisioning via `isql`, executed inside the instance's pod."""
 
+import base64
 import shlex
 import time
 
 import kopf
 from kubernetes import client
 from kubernetes.stream import stream
+
+from . import k8s
 
 POD_READY_TIMEOUT = 180.0
 POD_READY_POLL_INTERVAL = 2.0
@@ -156,6 +159,45 @@ def change_sysdba_password(
             f"gsec failed to change the SYSDBA password: {output}"
         )
     return output
+
+
+def write_databases_conf(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    content: str,
+    logger: kopf.Logger,
+) -> None:
+    """Overwrite databases.conf inside the already-running container.
+
+    This path is backed by a writable emptyDir, seeded from the databases.conf
+    ConfigMap by an initContainer on pod (re)start (see k8s.build_statefulset;
+    a ConfigMap volume itself is always mounted read-only, subPath or not, so
+    it can't be the live target of this exec). This is what makes a new/changed
+    alias usable immediately, without waiting for (or forcing) a pod restart.
+    Content is base64-encoded over the wire since database names (and
+    therefore alias names) come from user-controlled CR fields, not to be
+    trusted as literal shell/heredoc text.
+    """
+    encoded = base64.b64encode(content.encode()).decode()
+    shell_command = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(k8s.DATABASES_CONF_PATH)}"
+    command = ["/bin/sh", "-c", shell_command]
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=container,
+        command=command,
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    logger.debug(f"write_databases_conf command={command!r} output={output!r}")
+    if output.strip():
+        raise kopf.PermanentError(f"Failed to write databases.conf: {output}")
 
 
 def create_database(

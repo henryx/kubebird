@@ -62,6 +62,12 @@ spec:
                       name:
                         type: string
                         description: File name of the database, e.g. "instance.fdb".
+                      alias:
+                        type: string
+                        default: ""
+                        description: >-
+                          Firebird alias registered for this database in databases.conf. If
+                          empty, "name" is used as the alias.
                       shadow:
                         type: boolean
                         default: false

@@ -12,6 +12,7 @@ spec:
       charset: "UTF8"
       collation: "UTF8"
     - name: "shadowed.fdb"
+      alias: "enforced" # if not specified, uses database name as alias
       shadow: true
   service:
     type: ClusterIP

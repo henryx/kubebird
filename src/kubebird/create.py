@@ -40,6 +40,21 @@ def create_fn(
     storage = spec["storage"]
     shadow_storage = storage.get("shadow")
 
+    databases_conf_configmap_body = k8s.build_databases_conf_configmap(
+        name=f"{name}-databases-conf",
+        namespace=namespace,
+        instance_name=name,
+        databases=spec["databases"],
+        version=spec["version"],
+    )
+    kopf.adopt(databases_conf_configmap_body, owner=body)
+    k8s.create_or_ignore(
+        core_api.create_namespaced_config_map,
+        namespace,
+        databases_conf_configmap_body,
+        logger,
+    )
+
     pvc_body = k8s.build_pvc(
         pvc_name=f"{name}-data",
         namespace=namespace,
@@ -84,6 +99,7 @@ def create_fn(
         pvc_name=pvc_body["metadata"]["name"],
         shadow_pvc_name=shadow_pvc_name,
         sysdba_secret_name=secret_name,
+        databases_conf_configmap_name=databases_conf_configmap_body["metadata"]["name"],
     )
     kopf.adopt(statefulset_body, owner=body)
     k8s.create_or_ignore(

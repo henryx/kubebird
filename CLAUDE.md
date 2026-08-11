@@ -114,6 +114,29 @@ Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
   `kubectl exec` after the pod is already `Ready`). `gsec` sidesteps the whole problem, since it
   talks to the server via the Services API rather than opening `security.db` as a connection at
   all — the reason `firebird.change_sysdba_password` uses it instead of SQL.
+- `k8s.render_databases_conf`'s `security.db` line must reproduce the image's own default entry
+  verbatim: `security.db = $(dir_secDb)/security<major>.fdb` (`$(dir_secDb)` is a Firebird
+  built-in macro, not a literal path) plus a `{ RemoteAccess = false }` block. A first attempt
+  wrote a bare `security.db = security<major>.fdb` (no `$(dir_secDb)/` prefix, no `RemoteAccess`
+  block) — confirmed via a throwaway `docker run` against `firebirdsql/firebird:3.0.14` that this
+  crash-loops the container immediately: the entrypoint's own `isql -b -user SYSDBA security.db`
+  (see below) resolves the bare filename relative to whatever the entrypoint's current working
+  directory happens to be at that point, not to Firebird's actual security-database directory, and
+  fails with `I/O error ... No such file or directory` before the server ever starts — every
+  `create_fn`/`update_fn` run hit this, so the pod never became `Ready`. Reproduced/fixed by
+  diffing against the image's own shipped `/opt/firebird/databases.conf` (`docker run --rm
+  --entrypoint cat firebirdsql/firebird:<version> /opt/firebird/databases.conf`); confirmed the
+  same `$(dir_secDb)/security<major>.fdb` form for Firebird 3, 4, and 5 images.
+- A ConfigMap volume is *always* mounted read-only by kubelet — regardless of `subPath` and
+  regardless of the volumeMount's own `readOnly` field — so `databases.conf` can't live directly
+  on one if `update_fn` needs to rewrite it into an already-running pod (adding a database doesn't
+  restart the pod, and a ConfigMap update never propagates into an existing `subPath` mount
+  anyway). `firebird.write_databases_conf`'s exec against a ConfigMap-backed `subPath` mount was
+  confirmed empirically to fail with `Read-only file system`. Fixed by making the ConfigMap only
+  the *seed*: `k8s.build_statefulset` adds an `initContainer` that `cp`s the ConfigMap's
+  `databases.conf` onto a plain `emptyDir` on every pod (re)start, and the main container mounts
+  *that* `emptyDir` over `k8s.DATABASES_CONF_PATH` via `subPath` — `subPath` itself doesn't force
+  read-only, only the ConfigMap/Secret/projected volume types do.
 
 ## Development commands
 
@@ -282,6 +305,7 @@ spec:
   version: 3.0.14
   databases:
     - name: "instance.fdb"
+      alias: "" # if empty, "name" is used as the alias
       shadow: false
   service:
     type: ClusterIP
@@ -315,6 +339,19 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   still works even for a hand-built dict that skips the API server's defaulting), creating a
   `CREATE SHADOW 1` file under the shadow mount for any entry with `shadow: true` — raising a
   `kopf.PermanentError` if `storage.shadow` isn't configured in that case.
+- Manages a Firebird alias per `databases` entry (`database["alias"]` if set, otherwise the
+  database's own `name`, e.g. `instance.fdb` — `database.get("alias") or name` in
+  `k8s.render_databases_conf` — pointing at the full path under `k8s.DATA_MOUNT_PATH` derived from
+  `name` either way) in `/opt/firebird/databases.conf`, so clients can connect using that alias
+  instead of needing to know the in-pod mount path. `create_fn` builds a
+  `<instance-name>-databases-conf` ConfigMap (`k8s.build_databases_conf_configmap`/
+  `render_databases_conf`) from the full `spec.databases` list plus a version-specific
+  `security.db` alias (see the `databases.conf` gotchas above — this file replaces the image's own
+  default `databases.conf` wholesale, so `security.db` must be replicated or SYSDBA authentication
+  itself breaks) *before* creating the `StatefulSet`, so a fresh pod always starts with the correct
+  content. `build_statefulset` wires this ConfigMap in via an `initContainer` + writable `emptyDir`
+  rather than mounting it directly (see the same gotchas), and labels/adopts it like every other
+  created object.
 - Manages authentication: if `authentication.sysdba.secretRef` is unset, generates a
   `<instance-name>-sysdba` secret (keys `username: SYSDBA`, `password: <random>`) and wires it
   into the `StatefulSet` via `FIREBIRD_ROOT_PASSWORD`/`secretKeyRef`; if set, reads that secret's
@@ -338,10 +375,16 @@ itself rejects malformed sizes (e.g. `"banana"`) with a 422 before `create_fn` e
 Updating an `Instance` (`update_fn` in `src/kubebird/update.py`, `@kopf.on.update` on `Instance`):
 
 - Re-resolves the SYSDBA password the same way `create_fn` does (`k8s.ensure_sysdba_secret`), then
-  unconditionally reconciles the `Service` type and the `StatefulSet`'s container image/version via
+  unconditionally patches the `<instance-name>-databases-conf` ConfigMap with `databases.conf`
+  content re-rendered from the *current* `spec.databases`/`spec.version` (not a diff — the file is
+  always regenerated in full), and unconditionally reconciles the `Service` type and the
+  `StatefulSet`'s container image/version via
   `patch_namespaced_service`/`patch_namespaced_stateful_set` (idempotent no-ops when unchanged).
 - Waits for the pod to be `Ready` and SYSDBA-live again (relevant when `spec.version` changed and
-  the `StatefulSet` rolled the pod).
+  the `StatefulSet` rolled the pod), then execs the same freshly-rendered `databases.conf` content
+  directly into the running container (`firebird.write_databases_conf`) — necessary even though the
+  ConfigMap was just patched, since adding a database doesn't restart the pod, and a ConfigMap
+  update never reaches an already-mounted `subPath` on its own (see the gotcha above).
 - Diffs `old.spec.databases` (kopf's own kwarg, the previously-handled body) against
   `spec.databases` and provisions only the newly-added entries — pre-existing ones are left alone.
 - Reports progress via `status.phase`/`status.message` the same way `create_fn` does, ending in
@@ -386,7 +429,8 @@ deploy/operator.yaml`), following kopf's own [deployment](https://docs.kopf.dev/
 - A `ServiceAccount` plus a namespaced `Role`/`RoleBinding` granting exactly what the code above
   calls: `get`/`list`/`watch`/`patch` on `instances` and `instances/status`; `get`/`list`/`watch`/
   `create`/`patch` on `secrets` (covers `k8s.ensure_sysdba_secret`'s create-or-reuse, the labeling
-  of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create` on
+  of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create`/`patch` on
+  `configmaps` (the `databases.conf` ConfigMap `create_fn`/`update_fn` build/reconcile); `create` on
   `persistentvolumeclaims`; `create`/`patch` on `services` and `statefulsets`; `get` on `pods` and
   `create` on `pods/exec` (the `isql`/`gsec` provisioning in `firebird.py`); `create` on `events`;
   and a `kopfpeerings` rule kopf's own docs recommend (a harmless no-op unless a `KopfPeering` CRD

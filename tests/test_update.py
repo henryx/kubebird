@@ -10,6 +10,7 @@ from test_create import (
     CRD_PATH,
     _assert_database_file_exists,
     _ensure_crd_established,
+    _read_databases_conf,
     _wait_ready,
 )
 
@@ -379,6 +380,17 @@ def test_update_instance_add_database(kubeconfig: Path) -> None:
             namespace=namespace,
             pod_name=f"{name}-0",
             path=f"{DATA_MOUNT_PATH}/{new_db['name']}",
+        )
+
+        # The pod never restarted for this change, so this only passes if
+        # update_fn actually exec'd the new databases.conf content into the
+        # live container -- the ConfigMap's own subPath mount would not have
+        # picked it up on its own.
+        databases_conf = _read_databases_conf(
+            client.CoreV1Api(), namespace=namespace, pod_name=f"{name}-0"
+        )
+        assert (
+            f"{new_db['name']} = {DATA_MOUNT_PATH}/{new_db['name']}" in databases_conf
         )
 
         objects_api.delete_namespaced_custom_object(

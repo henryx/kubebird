@@ -129,6 +129,8 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
     assert can("get", "secrets")
     assert can("create", "secrets")
     assert can("patch", "secrets")
+    assert can("create", "configmaps")
+    assert can("patch", "configmaps")
     assert can("create", "persistentvolumeclaims")
     assert can("create", "services")
     assert can("patch", "services")

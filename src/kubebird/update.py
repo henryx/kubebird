@@ -41,6 +41,16 @@ def update_fn(
     # kubernetes' generated clients default a dict-bodied PATCH to
     # application/json-patch+json (which requires a list of operations, not
     # a merge dict) unless the content type is forced explicitly here.
+    databases_conf_content = k8s.render_databases_conf(
+        spec["databases"], spec["version"]
+    )
+    core_api.patch_namespaced_config_map(
+        f"{name}-databases-conf",
+        namespace,
+        {"data": {k8s.DATABASES_CONF_KEY: databases_conf_content}},
+        _content_type="application/merge-patch+json",
+    )
+
     service_type = (spec.get("service") or {}).get("type") or "ClusterIP"
     core_api.patch_namespaced_service(
         name,
@@ -78,6 +88,18 @@ def update_fn(
         pod_name=pod_name,
         container=CONTAINER_NAME,
         sysdba_password=sysdba_password,
+    )
+
+    # The ConfigMap patch above only reaches an already-running container on
+    # its own if the pod just restarted (e.g. a version bump); this exec makes
+    # a databases-only change (no restart) take effect immediately too.
+    firebird.write_databases_conf(
+        core_api,
+        namespace=namespace,
+        pod_name=pod_name,
+        container=CONTAINER_NAME,
+        content=databases_conf_content,
+        logger=logger,
     )
 
     shadow_storage = spec["storage"].get("shadow")

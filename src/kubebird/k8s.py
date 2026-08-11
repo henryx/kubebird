@@ -12,6 +12,8 @@ from kubernetes.client.exceptions import ApiException
 FIREBIRD_PORT = 3050
 DATA_MOUNT_PATH = "/var/lib/firebird/data"
 SHADOW_MOUNT_PATH = "/var/lib/firebird/shadow"
+DATABASES_CONF_PATH = "/opt/firebird/databases.conf"
+DATABASES_CONF_KEY = "databases.conf"
 
 INSTANCE_LABEL = "kubebird.github.io/instance"
 SYSDBA_ROLE_LABEL = "kubebird.github.io/role"
@@ -141,6 +143,65 @@ def _label_sysdba_secret(
     )
 
 
+def security_db_filename(version: str) -> str:
+    """The security database's own filename, which is version-specific
+    (security3.fdb for Firebird 3, security4.fdb for 4, security5.fdb for 5)."""
+    major = version.split(".", 1)[0]
+    if not major.isdigit():
+        raise kopf.PermanentError(f"Cannot determine major version from {version!r}.")
+    return f"security{major}.fdb"
+
+
+def render_databases_conf(databases: list[dict[str, Any]], version: str) -> str:
+    """Render databases.conf content: one alias per spec.databases entry (using
+    "alias" if set, otherwise the database's own "name", e.g. "instance.fdb"),
+    pointing at its full path under DATA_MOUNT_PATH, plus the version-specific
+    security.db alias that the image's own default databases.conf would
+    otherwise provide -- since this file replaces that default wholesale,
+    security.db must be replicated here or SYSDBA authentication itself breaks.
+
+    The security.db entry must match the image's own default verbatim (path
+    via the "$(dir_secDb)" macro, not a bare filename -- confirmed empirically:
+    a bare filename resolves relative to whatever the entrypoint's current
+    working directory happens to be at the time, not $(dir_secDb), and fails
+    with "I/O error ... No such file or directory"; and RemoteAccess = false,
+    the same setting the "always connect via localhost:" gotcha above depends
+    on to keep security.db unreachable from outside the pod).
+    """
+    lines = [
+        f"security.db = $(dir_secDb)/{security_db_filename(version)}",
+        "{",
+        "\tRemoteAccess = false",
+        "\tDefaultDbCachePages = 50",
+        "}",
+    ]
+    for database in databases:
+        name = database["name"]
+        alias = database.get("alias") or name
+        lines.append(f"{alias} = {DATA_MOUNT_PATH}/{name}")
+    return "\n".join(lines) + "\n"
+
+
+def build_databases_conf_configmap(
+    *,
+    name: str,
+    namespace: str,
+    instance_name: str,
+    databases: list[dict[str, Any]],
+    version: str,
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {INSTANCE_LABEL: instance_name},
+        },
+        "data": {DATABASES_CONF_KEY: render_databases_conf(databases, version)},
+    }
+
+
 def build_pvc(
     *, pvc_name: str, namespace: str, instance_name: str, storage: dict[str, Any]
 ) -> dict[str, Any]:
@@ -191,11 +252,37 @@ def build_statefulset(
     version: str,
     pvc_name: str,
     sysdba_secret_name: str,
+    databases_conf_configmap_name: str,
     shadow_pvc_name: str | None = None,
 ) -> dict[str, Any]:
     labels = {INSTANCE_LABEL: name}
-    volume_mounts = [{"name": "data", "mountPath": DATA_MOUNT_PATH}]
-    volumes = [{"name": "data", "persistentVolumeClaim": {"claimName": pvc_name}}]
+    # ConfigMap volumes are always mounted read-only by kubelet -- unrelated to
+    # and not overridable by subPath or a volumeMount's own readOnly setting --
+    # so databases.conf can't live directly on one: firebird.write_databases_conf
+    # execs a live rewrite whenever spec.databases/spec.version change, and that
+    # would fail with "Read-only file system" against a ConfigMap-backed mount.
+    # Instead the ConfigMap is only the seed: an initContainer copies it onto a
+    # plain (writable) emptyDir on every pod (re)start, and the main container
+    # mounts *that* over DATABASES_CONF_PATH via subPath -- subPath itself
+    # doesn't force read-only, only the ConfigMap volume type does.
+    databases_conf_configmap_mount = "/var/run/kubebird/databases-conf-configmap"
+    databases_conf_writable_mount = "/var/run/kubebird/databases-conf-writable"
+    volume_mounts = [
+        {"name": "data", "mountPath": DATA_MOUNT_PATH},
+        {
+            "name": "databases-conf-writable",
+            "mountPath": DATABASES_CONF_PATH,
+            "subPath": DATABASES_CONF_KEY,
+        },
+    ]
+    volumes = [
+        {"name": "data", "persistentVolumeClaim": {"claimName": pvc_name}},
+        {
+            "name": "databases-conf-configmap",
+            "configMap": {"name": databases_conf_configmap_name},
+        },
+        {"name": "databases-conf-writable", "emptyDir": {}},
+    ]
     if shadow_pvc_name:
         volume_mounts.append({"name": "shadow", "mountPath": SHADOW_MOUNT_PATH})
         volumes.append(
@@ -212,6 +299,31 @@ def build_statefulset(
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
+                    "initContainers": [
+                        {
+                            "name": "databases-conf-init",
+                            "image": f"{image}:{version}",
+                            "command": [
+                                "/bin/sh",
+                                "-c",
+                                (
+                                    f"cp {databases_conf_configmap_mount}/{DATABASES_CONF_KEY} "
+                                    f"{databases_conf_writable_mount}/{DATABASES_CONF_KEY}"
+                                ),
+                            ],
+                            "volumeMounts": [
+                                {
+                                    "name": "databases-conf-configmap",
+                                    "mountPath": databases_conf_configmap_mount,
+                                    "readOnly": True,
+                                },
+                                {
+                                    "name": "databases-conf-writable",
+                                    "mountPath": databases_conf_writable_mount,
+                                },
+                            ],
+                        }
+                    ],
                     "containers": [
                         {
                             "name": "firebird",
