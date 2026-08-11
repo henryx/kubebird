@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Entry point to run the Kubebird operator embedded, on uvloop.
 
 kopf's CLI (``kopf run``) picks up uvloop automatically when it is installed,
@@ -25,7 +24,3 @@ def main() -> None:
     namespaces = [namespace] if namespace else ()
     with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
         kopf.run(loop=runner.get_loop(), namespaces=namespaces)
-
-
-if __name__ == "__main__":
-    main()

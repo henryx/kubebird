@@ -1,1 +1,1 @@
-__all__ = ["create", "delete", "firebird", "k8s", "update"]
+__all__ = ["create", "delete", "firebird", "k8s", "operator", "update"]
