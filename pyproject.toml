@@ -28,9 +28,16 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "mypy>=0.991",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
+    "pyyaml>=6.0.3",
     "ruff>=0.16.2",
     "testcontainers>=4.15.0",
     "tox>=4.58.0",
+    "types-pyyaml>=6.0.12.20260724",
 ]
+
+[[tool.mypy.overrides]]
+module = "kubernetes.*"
+ignore_missing_imports = true
