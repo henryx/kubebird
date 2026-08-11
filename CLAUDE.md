@@ -438,20 +438,25 @@ kopf's cluster login (expected to fail outside an actual cluster/kubeconfig).
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push (`on: push`, no branch filter — so *any* branch push
-that passes tests currently publishes `:latest`, not just the default branch; narrow this to
-`branches: [main]` if that's not wanted):
-- `test` job: `actions/setup-python` (3.14) + `pip install tox` + plain `tox` — the same full
-  `clean, lint, format, type, py3, report` suite as "Development commands" above, including the
-  real k3s/testcontainers end-to-end tests (Docker is preinstalled on GitHub-hosted Linux runners,
-  so no extra setup needed for that).
-- `release` job (`needs: test`, so it only runs if the suite is green): logs into `quay.io` via
-  `docker/login-action` using repo secrets `QUAY_USERNAME`/`QUAY_PASSWORD` (a quay.io robot
-  account's token works well as the latter), then `docker/build-push-action` builds this repo's
-  `Dockerfile` and pushes `quay.io/kubebird/operator:<tag>` — `<tag>` is `latest` for a plain
-  branch push, or the pushed tag's own name (e.g. `v1.2.3`) for a tag push (`github.ref_type ==
-  'tag'`). The same value is also passed as the `VERSION` build-arg (cosmetic only — see "Container
-  image" above).
+`.github/workflows/ci.yml` triggers on `push` and on `pull_request_review` (`types: [submitted]`);
+the two jobs only run image-build work for an actual tag push, keeping ordinary commits/PR
+approvals to tests-only:
+- `test` job — `if: github.event_name == 'push' || github.event.review.state == 'approved'`, so it
+  runs for every commit push (branch or tag) and for an "approved" PR review, but not for a
+  "changes requested"/"commented" review. Checks out `github.event.pull_request.head.sha ||
+  github.sha` (the reviewed commit for a PR-review event, otherwise the pushed commit), then
+  `actions/setup-python` (3.14) + `pip install tox` + plain `tox` — the same full `clean, lint,
+  format, type, py3, report` suite as "Development commands" above, including the real
+  k3s/testcontainers end-to-end tests (Docker is preinstalled on GitHub-hosted Linux runners, so no
+  extra setup needed for that).
+- `release` job — `needs: test` plus its own `if: github.event_name == 'push' && github.ref_type ==
+  'tag'`, so it only ever runs for a tag push (never a branch push or a PR-review event), and only
+  after `test` succeeds on that same tag. Logs into `quay.io` via `docker/login-action` using repo
+  secrets `QUAY_USERNAME`/`QUAY_PASSWORD` (a quay.io robot account's token works well as the
+  latter), then `docker/build-push-action` builds this repo's `Dockerfile` and pushes
+  `quay.io/kubebird/operator` tagged both `:latest` and with the tag name itself (e.g. `:v1.2.3`) —
+  a plain branch push no longer publishes any image at all. The tag name is also passed as the
+  `VERSION` build-arg (cosmetic only — see "Container image" above).
 
 ## Requirements
 
