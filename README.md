@@ -49,6 +49,45 @@ With this CR, Kubebird can:
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
 - Label every object it creates (PVCs, Service, StatefulSet, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 
+### Object creation flow
+
+When an `Instance` is created, Kubebird creates the objects below in order (steps 1-6); each one is
+owned by the `Instance` and removed automatically when the `Instance` is deleted. Kubernetes then
+creates the Pod from the `StatefulSet`, and Kubebird waits for it to become ready before creating
+the actual database files inside it (steps 7-8):
+
+```mermaid
+flowchart TD
+    User(["kubectl apply -f cr.yaml"]) --> CR[/"Instance"/]
+    CR --> Kubebird["Kubebird"]
+
+    Kubebird -->|"1"| Secret["Secret<br/>&lt;name&gt;-sysdba"]
+    Kubebird -->|"2"| CM["ConfigMap<br/>&lt;name&gt;-databases-conf"]
+    Kubebird -->|"3"| PVCPrimary["PVC<br/>&lt;name&gt;-data"]
+    Kubebird -->|"4, optional"| PVCShadow["PVC<br/>&lt;name&gt;-shadow"]
+    Kubebird -->|"5"| Service["Service<br/>&lt;name&gt;"]
+    Kubebird -->|"6"| STS["StatefulSet<br/>&lt;name&gt;"]
+
+    Secret -.->|SYSDBA password| STS
+    CM -.->|database aliases| STS
+    PVCPrimary -.->|data volume| STS
+    PVCShadow -.->|shadow volume, optional| STS
+    Service -.->|routes traffic to| STS
+
+    STS -->|Kubernetes creates| Pod["Pod<br/>&lt;name&gt;-0"]
+
+    Kubebird -->|"7: waits for readiness"| Pod
+    Kubebird -->|"8: creates the databases"| Pod
+
+    classDef owned fill:#e6ecff,stroke:#3355ff,color:#000
+    class Secret,CM,PVCPrimary,PVCShadow,Service,STS owned
+```
+
+The dotted arrows show how the `StatefulSet` uses the other objects (the SYSDBA password from the
+secret, database aliases from the ConfigMap, storage from the PVCs, traffic routing from the
+Service) rather than a separate creation step. The shadow `PVC` only exists when `storage.shadow`
+is set on the `Instance`.
+
 Kubebird also reacts to updates on an existing `Instance`:
 - Changing `spec.service.type`, `spec.service.port`, or `spec.version` reconciles the
   `Service`/`StatefulSet` in place.
