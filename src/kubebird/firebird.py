@@ -39,7 +39,13 @@ def wait_for_pod_ready(
     logger.info(f"Waiting for pod {pod_name!r} to become Ready.")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        pod = core_api.read_namespaced_pod_status(pod_name, namespace)
+        # read_namespaced_pod, not read_namespaced_pod_status: the latter hits
+        # the pods/status *subresource* endpoint, which RBAC treats as a
+        # distinct resource from plain "pods" and so needs its own grant --
+        # the main resource already returns the identical .status.conditions
+        # for a GET, so there's no need to widen the ServiceAccount's Role for
+        # this.
+        pod = core_api.read_namespaced_pod(pod_name, namespace)
         conditions = pod.status.conditions or []
         if any(c.type == "Ready" and c.status == "True" for c in conditions):
             logger.debug(f"Pod {pod_name!r} is Ready.")
