@@ -6,6 +6,7 @@ import time
 
 import kopf
 from kubernetes import client
+from kubernetes.client.exceptions import ApiException
 from kubernetes.stream import stream
 
 from . import k8s
@@ -45,7 +46,16 @@ def wait_for_pod_ready(
         # the main resource already returns the identical .status.conditions
         # for a GET, so there's no need to widen the ServiceAccount's Role for
         # this.
-        pod = core_api.read_namespaced_pod(pod_name, namespace)
+        try:
+            pod = core_api.read_namespaced_pod(pod_name, namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            # The StatefulSet controller hasn't created the pod object yet --
+            # not an error, just an earlier "not ready" than any condition
+            # check can express.
+            time.sleep(POD_READY_POLL_INTERVAL)
+            continue
         conditions = pod.status.conditions or []
         if any(c.type == "Ready" and c.status == "True" for c in conditions):
             logger.debug(f"Pod {pod_name!r} is Ready.")

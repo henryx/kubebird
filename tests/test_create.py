@@ -70,15 +70,25 @@ def _wait_status_error(
     namespace: str,
     plural: str,
     name: str,
+    contains: str,
     timeout: float = 420.0,
 ) -> dict:
+    """Wait for status.error to contain `contains`, not just any non-empty value.
+
+    create_fn can hit unrelated, transient errors (e.g. a 404 while the
+    StatefulSet's pod is still being created) that get retried and overwritten
+    on a later attempt -- polling for "any error" would flag a stale/unrelated
+    one instead of the deterministic failure the test actually means to catch.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         obj = api.get_namespaced_custom_object(group, version, namespace, plural, name)
-        if (obj.get("status") or {}).get("error"):
+        if contains in ((obj.get("status") or {}).get("error") or ""):
             return obj
         time.sleep(2)
-    raise TimeoutError(f"Instance {name!r} did not report a status.error in time")
+    raise TimeoutError(
+        f"Instance {name!r} did not report a status.error containing {contains!r} in time"
+    )
 
 
 def _assert_database_file_exists(
@@ -280,6 +290,7 @@ def test_create_instance_reports_error_in_status(kubeconfig: Path) -> None:
             namespace=namespace,
             plural=plural,
             name=name,
+            contains="storage.shadow is not configured",
         )
         assert "storage.shadow is not configured" in instance["status"]["error"]
 
