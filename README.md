@@ -173,10 +173,11 @@ container image to actually be pullable or any pod to schedule.
 
 ## CI
 
-`.github/workflows/ci.yml` runs the full `tox` suite above on every commit push and on every
-"approved" pull request review — no image is built for either. Only pushing a tag (e.g. `v1.2.3`)
-also builds and pushes an image to `quay.io/kubebird/operator`, tagged both `:latest` and with the
-tag name itself. Requires repo secrets `QUAY_USERNAME`/`QUAY_PASSWORD`.
+`.github/workflows/ci.yml` runs the full `tox` suite above on every branch push, whenever a pull
+request is opened or updated, and on every "approved" pull request review — no image is built for
+any of these. Pushing a tag (e.g. `v1.2.3`) instead skips the test suite and only builds and pushes
+an image to `quay.io/kubebird/operator`, tagged both `:latest` and with the tag name itself.
+Requires repo secrets `QUAY_USERNAME`/`QUAY_PASSWORD`.
 
 ## License
 

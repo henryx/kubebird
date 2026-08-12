@@ -1,22 +1,28 @@
 name: CI
 
-# - A commit push (branch or PR) or an "approved" PR review only runs the
-#   full tox suite (lint/format/type/tests/coverage) -- no image is built.
-# - A tag push (e.g. "v1.2.3") runs that same suite, then, if it passes,
-#   builds and pushes quay.io/kubebird/operator tagged both ":latest" and
-#   with the tag name itself.
+# - A branch push, a pull request being opened/updated/reopened, or an
+#   "approved" PR review runs the full tox suite (lint/format/type/tests/
+#   coverage) -- no image is built, and a tag push does NOT run this job.
+# - A tag push (e.g. "v1.2.3") runs only the release job: it builds and pushes
+#   quay.io/kubebird/operator tagged both ":latest" and with the tag name
+#   itself, with no test gate of its own -- by the time a commit is tagged, it
+#   should already have gone through the test job via the push/PR that landed
+#   it on main.
 # Credentials for the release job come from repository secrets
 # QUAY_USERNAME/QUAY_PASSWORD (a quay.io robot account works well for
 # PASSWORD).
 on:
   push:
+  pull_request:
+    types: [opened, synchronize, reopened]
   pull_request_review:
     types: [submitted]
 
 jobs:
   test:
     if: >
-      github.event_name == 'push' ||
+      (github.event_name == 'push' && github.ref_type != 'tag') ||
+      github.event_name == 'pull_request' ||
       github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     steps:
@@ -39,7 +45,6 @@ jobs:
         run: tox
 
   release:
-    needs: test
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
