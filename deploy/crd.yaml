@@ -28,6 +28,9 @@ spec:
         - name: Phase
           type: string
           jsonPath: .status.phase
+        - name: Error
+          type: string
+          jsonPath: .status.error
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -162,3 +165,9 @@ spec:
                 message:
                   type: string
                   description: Human-readable detail about the current phase.
+                error:
+                  type: string
+                  description: >-
+                    Detail of the most recent handler failure, if any. Empty once a
+                    reconciliation completes successfully. The operator keeps retrying on its
+                    own; this field is for visibility, not a terminal failure indicator.

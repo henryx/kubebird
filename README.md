@@ -48,6 +48,7 @@ With this CR, Kubebird can:
 - Authentication section is optional. If is specified, you can:
   - Declare SYSDBA database password using a secret. If secrets isn't specified, operator create a `<instance-name>-sysdba` secret with a random password. The secret has `username` (always `SYSDBA`) and `password` keys.
 - Label every object it creates (PVCs, Service, StatefulSet, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
+- Report the most recent error, if any, in `status.error` — visible directly via `kubectl get instances` (an `Error` column) without needing to check the operator's own logs. It's cleared automatically once the `Instance` reconciles successfully again.
 
 ### Object creation flow
 

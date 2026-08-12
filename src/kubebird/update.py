@@ -22,6 +22,23 @@ def update_fn(
     if namespace is None:
         raise kopf.PermanentError("Instance is namespaced")
 
+    try:
+        _reconcile(spec, old, name, namespace, logger, body, patch)
+    except Exception as exc:
+        patch.status["error"] = str(exc)
+        raise
+    patch.status["error"] = ""
+
+
+def _reconcile(
+    spec: kopf.Spec,
+    old: kopf.BodyEssence | Any | None,
+    name: str,
+    namespace: str,
+    logger: kopf.Logger,
+    body: kopf.Body,
+    patch: kopf.Patch,
+) -> None:
     core_api = client.CoreV1Api()
     apps_api = client.AppsV1Api()
 

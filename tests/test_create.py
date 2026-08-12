@@ -62,6 +62,25 @@ def _wait_ready(
     raise TimeoutError(f"Instance {name!r} did not reach phase Ready in time")
 
 
+def _wait_status_error(
+    api: client.CustomObjectsApi,
+    *,
+    group: str,
+    version: str,
+    namespace: str,
+    plural: str,
+    name: str,
+    timeout: float = 420.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        obj = api.get_namespaced_custom_object(group, version, namespace, plural, name)
+        if (obj.get("status") or {}).get("error"):
+            return obj
+        time.sleep(2)
+    raise TimeoutError(f"Instance {name!r} did not report a status.error in time")
+
+
 def _assert_database_file_exists(
     core_api: client.CoreV1Api, *, namespace: str, pod_name: str, path: str
 ) -> None:
@@ -224,3 +243,50 @@ def test_create_instance_shadow_database(kubeconfig: Path) -> None:
     assert runner.exit_code == 0
     assert runner.exception is None
     assert "Handler 'create_fn' succeeded." in runner.output
+
+
+def test_create_instance_reports_error_in_status(kubeconfig: Path) -> None:
+    """A handler failure is expected to be surfaced into status.error, not just
+    into the operator's own logs -- here, a shadow database declared without
+    spec.storage.shadow configured (a real, deterministic kopf.PermanentError)."""
+    config.load_kube_config(config_file=str(kubeconfig))
+
+    crd_body = yaml.safe_load(CRD_PATH.read_text())
+    cr_body = yaml.safe_load(CR_PATH.read_text())
+    cr_body["metadata"]["name"] = "test-error"
+    cr_body["spec"]["databases"] = [{"name": "instance.fdb", "shadow": True}]
+    del cr_body["spec"]["storage"]["shadow"]
+
+    group, version = cr_body["apiVersion"].split("/")
+    plural = crd_body["spec"]["names"]["plural"]
+    namespace = "default"
+    name = cr_body["metadata"]["name"]
+
+    extensions_api = client.ApiextensionsV1Api()
+    _ensure_crd_established(extensions_api, crd_body)
+
+    objects_api = client.CustomObjectsApi()
+
+    with KopfRunner(
+        ["run", "-n", namespace, "--verbose", "-m", "kubebird.create"]
+    ) as runner:
+        objects_api.create_namespaced_custom_object(
+            group, version, namespace, plural, cr_body
+        )
+        instance = _wait_status_error(
+            objects_api,
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+        )
+        assert "storage.shadow is not configured" in instance["status"]["error"]
+
+        objects_api.delete_namespaced_custom_object(
+            group, version, namespace, plural, name
+        )
+        time.sleep(1)
+
+    assert runner.exit_code == 0
+    assert runner.exception is None

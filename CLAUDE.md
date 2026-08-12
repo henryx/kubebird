@@ -27,12 +27,20 @@ The implementation is split across five modules:
   (`change_sysdba_password`).
 - `src/kubebird/create.py` — the `@kopf.on.create` handler that orchestrates the two modules above
   and reports progress via `status.phase` (`Provisioning` → `WaitingForPod` →
-  `ProvisioningDatabases` → `Ready`).
+  `ProvisioningDatabases` → `Ready`); its actual reconciliation work lives in a private
+  `_reconcile()` so `create_fn` itself can wrap the call in `try`/`except Exception`, recording
+  `str(exc)` into `status.error` (cleared to `""` on success) before re-raising — this is what
+  surfaces a handler failure (RBAC errors, `kopf.PermanentError`/`TemporaryError`, anything) into
+  `kubectl get instances` via the CRD's `Error` printer column, not just into the operator's own
+  pod logs. Re-raising after recording it is what keeps kopf's own retry/backoff behavior intact —
+  this only adds visibility, it doesn't change control flow.
 - `src/kubebird/update.py` — `update_fn` (`@kopf.on.update` on `Instance`) reconciles `Service`
   type and `StatefulSet` image/version changes and provisions any databases newly added to
   `spec.databases`; `sysdba_secret_update_fn` (`@kopf.on.update` on core `Secret`, filtered by the
   `kubebird.github.io/role: sysdba` label) pushes a rotated SYSDBA secret password to the live
-  server via `gsec`.
+  server via `gsec`. `update_fn` follows the same `_reconcile()` + `try`/`except` →
+  `status.error` pattern as `create_fn` (see below); `sysdba_secret_update_fn` doesn't, since it
+  reconciles a `Secret`, not an `Instance` — there's no `Instance.status` for it to write into.
 - `src/kubebird/delete.py` — `delete_fn` (`@kopf.on.delete` on `Instance`). Deliberately minimal:
   it just logs and patches `status.phase`, since every object `create_fn`/`update_fn` create is
   already `kopf.adopt()`-ed, so Kubernetes garbage-collects all of them (Secret, PVC(s), Service,
@@ -266,12 +274,17 @@ become live), and execs into the pod to confirm the relevant database file actua
 before deleting the `Instance`. These are real, non-mocked runs — each takes roughly a minute
 end-to-end on a warm image cache.
 
-There are two such tests, run independently against the same `Instance` CRD:
+There are three such tests, run independently against the same `Instance` CRD:
 - `test_create_instance` — the CR as shipped in `deploy/cr.yaml`; checks that the primary
   (non-shadow) database file exists under `k8s.DATA_MOUNT_PATH`.
 - `test_create_instance_shadow_database` — the same CR but with `metadata.name` overridden to
   `test-shadow` (so it can't collide with the other test's still-being-garbage-collected objects);
   checks that the shadow database's `.shadow` file exists under `k8s.SHADOW_MOUNT_PATH`.
+- `test_create_instance_reports_error_in_status` — a database with `shadow: true` but
+  `spec.storage.shadow` deleted from the CR, a real (not mocked) way to trigger `create_fn`'s
+  `kopf.PermanentError` for that case; polls for `status.error` to become non-empty
+  (`_wait_status_error`) instead of `status.phase == "Ready"`, since this CR is expected to never
+  reach `Ready`.
 
 Since the CRD is cluster-scoped, both tests need it created but only one can actually create it;
 `_ensure_crd_established` (not `_wait_established` — renamed when this became shared) tolerates a
@@ -398,6 +411,10 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   `Instance`. `build_service`/`build_statefulset` already needed this label internally for the
   Service→Pod selector and the StatefulSet's pod template; it's now also stamped on each object's
   own `metadata.labels`, not just used internally.
+- Reports any handler failure into `status.error` (cleared on success) — see the `_reconcile()`
+  bullet under "Project overview" above — surfaced via `deploy/crd.yaml`'s `Error` printer column,
+  so `kubectl get instances` shows e.g. an RBAC-forbidden error or a missing-`storage.shadow`
+  `kopf.PermanentError` directly, without needing to read the operator pod's own logs.
 
 `storage.primary.size` and `storage.shadow.size` in `deploy/crd.yaml` carry a `pattern` validating
 the standard Kubernetes resource-quantity grammar (e.g. `3Gi`, `500Mi`, `1.5G`), so the API server
@@ -421,7 +438,8 @@ Updating an `Instance` (`update_fn` in `src/kubebird/update.py`, `@kopf.on.updat
   update never reaches an already-mounted `subPath` on its own (see the gotcha above).
 - Diffs `old.spec.databases` (kopf's own kwarg, the previously-handled body) against
   `spec.databases` and provisions only the newly-added entries — pre-existing ones are left alone.
-- Reports progress via `status.phase`/`status.message` the same way `create_fn` does, ending in
+- Reports progress via `status.phase`/`status.message` the same way `create_fn` does (and any
+  handler failure into `status.error`, also the same way), ending in
   `status.message == "Instance updated."` (a distinct value from `create_fn`'s `"Instance
   provisioned."`, useful for tests/tooling to tell a genuine update apart from a stale `Ready`
   status left over from creation).
