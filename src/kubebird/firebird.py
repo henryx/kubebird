@@ -43,6 +43,7 @@ def wait_for_sysdba_ready(
     pod_name: str,
     container: str,
     sysdba_password: str,
+    logger: kopf.Logger,
     timeout: float = SYSDBA_READY_TIMEOUT,
 ) -> None:
     """Block until the server actually accepts `sysdba_password`.
@@ -56,24 +57,17 @@ def wait_for_sysdba_ready(
         f"CREATE DATABASE 'localhost:{SYSDBA_PROBE_PATH}' "
         f"USER 'SYSDBA' PASSWORD '{sysdba_password}';\nDROP DATABASE;"
     )
-    shell_command = (
-        f"echo {shlex.quote(sql)} | isql -quiet "
-        f"-user SYSDBA -password {shlex.quote(sysdba_password)}"
-    )
-    command = ["/bin/sh", "-c", shell_command]
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        output = stream(
-            core_api.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
+        output = run_isql(
+            core_api,
+            namespace=namespace,
+            pod_name=pod_name,
             container=container,
-            command=command,
-            stderr=True,
-            stdin=False,
-            stdout=True,
-            tty=False,
+            sysdba_password=sysdba_password,
+            sql=sql,
+            logger=logger,
+            check=False,
         )
         if "Statement failed" not in output:
             return
@@ -93,6 +87,7 @@ def run_isql(
     sql: str,
     logger: kopf.Logger,
     database: str | None = None,
+    check: bool = True,
 ) -> str:
     # A bare local path makes isql open the database through Firebird's
     # embedded/local provider, which races the already-running SuperServer
@@ -119,7 +114,7 @@ def run_isql(
     # The exec exit-code channel varies across negotiated websocket
     # subprotocol versions and is unreliable here; isql itself always
     # prints this marker on a failed statement, so check for it instead.
-    if "Statement failed" in output:
+    if check and "Statement failed" in output:
         raise kopf.PermanentError(f"isql failed (sql={sql!r}): {output}")
     return output
 

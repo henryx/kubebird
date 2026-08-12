@@ -115,6 +115,7 @@ def create_fn(
         pod_name=pod_name,
         container=CONTAINER_NAME,
         sysdba_password=sysdba_password,
+        logger=logger,
     )
 
     patch.status["phase"] = "ProvisioningDatabases"

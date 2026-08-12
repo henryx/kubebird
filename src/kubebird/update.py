@@ -88,6 +88,7 @@ def update_fn(
         pod_name=pod_name,
         container=CONTAINER_NAME,
         sysdba_password=sysdba_password,
+        logger=logger,
     )
 
     # The ConfigMap patch above only reaches an already-running container on
