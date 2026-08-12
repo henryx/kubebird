@@ -9,7 +9,12 @@ from kubernetes.client.exceptions import ApiException
 from kubernetes.stream import stream
 
 from kubebird.create import CONTAINER_NAME
-from kubebird.k8s import DATA_MOUNT_PATH, DATABASES_CONF_PATH, SHADOW_MOUNT_PATH
+from kubebird.k8s import (
+    DATA_MOUNT_PATH,
+    DATABASES_CONF_PATH,
+    FIREBIRD_PORT,
+    SHADOW_MOUNT_PATH,
+)
 
 DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 CRD_PATH = DEPLOY_DIR / "crd.yaml"
@@ -143,6 +148,10 @@ def test_create_instance(kubeconfig: Path) -> None:
             f"{primary_db['name']} = {DATA_MOUNT_PATH}/{primary_db['name']}"
             in databases_conf
         )
+
+        service = client.CoreV1Api().read_namespaced_service(name, namespace)
+        assert service.spec.ports[0].port == cr_body["spec"]["service"]["port"]
+        assert service.spec.ports[0].target_port == FIREBIRD_PORT
 
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name

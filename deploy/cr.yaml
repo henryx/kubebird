@@ -16,6 +16,7 @@ spec:
       shadow: true
   service:
     type: ClusterIP
+    port: 3050 # port the Service exposes the instance on. Default is 3050
   storage:
     primary:
       class: "" # if empty, uses the default storage class

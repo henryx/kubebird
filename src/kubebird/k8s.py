@@ -238,7 +238,11 @@ def build_service(
             "type": service_spec.get("type") or "ClusterIP",
             "selector": {INSTANCE_LABEL: name},
             "ports": [
-                {"name": "firebird", "port": FIREBIRD_PORT, "targetPort": FIREBIRD_PORT}
+                {
+                    "name": "firebird",
+                    "port": service_spec.get("port") or FIREBIRD_PORT,
+                    "targetPort": FIREBIRD_PORT,
+                }
             ],
         },
     }

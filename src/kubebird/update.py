@@ -51,11 +51,27 @@ def update_fn(
         _content_type="application/merge-patch+json",
     )
 
-    service_type = (spec.get("service") or {}).get("type") or "ClusterIP"
+    service_spec = spec.get("service") or {}
+    service_type = service_spec.get("type") or "ClusterIP"
+    service_port = service_spec.get("port") or k8s.FIREBIRD_PORT
     core_api.patch_namespaced_service(
         name,
         namespace,
-        {"spec": {"type": service_type}},
+        {
+            "spec": {
+                "type": service_type,
+                # JSON merge-patch replaces the whole "ports" array, not just
+                # matching entries by name -- fine here since there's only ever
+                # this one port.
+                "ports": [
+                    {
+                        "name": "firebird",
+                        "port": service_port,
+                        "targetPort": k8s.FIREBIRD_PORT,
+                    }
+                ],
+            }
+        },
         _content_type="application/merge-patch+json",
     )
 

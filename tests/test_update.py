@@ -16,7 +16,7 @@ from test_create import (
 )
 
 from kubebird import firebird
-from kubebird.k8s import DATA_MOUNT_PATH
+from kubebird.k8s import DATA_MOUNT_PATH, FIREBIRD_PORT
 
 
 def _runner_args(namespace: str) -> list[str]:
@@ -112,6 +112,72 @@ def test_update_instance_service_type(kubeconfig: Path) -> None:
 
         service = core_api.read_namespaced_service(name, namespace)
         assert service.spec.type == "NodePort"
+
+        objects_api.delete_namespaced_custom_object(
+            group, version, namespace, plural, name
+        )
+        time.sleep(1)
+
+    assert runner.exit_code == 0
+    assert runner.exception is None
+    assert "Handler 'update_fn' succeeded." in runner.output
+
+
+def test_update_instance_service_port(kubeconfig: Path) -> None:
+    """update_fn is expected to reconcile the Service's port when spec.service.port
+    changes, while leaving targetPort at the container's actual, fixed port."""
+    config.load_kube_config(config_file=str(kubeconfig))
+
+    crd_body = yaml.safe_load(CRD_PATH.read_text())
+    cr_body = yaml.safe_load(CR_PATH.read_text())
+    cr_body["metadata"]["name"] = "test-update-service-port"
+
+    group, version = cr_body["apiVersion"].split("/")
+    plural = crd_body["spec"]["names"]["plural"]
+    namespace = "default"
+    name = cr_body["metadata"]["name"]
+    new_port = 3051
+
+    extensions_api = client.ApiextensionsV1Api()
+    _ensure_crd_established(extensions_api, crd_body)
+
+    objects_api = client.CustomObjectsApi()
+    core_api = client.CoreV1Api()
+
+    with KopfRunner(_runner_args(namespace)) as runner:
+        objects_api.create_namespaced_custom_object(
+            group, version, namespace, plural, cr_body
+        )
+        _wait_ready(
+            objects_api,
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+        )
+
+        objects_api.patch_namespaced_custom_object(
+            group,
+            version,
+            namespace,
+            plural,
+            name,
+            {"spec": {"service": {"port": new_port}}},
+        )
+        _wait_status_message(
+            objects_api,
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+            message="Instance updated.",
+        )
+
+        service = core_api.read_namespaced_service(name, namespace)
+        assert service.spec.ports[0].port == new_port
+        assert service.spec.ports[0].target_port == FIREBIRD_PORT
 
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name

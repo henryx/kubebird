@@ -26,6 +26,7 @@ spec:
       shadow: true
   service:
     type: ClusterIP
+    port: 3050 # port the Service exposes the instance on; defaults to 3050
   storage:
     primary:
       class: "" # if empty, uses the default storage class
@@ -40,7 +41,7 @@ spec:
 
 With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in.
-- Create a service for the instance. Default service type is `ClusterIP`.
+- Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`) with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`).
@@ -49,7 +50,8 @@ With this CR, Kubebird can:
 - Label every object it creates (PVCs, Service, StatefulSet, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 
 Kubebird also reacts to updates on an existing `Instance`:
-- Changing `spec.service.type` or `spec.version` reconciles the `Service`/`StatefulSet` in place.
+- Changing `spec.service.type`, `spec.service.port`, or `spec.version` reconciles the
+  `Service`/`StatefulSet` in place.
 - Adding an entry to `spec.databases` provisions just that new database (existing ones are left
   alone) and registers its alias immediately, without needing a pod restart.
 - Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
