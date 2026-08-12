@@ -210,12 +210,14 @@ starts a real k3s container per test session. `testcontainers` is a dev dependen
 `k3s.config_yaml()` returns a valid kubeconfig).
 
 `tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies `deploy/crd.yaml`
-and every object in `deploy/operator.yaml` (ServiceAccount/ClusterRole/ClusterRoleBinding/
-Role/RoleBinding/Deployment, dispatched by `kind` since it's multi-document YAML) via the
-`kubernetes` client, then uses `AuthorizationV1Api.create_subject_access_review` (the API
-`kubectl auth can-i --as=...` itself calls) to confirm the ServiceAccount actually gets every
-permission `create_fn`/`update_fn`/`k8s.py`/`firebird.py` call for, plus kopf's own cluster-scoped
-framework needs. This only validates the manifest/RBAC, not full pod scheduling (the Deployment's
+and every object in `deploy/operator.yaml` (Namespace/ServiceAccount/ClusterRole/
+ClusterRoleBinding/Role/RoleBinding/Deployment, dispatched by `kind` since it's multi-document
+YAML — each namespaced object's target namespace is read from its own `metadata.namespace`, i.e.
+`kubebird-system`, rather than a namespace the test picks) via the `kubernetes` client, then uses
+`AuthorizationV1Api.create_subject_access_review` (the API `kubectl auth can-i --as=...` itself
+calls) to confirm the ServiceAccount actually gets every permission
+`create_fn`/`update_fn`/`k8s.py`/`firebird.py` call for, plus kopf's own cluster-scoped framework
+needs. This only validates the manifest/RBAC, not full pod scheduling (the Deployment's
 `image: quay.io/kubebird/operator:latest` isn't expected to actually be pullable here), so it's
 fast (~15s) compared to the `test_create`/`test_update`/`test_delete` suites below.
 
@@ -429,11 +431,20 @@ object's own removal against that garbage collection.
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
 with each other and with the README's sample whenever the CR shape changes.
 
-`deploy/operator.yaml` is the Deployment/RBAC manifest for running the operator itself in-cluster
-(the README's Installation section documents `kubectl apply -f deploy/crd.yaml -f
-deploy/operator.yaml`), following kopf's own [deployment](https://docs.kopf.dev/en/stable/deployment/)/
-[RBAC](https://docs.kopf.dev/en/stable/rbac/) guidance for a namespace-scoped operator:
-- A `ServiceAccount` plus a namespaced `Role`/`RoleBinding` granting exactly what the code above
+`deploy/operator.yaml` is the Namespace/Deployment/RBAC manifest for running the operator itself
+in-cluster (the README's Installation section documents a plain `kubectl apply -f deploy/crd.yaml
+-f deploy/operator.yaml`, no `-n` flag needed), following kopf's own
+[deployment](https://docs.kopf.dev/en/stable/deployment/)/[RBAC](https://docs.kopf.dev/en/stable/rbac/)
+guidance for a namespace-scoped operator:
+- A `Namespace` object creates a fixed `kubebird-system` namespace, and every other namespaced
+  object in the file (`ServiceAccount`/`Role`/`RoleBinding`/`Deployment`) hardcodes
+  `metadata.namespace: kubebird-system` to match — rather than the previous design of leaving them
+  namespace-less and relying on `kubectl apply -n <namespace>` to pick one at apply-time. This is
+  what lets the `ClusterRoleBinding`'s `subjects[].namespace` (see below) be correct by construction
+  instead of a manual edit someone has to remember to keep in sync. The tradeoff: `Instance` CRs
+  must now be created in `kubebird-system` too, since the namespaced `Role`/`RoleBinding` only grant
+  access there.
+- A `ServiceAccount` plus that namespaced `Role`/`RoleBinding` granting exactly what the code above
   calls: `get`/`list`/`watch`/`patch` on `instances` and `instances/status`; `get`/`list`/`watch`/
   `create`/`patch` on `secrets` (covers `k8s.ensure_sysdba_secret`'s create-or-reuse, the labeling
   of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create`/`patch` on
@@ -445,19 +456,19 @@ deploy/operator.yaml`), following kopf's own [deployment](https://docs.kopf.dev/
 - A thin cluster-scoped `ClusterRole`/`ClusterRoleBinding`, still needed even though the operator
   itself is namespace-scoped: kopf's framework needs `list`/`watch` on `customresourcedefinitions`
   and `namespaces`, both genuinely cluster-scoped resource types with no namespaced equivalent to
-  grant instead. No webhook-config permissions, since kubebird registers no admission handlers.
-- None of the namespaced objects (`ServiceAccount`/`Role`/`RoleBinding`/`Deployment`) hardcode a
-  namespace — `kubectl apply -n <namespace> -f deploy/operator.yaml` picks it at apply-time. The
-  one unavoidable exception is the `ClusterRoleBinding`'s `subjects[]` entry (defaults to
-  `default`): a cluster-scoped object has no "current namespace" to infer from, so it must be kept
-  in sync by hand with whatever namespace the rest of the file is actually applied into.
+  grant instead. No webhook-config permissions, since kubebird registers no admission handlers. The
+  `ClusterRoleBinding`'s `subjects[].namespace` is `kubebird-system` — unlike every other namespaced
+  object here, a `ClusterRoleBinding` has no "current namespace" for Kubernetes to infer at
+  apply-time no matter how the rest of the file is structured, so this value must always be spelled
+  out explicitly; fixing the operator's own namespace means there's exactly one correct value for it
+  instead of a moving target.
 - The `Deployment` runs 1 replica with `strategy: Recreate` (matching kopf's own "never run two
   operators for the same objects" recommendation) and wires `NAMESPACE` via the Downward API
-  (`fieldRef: metadata.namespace`), which `src/kubebird/operator.py`'s existing namespace-scoping
-  logic already reads.
+  (`fieldRef: metadata.namespace`, i.e. `kubebird-system`), which `src/kubebird/operator.py`'s
+  existing namespace-scoping logic already reads.
 
-Verified against a real cluster (both applying as-is and with `-n <other-namespace>`, plus
-`kubectl auth can-i --as=system:serviceaccount:...` for every rule above); see
+Verified against a real cluster (applying the whole file, including the `Namespace` object, from
+scratch), plus `kubectl auth can-i --as=system:serviceaccount:...` for every rule above; see
 `tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac`.
 
 ## Container image

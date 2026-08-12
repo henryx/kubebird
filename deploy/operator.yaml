@@ -1,20 +1,28 @@
-# Namespaced deployment of the Kubebird operator: the ServiceAccount/Role/RoleBinding below scope
-# its own workload (Instances, Secrets, ConfigMaps, PVCs, Services, StatefulSets, pod exec) to a
-# single namespace. None of the namespaced objects below hardcode one -- apply with
-# `kubectl apply -n <namespace> -f deploy/operator.yaml` (or against a context whose current
-# namespace is already set) to pick it. The one exception is the ClusterRoleBinding's `subjects[]`
-# entry: a cluster-scoped object has no "current namespace" to infer from, so Kubernetes requires
-# that namespace spelled out explicitly there -- keep it in sync with whatever namespace you apply
-# the rest of this file into.
+# Deploys the Kubebird operator into its own fixed "kubebird-system" namespace (created below),
+# rather than inferring one at apply-time. This is what lets the ClusterRoleBinding's
+# `subjects[].namespace` below be hardcoded correctly by construction: a ClusterRoleBinding is
+# cluster-scoped and has no "current namespace" to infer from, so Kubernetes always requires that
+# value spelled out explicitly -- fixing the operator's own namespace means there's exactly one
+# correct value, instead of a manual edit you have to remember to keep in sync.
 #
-# A thin ClusterRole/ClusterRoleBinding is still required even for a namespaced operator: kopf's
-# own framework needs read access to two genuinely cluster-scoped resource types
+# Install with a plain `kubectl apply -f deploy/crd.yaml -f deploy/operator.yaml` (no `-n` needed).
+#
+# The Role/RoleBinding below scope the operator's own workload (Instances, Secrets, ConfigMaps,
+# PVCs, Services, StatefulSets, pod exec) to this same "kubebird-system" namespace -- so Instance
+# CRs must be created there too. A thin ClusterRole/ClusterRoleBinding is still required even so:
+# kopf's own framework needs read access to two genuinely cluster-scoped resource types
 # (CustomResourceDefinitions, Namespaces) that have no namespaced equivalent to grant instead.
 # See: https://kopf.dev/en/stable/deployment/ and https://kopf.dev/en/stable/rbac/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubebird-system
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: kubebird-operator
+  namespace: kubebird-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -40,16 +48,15 @@ roleRef:
   kind: ClusterRole
   name: kubebird-operator-cluster
 subjects:
-  # Must stay hardcoded (see the top-of-file note): ClusterRoleBinding subjects can't inherit an
-  # "apply-time" namespace the way plain namespaced objects do.
   - kind: ServiceAccount
     name: kubebird-operator
-    namespace: default
+    namespace: kubebird-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: kubebird-operator
+  namespace: kubebird-system
 rules:
   # Framework: cross-operator awareness (harmless no-op unless a KopfPeering CRD is separately
   # installed and peering is explicitly requested -- kubebird runs a single replica, so peering
@@ -85,7 +92,7 @@ rules:
     resources: [persistentvolumeclaims]
     verbs: [create]
   # Application: the Service -- created by create_fn, patched in place by update_fn
-  # (spec.service.type changes).
+  # (spec.service.type/port changes).
   - apiGroups: [""]
     resources: [services]
     verbs: [create, patch]
@@ -107,6 +114,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: kubebird-operator
+  namespace: kubebird-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -119,6 +127,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kubebird-operator
+  namespace: kubebird-system
 spec:
   # kopf strongly recommends exactly one replica: two or more operators reconciling the same
   # objects collide unpredictably. `Recreate` avoids a brief two-pod overlap during rollouts.
@@ -140,8 +149,9 @@ spec:
           # (see README.md) and pushed to a registry this cluster can pull from.
           image: quay.io/kubebird/operator:latest
           env:
-            # Scopes kopf.run(namespaces=[...]) to this Deployment's own namespace, matching the
-            # namespaced Role/RoleBinding above -- see src/kubebird/operator.py.
+            # Scopes kopf.run(namespaces=[...]) to this Deployment's own namespace
+            # (kubebird-system), matching the namespaced Role/RoleBinding above -- see
+            # src/kubebird/operator.py. Instance CRs must live in kubebird-system too.
             - name: NAMESPACE
               valueFrom:
                 fieldRef:

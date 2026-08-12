@@ -19,8 +19,17 @@ def test_k3s_config_yaml(k3s: K3SContainer) -> None:
     )
 
 
-def _create_object(kind: str, namespace: str, body: dict) -> None:
-    if kind == "ServiceAccount":
+def _create_object(kind: str, body: dict) -> None:
+    # operator.yaml now hardcodes metadata.namespace on every namespaced object it
+    # defines (kubebird-system), rather than relying on an apply-time -n flag.
+    namespace = body.get("metadata", {}).get("namespace")
+    if kind == "Namespace":
+        try:
+            client.CoreV1Api().create_namespace(body)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+    elif kind == "ServiceAccount":
         client.CoreV1Api().create_namespaced_service_account(namespace, body)
     elif kind == "ClusterRole":
         client.RbacAuthorizationV1Api().create_cluster_role(body)
@@ -71,7 +80,7 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
     namespace-scoped."""
     config.load_kube_config(config_file=str(kubeconfig))
 
-    namespace = "default"
+    namespace = "kubebird-system"
     service_account = "kubebird-operator"
 
     ext_api = client.ApiextensionsV1Api()
@@ -83,7 +92,7 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
             raise
 
     for doc in yaml.safe_load_all(OPERATOR_PATH.read_text()):
-        _create_object(doc["kind"], namespace, doc)
+        _create_object(doc["kind"], doc)
 
     deployment = client.AppsV1Api().read_namespaced_deployment(
         service_account, namespace

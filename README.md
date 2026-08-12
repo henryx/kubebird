@@ -67,19 +67,18 @@ it (they're all owned by the `Instance`); the operator itself just logs the dele
 To install Kubebird in the Kubernetes cluster, you can use these commands:
 ```bash
 kubectl apply -f deploy/crd.yaml
-kubectl apply -n <namespace> -f deploy/operator.yaml
+kubectl apply -f deploy/operator.yaml
 ```
-`deploy/operator.yaml` deploys the operator itself (Deployment, ServiceAccount, and the RBAC it
-needs) scoped to a single namespace: `-n <namespace>` picks which one. The only manual step if you
-deploy outside the `default` namespace is updating the `ClusterRoleBinding`'s `subjects[].namespace`
-in `deploy/operator.yaml` to match — a plain cluster-scoped object can't infer that at apply-time
-the way the rest of the file does.
+`deploy/operator.yaml` creates its own `kubebird-system` namespace and deploys the operator into it
+(Deployment, ServiceAccount, and the RBAC it needs) — no `-n <namespace>` needed. `Instance` CRs
+must be created in `kubebird-system` too, since the namespaced `Role`/`RoleBinding` only grant
+access there.
 
 The operator itself runs via the `kubebird-operator` console script (on `uvloop`):
 ```bash
 uv run kubebird-operator
 # or, to scope it to a single namespace instead of the whole cluster:
-NAMESPACE=default uv run kubebird-operator
+NAMESPACE=kubebird-system uv run kubebird-operator
 ```
 
 To build the container image instead:
