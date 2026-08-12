@@ -96,6 +96,24 @@ Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
   probe distinguishes this), so `create_fn` must additionally wait for SYSDBA authentication to
   actually be live (`firebird.wait_for_sysdba_ready`, a throwaway `CREATE DATABASE`/`DROP DATABASE`
   probe) before issuing any real SQL.
+- `firebird.wait_for_pod_ready` must call `core_api.read_namespaced_pod`, not
+  `read_namespaced_pod_status`: the latter hits the `pods/status` *subresource* endpoint
+  (`GET .../pods/{name}/status`), which RBAC treats as a distinct resource from plain `pods` and so
+  needs its own grant — `deploy/operator.yaml`'s Role only ever granted `get` on `pods` itself. Hit
+  this for real against a live cluster: `create_fn` got stuck retrying every 60s on a `403` ("cannot
+  get resource \"pods/status\""). The main resource's GET already returns the identical
+  `.status.conditions`, so switching to it fixed the 403 without needing to widen the
+  ServiceAccount's Role at all.
+- That same function must also tolerate a `404` from `read_namespaced_pod`, not just poll on
+  conditions: right after `create_fn`/`update_fn` creates the `StatefulSet`, there's a real window
+  where the StatefulSet controller hasn't created the pod object yet at all, and a GET for it 404s
+  outright rather than returning an object with no `Ready` condition. Before the `status.error`
+  feature below existed, this only ever showed up as a transient `ERROR`-logged exception that kopf
+  silently retried past (so it went unnoticed); once `status.error` started surfacing every handler
+  exception, this exact 404 showed up as a false-positive "error" on an otherwise-healthy
+  reconciliation, caught by `tests/test_create.py`'s new error-reporting test race — fixed by
+  catching `ApiException` with `.status == 404` and treating it the same as "not ready yet" instead
+  of letting it propagate.
 - `k8s.ensure_sysdba_secret` must be idempotent across kopf handler retries: it generates a random
   password, but if the secret already exists (409, from a prior attempt) it must re-read that
   secret's *actual* stored password rather than using the freshly generated one that was never
@@ -282,9 +300,12 @@ There are three such tests, run independently against the same `Instance` CRD:
   checks that the shadow database's `.shadow` file exists under `k8s.SHADOW_MOUNT_PATH`.
 - `test_create_instance_reports_error_in_status` — a database with `shadow: true` but
   `spec.storage.shadow` deleted from the CR, a real (not mocked) way to trigger `create_fn`'s
-  `kopf.PermanentError` for that case; polls for `status.error` to become non-empty
-  (`_wait_status_error`) instead of `status.phase == "Ready"`, since this CR is expected to never
-  reach `Ready`.
+  `kopf.PermanentError` for that case; polls for `status.error` to contain that specific message
+  (`_wait_status_error(..., contains=...)`) instead of `status.phase == "Ready"`, since this CR is
+  expected to never reach `Ready`. Polling for *any* non-empty `status.error` (an earlier version
+  of this test/helper) is a real false-positive trap here — see the `wait_for_pod_ready` 404 gotcha
+  above — since a transient, unrelated error from an earlier retry can still be sitting in
+  `status.error` when the deterministic one this test actually means to catch hasn't landed yet.
 
 Since the CRD is cluster-scoped, both tests need it created but only one can actually create it;
 `_ensure_crd_established` (not `_wait_established` — renamed when this became shared) tolerates a
