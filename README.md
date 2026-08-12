@@ -79,7 +79,11 @@ The operator itself runs via the `kubebird-operator` console script (on `uvloop`
 uv run kubebird-operator
 # or, to scope it to a single namespace instead of the whole cluster:
 NAMESPACE=kubebird-system uv run kubebird-operator
+# or, to control log verbosity (DEBUG/INFO/WARNING/ERROR/CRITICAL; defaults to INFO):
+LOG_LEVEL=DEBUG uv run kubebird-operator
 ```
+`deploy/operator.yaml`'s Deployment sets a fixed `LOG_LEVEL: INFO` — edit that value directly to
+change verbosity for an in-cluster deployment.
 
 To build the container image instead:
 ```bash
@@ -114,19 +118,19 @@ and `test_create_instance_shadow_database` checks that a database with `shadow: 
 shadow file on the separate shadow PVC.
 
 `tests/test_update.py` covers the update-reconciliation behaviour the same way: patching an
-already-`Ready` `Instance`'s `service.type`/`version`/`databases`, and rotating its SYSDBA secret's
-password (both the auto-generated one and a user-provided `secretRef`), then confirming the change
-actually took effect against the live `Service`/`StatefulSet`/pod.
+already-`Ready` `Instance`'s `service.type`/`service.port`/`version`/`databases`, and rotating its
+SYSDBA secret's password (both the auto-generated one and a user-provided `secretRef`), then
+confirming the change actually took effect against the live `Service`/`StatefulSet`/pod.
 
 `tests/test_delete.py` covers deletion the same way: deletes a `Ready` `Instance` and confirms it
 actually disappears (not just that the delete call returned) and that Kubernetes garbage-collects
 the `StatefulSet` it owned.
 
 `tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies `deploy/operator.yaml`
-(ServiceAccount, ClusterRole/ClusterRoleBinding, Role/RoleBinding, Deployment) and checks, via
-`SubjectAccessReview`, that the resulting ServiceAccount actually gets every permission the
-operator's code calls for — much faster than the other suites since it doesn't need the container
-image to actually be pullable or any pod to schedule.
+(Namespace, ServiceAccount, ClusterRole/ClusterRoleBinding, Role/RoleBinding, Deployment) and
+checks, via `SubjectAccessReview`, that the resulting ServiceAccount actually gets every permission
+the operator's code calls for — much faster than the other suites since it doesn't need the
+container image to actually be pullable or any pod to schedule.
 
 ## CI
 

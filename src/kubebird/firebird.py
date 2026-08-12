@@ -17,18 +17,32 @@ SYSDBA_READY_POLL_INTERVAL = 3.0
 SYSDBA_PROBE_PATH = "/tmp/kubebird-readiness-probe.fdb"
 
 
+def _redact(text: str, *secrets: str) -> str:
+    """Strip literal secret values (e.g. a SYSDBA password) out of a string
+    before it's logged -- even at DEBUG level, exec commands/SQL text below
+    embed passwords inline, and kubebird has no control over where the
+    resulting log lines end up (stdout, an aggregator, etc.)."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 def wait_for_pod_ready(
     core_api: client.CoreV1Api,
     *,
     namespace: str,
     pod_name: str,
+    logger: kopf.Logger,
     timeout: float = POD_READY_TIMEOUT,
 ) -> None:
+    logger.info(f"Waiting for pod {pod_name!r} to become Ready.")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         pod = core_api.read_namespaced_pod_status(pod_name, namespace)
         conditions = pod.status.conditions or []
         if any(c.type == "Ready" and c.status == "True" for c in conditions):
+            logger.debug(f"Pod {pod_name!r} is Ready.")
             return
         time.sleep(POD_READY_POLL_INTERVAL)
     raise kopf.TemporaryError(
@@ -53,6 +67,9 @@ def wait_for_sysdba_ready(
     this) before that change has taken effect. A throwaway probe database is
     created and dropped as a proxy for "authentication is live".
     """
+    logger.info(
+        f"Waiting for SYSDBA authentication to become live on pod {pod_name!r}."
+    )
     sql = (
         f"CREATE DATABASE 'localhost:{SYSDBA_PROBE_PATH}' "
         f"USER 'SYSDBA' PASSWORD '{sysdba_password}';\nDROP DATABASE;"
@@ -70,6 +87,7 @@ def wait_for_sysdba_ready(
             check=False,
         )
         if "Statement failed" not in output:
+            logger.debug("SYSDBA authentication is live.")
             return
         time.sleep(SYSDBA_READY_POLL_INTERVAL)
     raise kopf.TemporaryError(
@@ -110,7 +128,9 @@ def run_isql(
         stdout=True,
         tty=False,
     )
-    logger.debug(f"isql command={command!r} output={output!r}")
+    logger.debug(
+        f"isql command={_redact(shell_command, sysdba_password)!r} output={output!r}"
+    )
     # The exec exit-code channel varies across negotiated websocket
     # subprotocol versions and is unreliable here; isql itself always
     # prints this marker on a failed statement, so check for it instead.
@@ -146,7 +166,10 @@ def change_sysdba_password(
         stdout=True,
         tty=False,
     )
-    logger.debug(f"gsec command={command!r} output={output!r}")
+    logger.debug(
+        f"gsec command={_redact(shell_command, old_password, new_password)!r} "
+        f"output={output!r}"
+    )
     # gsec prints nothing on success; any output is an error (e.g. the old
     # password no longer matching what's actually live).
     if output.strip():

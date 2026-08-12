@@ -52,7 +52,25 @@ mechanism explicitly (`asyncio.Runner(loop_factory=uvloop.new_event_loop)`, then
 `kopf.run(loop=runner.get_loop())`). It also reads a `NAMESPACE` env var and, if set, passes it as
 `kopf.run(namespaces=[NAMESPACE])` to scope the operator to one namespace (e.g. via the pod's
 Downward API); left unset, `kopf.run()` falls back to its own default (cluster-wide/current
-context), matching `kopf run` with neither `-n` nor `-A`. It is a regular (non-executable) file
+context), matching `kopf run` with neither `-n` nor `-A`. It also reads a `LOG_LEVEL` env var
+(`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`, defaulting to and falling back to `INFO` on an unset
+or unrecognized value) to control verbosity: `main()` calls `kopf.configure(debug=(log_level ==
+"DEBUG"), verbose=(log_level == "DEBUG"), quiet=(log_level == "WARNING"))` first — kopf's
+documented hook for controlling logging when embedding `kopf.run()` directly, as opposed to the
+`kopf run` CLI's own `--verbose`/`--debug`/`--quiet` flags — then explicitly overrides the root
+logger's level via `logging.getLogger().setLevel(log_level)` right after. Of `configure()`'s three
+knobs, only `debug` has any effect actually visible here: it's the one that decides whether kopf's
+own internal loggers (e.g. `asyncio`) propagate instead of being muted, and it's the only thing our
+subsequent explicit `setLevel()` call doesn't also override — `configure()`'s own `log_level`
+computation from `debug`/`verbose`/`quiet` (which only distinguishes `DEBUG`/`INFO`/`WARNING`, with
+no separate `ERROR`/`CRITICAL`) gets discarded the moment `setLevel(log_level)` runs afterward, so
+passing `verbose`/`quiet` through as well is harmless but redundant. Verified directly against kopf
+1.44.6's source (`kopf._core.actions.loggers.configure`) and empirically for every `LOG_LEVEL`
+value: none of kopf's own loggers (`kopf.objects`, the one `create_fn`/`update_fn`/`delete_fn`'s
+`logger` parameter is backed by, included) set an explicit level anywhere in the package, so they
+all inherit whatever effective level the root logger ends up at. `deploy/operator.yaml`'s
+Deployment sets a fixed `LOG_LEVEL: INFO` alongside `NAMESPACE`. It is a regular (non-executable)
+file
 with no `#!/usr/bin/env python3` shebang and no `if __name__ == "__main__": main()` guard, so it
 is *not* directly executable (`python -m kubebird.operator` would import it and define `main()`
 without calling it); the `kubebird-operator` console script (which calls `main()` itself via its
@@ -84,6 +102,13 @@ Gotchas hit while building `firebird.py` (all fixed, but easy to reintroduce):
   the running server via the Services API, unlike `isql`'s embedded-vs-network distinction) is how
   `firebird.change_sysdba_password` rotates the live SYSDBA password; like `isql -quiet`, it prints
   nothing on success, so any non-empty output is treated as a failure.
+- `run_isql`/`change_sysdba_password` both build a shell command embedding the SYSDBA password
+  inline (for `run_isql`, twice over for the SYSDBA-readiness probe: once in the `-password`
+  switch, once in the `CREATE DATABASE ... PASSWORD '...'` SQL text it echoes into `isql`), and both
+  log that exact command at `DEBUG` for troubleshooting. `firebird._redact()` strips every literal
+  password value out of the string before it's logged — added after noticing the debug log would
+  otherwise leak live passwords into whatever aggregates the operator's stdout, however verbose
+  logging is configured.
 - `k8s.generate_password` rejects passwords starting with `-`: `secrets.token_urlsafe`'s alphabet
   includes `-`/`_`, and roughly 1 in 64 generated passwords starts with `-` — `shlex.quote` doesn't
   add quotes around it (a leading hyphen isn't a shell metacharacter), so `gsec`/`isql` then parse
@@ -465,7 +490,8 @@ guidance for a namespace-scoped operator:
 - The `Deployment` runs 1 replica with `strategy: Recreate` (matching kopf's own "never run two
   operators for the same objects" recommendation) and wires `NAMESPACE` via the Downward API
   (`fieldRef: metadata.namespace`, i.e. `kubebird-system`), which `src/kubebird/operator.py`'s
-  existing namespace-scoping logic already reads.
+  existing namespace-scoping logic already reads, plus a fixed `LOG_LEVEL: INFO` that same file's
+  logging-configuration logic reads.
 
 Verified against a real cluster (applying the whole file, including the `Namespace` object, from
 scratch), plus `kubectl auth can-i --as=system:serviceaccount:...` for every rule above; see
@@ -523,7 +549,8 @@ approvals to tests-only:
 ## Requirements
 
 Python >= 3.14 (see `.python-version`, pinned to 3.14). `uv run kubebird-operator` (or
-`NAMESPACE=default uv run kubebird-operator` to scope it to one namespace) runs the operator via
-the `kubebird-operator` console script (`src/kubebird/operator.py`, on `uvloop`); the tests
-themselves still drive it via `kopf.testing.KopfRunner` and `-m kubebird.<module>` instead (see
-"Development commands" above), not through this entry point.
+`NAMESPACE=kubebird-system LOG_LEVEL=DEBUG uv run kubebird-operator` to scope it to one namespace
+and/or change log verbosity) runs the operator via the `kubebird-operator` console script
+(`src/kubebird/operator.py`, on `uvloop`); the tests themselves still drive it via
+`kopf.testing.KopfRunner` and `-m kubebird.<module>` instead (see "Development commands" above),
+not through this entry point.

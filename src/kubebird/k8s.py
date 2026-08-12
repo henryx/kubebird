@@ -39,6 +39,7 @@ def create_or_ignore(
     """Create the object, tolerating a 409 Conflict from a previous handler retry."""
     try:
         create_call(namespace=namespace, body=body)
+        logger.debug(f"Created {body['kind']} {body['metadata']['name']!r}.")
     except ApiException as e:
         if e.status != 409:
             raise
@@ -91,6 +92,7 @@ def ensure_sysdba_secret(
     kopf.adopt(secret_body, owner=body)
     try:
         core_api.create_namespaced_secret(namespace=namespace, body=secret_body)
+        logger.info(f"Created SYSDBA secret {secret_name!r}.")
     except ApiException as e:
         if e.status != 409:
             raise

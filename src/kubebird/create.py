@@ -24,6 +24,7 @@ def create_fn(
     core_api = client.CoreV1Api()
     apps_api = client.AppsV1Api()
 
+    logger.info(f"Provisioning instance {name!r}.")
     patch.status["phase"] = "Provisioning"
 
     authentication = spec.get("authentication") or {}
@@ -108,7 +109,9 @@ def create_fn(
 
     patch.status["phase"] = "WaitingForPod"
     pod_name = f"{name}-0"
-    firebird.wait_for_pod_ready(core_api, namespace=namespace, pod_name=pod_name)
+    firebird.wait_for_pod_ready(
+        core_api, namespace=namespace, pod_name=pod_name, logger=logger
+    )
     firebird.wait_for_sysdba_ready(
         core_api,
         namespace=namespace,
@@ -156,3 +159,4 @@ def create_fn(
 
     patch.status["phase"] = "Ready"
     patch.status["message"] = "Instance provisioned."
+    logger.info(f"Instance {name!r} provisioned successfully.")

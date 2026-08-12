@@ -25,6 +25,7 @@ def update_fn(
     core_api = client.CoreV1Api()
     apps_api = client.AppsV1Api()
 
+    logger.info(f"Updating instance {name!r}.")
     patch.status["phase"] = "Updating"
 
     authentication = spec.get("authentication") or {}
@@ -44,6 +45,7 @@ def update_fn(
     databases_conf_content = k8s.render_databases_conf(
         spec["databases"], spec["version"]
     )
+    logger.debug(f"Reconciling databases.conf ConfigMap for instance {name!r}.")
     core_api.patch_namespaced_config_map(
         f"{name}-databases-conf",
         namespace,
@@ -54,6 +56,9 @@ def update_fn(
     service_spec = spec.get("service") or {}
     service_type = service_spec.get("type") or "ClusterIP"
     service_port = service_spec.get("port") or k8s.FIREBIRD_PORT
+    logger.debug(
+        f"Reconciling Service {name!r} (type={service_type!r}, port={service_port!r})."
+    )
     core_api.patch_namespaced_service(
         name,
         namespace,
@@ -76,6 +81,9 @@ def update_fn(
     )
 
     pod_name = f"{name}-0"
+    logger.debug(
+        f"Reconciling StatefulSet {name!r} image to {spec['image']}:{spec['version']}."
+    )
     apps_api.patch_namespaced_stateful_set(
         name,
         namespace,
@@ -97,7 +105,9 @@ def update_fn(
     )
 
     patch.status["phase"] = "WaitingForPod"
-    firebird.wait_for_pod_ready(core_api, namespace=namespace, pod_name=pod_name)
+    firebird.wait_for_pod_ready(
+        core_api, namespace=namespace, pod_name=pod_name, logger=logger
+    )
     firebird.wait_for_sysdba_ready(
         core_api,
         namespace=namespace,
@@ -166,6 +176,7 @@ def update_fn(
 
     patch.status["phase"] = "Ready"
     patch.status["message"] = "Instance updated."
+    logger.info(f"Instance {name!r} updated successfully.")
 
 
 @kopf.on.update(
@@ -192,8 +203,12 @@ def sysdba_secret_update_fn(
     old_password_b64 = (old_essence.get("data") or {}).get("password")
     new_password_b64 = (new_essence.get("data") or {}).get("password")
     if not old_password_b64 or not new_password_b64:
+        logger.debug(
+            f"Secret {meta['name']!r} has no old/new password to compare yet; skipping."
+        )
         return  # nothing to compare against yet (e.g. secret just created)
     if old_password_b64 == new_password_b64:
+        logger.debug(f"Secret {meta['name']!r} password unchanged; skipping.")
         return  # some other field on the secret changed, not the password
 
     instance_name = meta["labels"][k8s.INSTANCE_LABEL]

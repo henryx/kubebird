@@ -156,3 +156,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Sets the root logger's level (DEBUG/INFO/WARNING/ERROR/CRITICAL) --
+            # see src/kubebird/operator.py's use of kopf.configure(). A fixed value
+            # here; edit it directly to change verbosity for this deployment.
+            - name: LOG_LEVEL
+              value: INFO
