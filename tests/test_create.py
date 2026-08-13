@@ -230,7 +230,7 @@ def test_create_instance_shadow_database(kubeconfig: Path) -> None:
             client.CoreV1Api(),
             namespace=namespace,
             pod_name=f"{name}-0",
-            path=f"{SHADOW_MOUNT_PATH}/{shadow_db['name']}.shadow",
+            path=f"{SHADOW_MOUNT_PATH}/{shadow_db['name']}.shd",
         )
 
         # deploy/cr.yaml sets an explicit "alias" on this database, distinct

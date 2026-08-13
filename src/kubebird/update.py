@@ -178,7 +178,7 @@ def _reconcile(
                     f"database {database['name']!r} has shadow: true but "
                     "spec.storage.shadow is not configured."
                 )
-            shadow_path = f"{k8s.SHADOW_MOUNT_PATH}/{database['name']}.shadow"
+            shadow_path = f"{k8s.SHADOW_MOUNT_PATH}/{database['name']}.shd"
             logger.info(f"Creating shadow for database {db_path!r}.")
             firebird.create_shadow(
                 core_api,

@@ -297,7 +297,7 @@ There are three such tests, run independently against the same `Instance` CRD:
   (non-shadow) database file exists under `k8s.DATA_MOUNT_PATH`.
 - `test_create_instance_shadow_database` — the same CR but with `metadata.name` overridden to
   `test-shadow` (so it can't collide with the other test's still-being-garbage-collected objects);
-  checks that the shadow database's `.shadow` file exists under `k8s.SHADOW_MOUNT_PATH`.
+  checks that the shadow database's `.shd` file exists under `k8s.SHADOW_MOUNT_PATH`.
 - `test_create_instance_reports_error_in_status` — a database with `shadow: true` but
   `spec.storage.shadow` deleted from the CR, a real (not mocked) way to trigger `create_fn`'s
   `kopf.PermanentError` for that case; polls for `status.error` to contain that specific message
