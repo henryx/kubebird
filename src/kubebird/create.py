@@ -138,40 +138,16 @@ def _reconcile(
     )
 
     patch.status["phase"] = "ProvisioningDatabases"
-    for database in spec["databases"]:
-        db_path = f"{k8s.DATA_MOUNT_PATH}/{database['name']}"
-        logger.info(f"Creating database {db_path!r}.")
-        firebird.create_database(
-            core_api,
-            namespace=namespace,
-            pod_name=pod_name,
-            container=CONTAINER_NAME,
-            sysdba_password=sysdba_password,
-            path=db_path,
-            page_size=database.get("pageSize", 8192),
-            charset=database.get("charset", "UTF8"),
-            collation=database.get("collation", "UTF8"),
-            logger=logger,
-        )
-
-        if database.get("shadow"):
-            if shadow_storage is None:
-                raise kopf.PermanentError(
-                    f"database {database['name']!r} has shadow: true but "
-                    "spec.storage.shadow is not configured."
-                )
-            shadow_path = f"{k8s.SHADOW_MOUNT_PATH}/{database['name']}.shd"
-            logger.info(f"Creating shadow for database {db_path!r}.")
-            firebird.create_shadow(
-                core_api,
-                namespace=namespace,
-                pod_name=pod_name,
-                container=CONTAINER_NAME,
-                sysdba_password=sysdba_password,
-                database_path=db_path,
-                shadow_path=shadow_path,
-                logger=logger,
-            )
+    firebird.provision_databases(
+        core_api,
+        namespace=namespace,
+        pod_name=pod_name,
+        container=CONTAINER_NAME,
+        sysdba_password=sysdba_password,
+        databases=spec["databases"],
+        shadow_storage=shadow_storage,
+        logger=logger,
+    )
 
     patch.status["phase"] = "Ready"
     patch.status["message"] = "Instance provisioned."

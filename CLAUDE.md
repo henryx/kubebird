@@ -24,7 +24,12 @@ The implementation is split across five modules:
   `isql` piped through `/bin/sh -c`: waits for the pod to be `Ready`, then separately waits for
   SYSDBA authentication to actually work (see gotcha below), then runs `CREATE DATABASE`/`CREATE
   SHADOW`. Also runs `gsec` the same way to change the live SYSDBA password
-  (`change_sysdba_password`).
+  (`change_sysdba_password`). `provision_databases` loops a list of `spec.databases`-shaped dicts
+  through `create_database`/`create_shadow` (raising `kopf.PermanentError` for a `shadow: true`
+  entry when `shadow_storage` is `None`) and is the one place both `create_fn` (the full
+  `spec.databases` list) and `update_fn` (only the newly-added entries) drive database
+  provisioning from — kept here rather than in `create.py`/`update.py` since it's pure pod-exec
+  orchestration with no `Instance`-specific `status`/`patch` handling of its own.
 - `src/kubebird/create.py` — the `@kopf.on.create` handler that orchestrates the two modules above
   and reports progress via `status.phase` (`Provisioning` → `WaitingForPod` →
   `ProvisioningDatabases` → `Ready`); its actual reconciliation work lives in a private

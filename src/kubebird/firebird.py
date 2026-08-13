@@ -3,6 +3,7 @@
 import base64
 import shlex
 import time
+from typing import Any
 
 import kopf
 from kubernetes import client
@@ -284,3 +285,53 @@ def create_shadow(
         database=database_path,
         logger=logger,
     )
+
+
+def provision_databases(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    sysdba_password: str,
+    databases: list[dict[str, Any]],
+    shadow_storage: dict[str, Any] | None,
+    logger: kopf.Logger,
+) -> None:
+    """Create every entry in `databases`, plus a shadow file for any entry
+    with shadow: true. Shared between create_fn (all of spec.databases) and
+    update_fn (only the entries newly added since the last reconcile)."""
+    for database in databases:
+        db_path = f"{k8s.DATA_MOUNT_PATH}/{database['name']}"
+        logger.info(f"Creating database {db_path!r}.")
+        create_database(
+            core_api,
+            namespace=namespace,
+            pod_name=pod_name,
+            container=container,
+            sysdba_password=sysdba_password,
+            path=db_path,
+            page_size=database.get("pageSize", 8192),
+            charset=database.get("charset", "UTF8"),
+            collation=database.get("collation", "UTF8"),
+            logger=logger,
+        )
+
+        if database.get("shadow"):
+            if shadow_storage is None:
+                raise kopf.PermanentError(
+                    f"database {database['name']!r} has shadow: true but "
+                    "spec.storage.shadow is not configured."
+                )
+            shadow_path = f"{k8s.SHADOW_MOUNT_PATH}/{database['name']}.shd"
+            logger.info(f"Creating shadow for database {db_path!r}.")
+            create_shadow(
+                core_api,
+                namespace=namespace,
+                pod_name=pod_name,
+                container=container,
+                sysdba_password=sysdba_password,
+                database_path=db_path,
+                shadow_path=shadow_path,
+                logger=logger,
+            )
