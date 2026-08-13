@@ -146,6 +146,7 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
     assert can("create", "statefulsets", group="apps")
     assert can("patch", "statefulsets", group="apps")
     assert can("get", "pods")
+    assert can("get", "pods", subresource="exec")
     assert can("create", "pods", subresource="exec")
     assert can("create", "events")
 

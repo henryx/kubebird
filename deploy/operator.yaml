@@ -106,9 +106,14 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get]
+  # Two verbs are both genuinely required here: the API server's own front-door authorization
+  # for this GET-based websocket exec request needs `get`, but the request is then proxied to the
+  # kubelet on the pod's node, which performs its own separate authorization check for pod
+  # exec/attach/portforward that is always hardcoded to verb `create` regardless of the HTTP
+  # method the front-door request used.
   - apiGroups: [""]
     resources: [pods/exec]
-    verbs: [create]
+    verbs: [get, create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

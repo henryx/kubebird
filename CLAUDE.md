@@ -514,7 +514,16 @@ guidance for a namespace-scoped operator:
   of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create`/`patch` on
   `configmaps` (the `databases.conf` ConfigMap `create_fn`/`update_fn` build/reconcile); `create` on
   `persistentvolumeclaims`; `create`/`patch` on `services` and `statefulsets`; `get` on `pods` and
-  `create` on `pods/exec` (the `isql`/`gsec` provisioning in `firebird.py`); `create` on `events`;
+  `get`/`create` on `pods/exec` — both verbs are genuinely required, for two separate
+  authorization hops: the `isql`/`gsec` provisioning in `firebird.py` all go through the
+  `kubernetes` client's `connect_get_namespaced_pod_exec`, an HTTP GET under the hood for the
+  websocket upgrade, so the API server's own front-door RBAC check (which maps the HTTP method to
+  a verb) needs `get`; the request is then proxied to the kubelet on the pod's node, which performs
+  its own separate authorization check for pod exec/attach/portforward that the kubelet hardcodes
+  to verb `create` regardless of which HTTP method the front-door request used — omitting either
+  verb 403s at a different hop with a different error shape (missing `get`: the API server's own
+  RBAC-denial message, naming the verb/resource/namespace explicitly; missing `create`: an empty
+  `pods "<name>" is forbidden: ` from the kubelet hop instead); `create` on `events`;
   and a `kopfpeerings` rule kopf's own docs recommend (a harmless no-op unless a `KopfPeering` CRD
   is separately installed — kubebird runs a single replica, so peering itself isn't required).
 - A thin cluster-scoped `ClusterRole`/`ClusterRoleBinding`, still needed even though the operator
