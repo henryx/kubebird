@@ -12,6 +12,7 @@ from kubernetes.client.exceptions import ApiException
 FIREBIRD_PORT = 3050
 DATA_MOUNT_PATH = "/var/lib/firebird/data"
 SHADOW_MOUNT_PATH = "/var/lib/firebird/shadow"
+BACKUP_MOUNT_PATH = "/var/lib/firebird/backup"
 DATABASES_CONF_PATH = "/opt/firebird/databases.conf"
 DATABASES_CONF_KEY = "databases.conf"
 
@@ -260,6 +261,7 @@ def build_statefulset(
     sysdba_secret_name: str,
     databases_conf_configmap_name: str,
     shadow_pvc_name: str | None = None,
+    backup_pvc_name: str | None = None,
 ) -> dict[str, Any]:
     labels = {INSTANCE_LABEL: name}
     # ConfigMap volumes are always mounted read-only by kubelet -- unrelated to
@@ -293,6 +295,11 @@ def build_statefulset(
         volume_mounts.append({"name": "shadow", "mountPath": SHADOW_MOUNT_PATH})
         volumes.append(
             {"name": "shadow", "persistentVolumeClaim": {"claimName": shadow_pvc_name}}
+        )
+    if backup_pvc_name:
+        volume_mounts.append({"name": "backup", "mountPath": BACKUP_MOUNT_PATH})
+        volumes.append(
+            {"name": "backup", "persistentVolumeClaim": {"claimName": backup_pvc_name}}
         )
     return {
         "apiVersion": "apps/v1",

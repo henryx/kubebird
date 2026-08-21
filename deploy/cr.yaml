@@ -24,6 +24,9 @@ spec:
     shadow: # can be omitted if no database above has "shadow: true"
       class: ""
       size: 3Gi
+    backup: # can be omitted if we want to use S3 storage for backups
+      class: ""
+      size: 3Gi
   authentication:
     sysdba:
       secretRef: ""

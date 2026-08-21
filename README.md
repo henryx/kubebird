@@ -1,7 +1,7 @@
 # Kubebird
 
 ## Overview
-[Kubebird](github.com/henryx/kubebird) is a Kubernetes operator based on Python and `kopf` to install and manage [Firebird RDBMS](https://firebirdsql.org/) instances
+[Kubebird](https://github.com/henryx/kubebird) is a Kubernetes operator based on Python and `kopf` to install and manage [Firebird RDBMS](https://firebirdsql.org/) instances
 
 ## Architecture
 Project uses the namespaced CR `Instances` that defines Firebird instance.
@@ -11,7 +11,7 @@ This is a sample of `Instances`:
 apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
-  name: test
+  name: firebird
 spec:
   image: firebirdsql/firebird
   version: 3.0.14
@@ -34,6 +34,9 @@ spec:
     shadow: # can be omitted if no database below has "shadow: true"
       class: ""
       size: 3Gi
+    backup: # can be omitted if we want to use S3 storage for backups
+      class: ""
+      size: 3Gi
   authentication:
     sysdba:
       secretRef: ""
@@ -43,6 +46,7 @@ With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in.
 - Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`) with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
+- Optionally define a `<instance-name>-backup` PVC (`storage.backup`), mounted into the pod at `/var/lib/firebird/backup` for whatever backs up the instance's data to use; can be omitted if backups instead go to S3 storage. Unlike the primary/shadow PVCs, this one is **not** owned by the `Instance` — deleting the `Instance` leaves it (and the backup data on it) behind instead of garbage-collecting it.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`).
 - Authentication section is optional. If is specified, you can:
@@ -66,28 +70,35 @@ flowchart TD
     Kubebird -->|"2"| CM["ConfigMap<br/>&lt;name&gt;-databases-conf"]
     Kubebird -->|"3"| PVCPrimary["PVC<br/>&lt;name&gt;-data"]
     Kubebird -->|"4, optional"| PVCShadow["PVC<br/>&lt;name&gt;-shadow"]
-    Kubebird -->|"5"| Service["Service<br/>&lt;name&gt;"]
-    Kubebird -->|"6"| STS["StatefulSet<br/>&lt;name&gt;"]
+    Kubebird -->|"5, optional"| PVCBackup["PVC<br/>&lt;name&gt;-backup"]
+    Kubebird -->|"6"| Service["Service<br/>&lt;name&gt;"]
+    Kubebird -->|"7"| STS["StatefulSet<br/>&lt;name&gt;"]
 
     Secret -.->|SYSDBA password| STS
     CM -.->|database aliases| STS
     PVCPrimary -.->|data volume| STS
     PVCShadow -.->|shadow volume, optional| STS
+    PVCBackup -.->|backup volume, optional| STS
     Service -.->|routes traffic to| STS
 
     STS -->|Kubernetes creates| Pod["Pod<br/>&lt;name&gt;-0"]
 
-    Kubebird -->|"7: waits for readiness"| Pod
-    Kubebird -->|"8: creates the databases"| Pod
+    Kubebird -->|"8: waits for readiness"| Pod
+    Kubebird -->|"9: creates the databases"| Pod
 
     classDef owned fill:#e6ecff,stroke:#3355ff,color:#000
+    classDef unowned fill:#fff3e0,stroke:#cc8800,color:#000,stroke-dasharray: 4 3
     class Secret,CM,PVCPrimary,PVCShadow,Service,STS owned
+    class PVCBackup unowned
 ```
 
 The dotted arrows show how the `StatefulSet` uses the other objects (the SYSDBA password from the
 secret, database aliases from the ConfigMap, storage from the PVCs, traffic routing from the
 Service) rather than a separate creation step. The shadow `PVC` only exists when `storage.shadow`
-is set on the `Instance`.
+is set on the `Instance`; likewise the backup `PVC` only exists when `storage.backup` is set, and
+is mounted at `/var/lib/firebird/backup` the same way the primary/shadow PVCs are mounted at their
+own paths. The backup `PVC` (dashed outline above) is, unlike every other object here, not owned
+by the `Instance` — see "Deleting an `Instance`" below.
 
 Kubebird also reacts to updates on an existing `Instance`:
 - Changing `spec.service.type`, `spec.service.port`, or `spec.version` reconciles the
@@ -100,7 +111,10 @@ Kubebird also reacts to updates on an existing `Instance`:
 
 Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
 it (they're all owned by the `Instance`); the operator itself just logs the deletion and reports
-`status.phase: Deleting` while that garbage collection runs.
+`status.phase: Deleting` while that garbage collection runs. The one exception is the backup PVC
+(`<instance-name>-backup`, from `storage.backup`): it is deliberately **not** owned by the
+`Instance`, so deleting the `Instance` leaves it (and any backup data on it) in place instead of
+garbage-collecting it along with everything else.
 
 ## Installation
 

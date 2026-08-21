@@ -10,6 +10,7 @@ from kubernetes.stream import stream
 
 from kubebird.create import CONTAINER_NAME
 from kubebird.k8s import (
+    BACKUP_MOUNT_PATH,
     DATA_MOUNT_PATH,
     DATABASES_CONF_PATH,
     FIREBIRD_PORT,
@@ -108,6 +109,28 @@ def _assert_database_file_exists(
     assert "EXISTS" in output, f"database file {path!r} was not created: {output}"
 
 
+def _assert_path_is_writable(
+    core_api: client.CoreV1Api, *, namespace: str, pod_name: str, path: str
+) -> None:
+    marker = f"{path}/.kubebird-mount-check"
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=CONTAINER_NAME,
+        command=[
+            "/bin/sh",
+            "-c",
+            f"touch {shlex.quote(marker)} && test -f {shlex.quote(marker)} && echo EXISTS",
+        ],
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    assert "EXISTS" in output, f"{path!r} is not writable/mounted: {output}"
+
+
 def _read_databases_conf(
     core_api: client.CoreV1Api, *, namespace: str, pod_name: str
 ) -> str:
@@ -181,6 +204,15 @@ def test_create_instance(kubeconfig: Path) -> None:
         service = client.CoreV1Api().read_namespaced_service(name, namespace)
         assert service.spec.ports[0].port == cr_body["spec"]["service"]["port"]
         assert service.spec.ports[0].target_port == FIREBIRD_PORT
+
+        # deploy/cr.yaml sets storage.backup -- confirm the backup PVC is
+        # actually mounted into the pod, not just created.
+        _assert_path_is_writable(
+            client.CoreV1Api(),
+            namespace=namespace,
+            pod_name=f"{name}-0",
+            path=BACKUP_MOUNT_PATH,
+        )
 
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name

@@ -14,7 +14,9 @@ group="kubebird.github.io")`) provisions it, `update_fn`/`sysdba_secret_update_f
 (`src/kubebird/delete.py`) handles deletion. `kopf` and `kubernetes` (the official Python client)
 are declared dependencies. `deploy/operator.yaml` runs the operator in-cluster (Deployment + RBAC,
 see "Architecture" below); still missing: `update_fn` support for changes to
-`authentication`/`storage` (only `service`/`version`/`databases` are reconciled today).
+`authentication`/`storage` (only `service`/`version`/`databases` are reconciled today — this
+includes `storage.backup`: adding/changing it on an already-created `Instance` has no effect,
+only `create_fn` provisions the backup PVC).
 
 The implementation is split across five modules:
 - `src/kubebird/k8s.py` — builds the `Secret`/`PersistentVolumeClaim`/`Service`/`StatefulSet`
@@ -51,7 +53,10 @@ The implementation is split across five modules:
   already `kopf.adopt()`-ed, so Kubernetes garbage-collects all of them (Secret, PVC(s), Service,
   StatefulSet) through their owner references as soon as this handler returns. Its only real effect
   is the finalizer kopf attaches for having *any* `on.delete` handler registered at all, which
-  blocks the `Instance`'s own removal until the handler completes.
+  blocks the `Instance`'s own removal until the handler completes. The one object this doesn't
+  reach is the backup PVC (`storage.backup`): `create_fn` deliberately never `kopf.adopt()`s it, so
+  it's left behind rather than garbage-collected — see the `storage.backup` bullet under
+  "Architecture" below.
 
 `src/kubebird/operator.py` is the CLI entry point (`pyproject.toml`'s `[project.scripts]` maps
 `kubebird-operator` to `kubebird.operator:main`). It imports `kubebird.create`/`delete`/`update`
@@ -299,7 +304,10 @@ end-to-end on a warm image cache.
 
 There are three such tests, run independently against the same `Instance` CRD:
 - `test_create_instance` — the CR as shipped in `deploy/cr.yaml`; checks that the primary
-  (non-shadow) database file exists under `k8s.DATA_MOUNT_PATH`.
+  (non-shadow) database file exists under `k8s.DATA_MOUNT_PATH`, and (since that CR also sets
+  `storage.backup`) that `k8s.BACKUP_MOUNT_PATH` is actually mounted and writable in the pod
+  (`_assert_path_is_writable`, a `touch`+`test -f` exec rather than `_assert_database_file_exists`,
+  since nothing creates a file under this path on its own the way database provisioning does).
 - `test_create_instance_shadow_database` — the same CR but with `metadata.name` overridden to
   `test-shadow` (so it can't collide with the other test's still-being-garbage-collected objects);
   checks that the shadow database's `.shd` file exists under `k8s.SHADOW_MOUNT_PATH`.
@@ -347,7 +355,11 @@ was gone by the time the test's later, separate exec checked for it.
 `-m kubebird.create -m kubebird.delete`: creates the `Instance`, waits `Ready`, deletes it, then
 waits for the `Instance` object itself to actually disappear (`_wait_gone`, polling for a 404 —
 not just for the delete call to return, since the finalizer keeps it present until `delete_fn`
-completes) and for the owned `StatefulSet` to be garbage-collected (`_wait_statefulset_gone`).
+completes) and for the owned `StatefulSet` to be garbage-collected (`_wait_statefulset_gone`). It
+also confirms the unadopted `<name>-backup` PVC (`deploy/cr.yaml` sets `storage.backup`) exists
+before deletion and is *still* present afterwards — a plain `read_namespaced_persistent_volume_claim`
+call, not a wait loop, since there's no expected transition to poll for; the test deletes it itself
+at the end, since nothing else will.
 
 Gotcha: as soon as the `kubernetes` package is importable, `kopf` prefers piggybacking on it for
 authentication (`kopf._core.intents.piggybacking.login_via_client`) over its own lightweight
@@ -384,6 +396,9 @@ spec:
     shadow:
       class: ""
       size: 3Gi
+    backup:
+      class: ""
+      size: 3Gi
   authentication:
     sysdba:
       secretRef: ""
@@ -393,7 +408,8 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
 
 - Deploys the Firebird instance as a `StatefulSet` (1 replica) using the given `image`/`version`,
   mounting the primary-data PVC at `k8s.DATA_MOUNT_PATH` (`/var/lib/firebird/data`) and, only if
-  `storage.shadow` is set, a second PVC at `k8s.SHADOW_MOUNT_PATH` (`/var/lib/firebird/shadow`).
+  `storage.shadow`/`storage.backup` are set, a second/third PVC at `k8s.SHADOW_MOUNT_PATH`
+  (`/var/lib/firebird/shadow`) / `k8s.BACKUP_MOUNT_PATH` (`/var/lib/firebird/backup`).
 - Creates a `Service` for the instance (type from `spec.service.type`, default `ClusterIP`),
   exposing `spec.service.port` (default `3050`, from `k8s.FIREBIRD_PORT`) as its `port`; `targetPort`
   is always `k8s.FIREBIRD_PORT` since that's the container's actual, non-configurable listening
@@ -402,6 +418,15 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   `storage.shadow`, each sized per `.size` and using the cluster default `StorageClass` when
   `.class` is empty. Both are plain PVCs referenced by the pod's `volumes`, not
   `volumeClaimTemplate`s, since the CR describes exactly one instance/pod.
+- If present, also creates a third PVC, `<instance-name>-backup`, for `storage.backup` — sized/
+  classed the same way as `storage.primary`/`storage.shadow` (`k8s.build_pvc` is shared across all
+  three) and mounted into the `firebird` container at `k8s.BACKUP_MOUNT_PATH`
+  (`/var/lib/firebird/backup`), for whatever backs the instance up to write to. Unlike every other
+  object `create_fn` creates, though, this PVC is deliberately never `kopf.adopt()`-ed — see the
+  "Adopts every created object" bullet below and "Deleting an `Instance`" further down.
+  `storage.backup` is entirely optional (can be omitted if backups instead go to S3), and
+  `update_fn` doesn't reconcile it either way (nor, correspondingly, the mount) — see the
+  `storage`/`authentication` gap noted under "Project overview" above.
 - Instantiates every entry in `databases` via `isql` exec'd into the pod
   (`CREATE DATABASE ... PAGE_SIZE <pageSize> DEFAULT CHARACTER SET <charset> COLLATION
   <collation>`, using each entry's `pageSize`/`charset`/`collation` — defaulted by the CRD to
@@ -430,11 +455,14 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   There is no way to provision a non-SYSDBA user yet (see gotcha above on why `CREATE DATABASE`,
   and object-level access on a database it didn't create, can't be delegated away from SYSDBA).
 - Adopts every created object with `kopf.adopt()`, so deleting the `Instance` garbage-collects them
-  via owner references.
-- Labels every created object (`PVC`(s), `Service`, `StatefulSet`, and the auto-generated SYSDBA
-  `Secret`) with `k8s.INSTANCE_LABEL` (`kubebird.github.io/instance: <name>`) — e.g.
-  `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds everything for one
-  `Instance`. `build_service`/`build_statefulset` already needed this label internally for the
+  via owner references — with one deliberate exception: the backup PVC (above) is never adopted, so
+  it (and the backup data on it) survives Instance deletion instead of being garbage-collected along
+  with everything else.
+- Labels every created object, including the backup PVC (`PVC`(s), `Service`, `StatefulSet`, and
+  the auto-generated SYSDBA `Secret`) with `k8s.INSTANCE_LABEL` (`kubebird.github.io/instance:
+  <name>`) — e.g. `kubectl get all,pvc,secrets -l kubebird.github.io/instance=<name>` finds
+  everything for one `Instance` (the backup PVC included, even after the `Instance` itself is
+  gone). `build_service`/`build_statefulset` already needed this label internally for the
   Service→Pod selector and the StatefulSet's pod template; it's now also stamped on each object's
   own `metadata.labels`, not just used internally.
 - Reports any handler failure into `status.error` (cleared on success) — see the `_reconcile()`
@@ -442,9 +470,10 @@ Reconciling this CR (`create_fn` in `src/kubebird/create.py`):
   so `kubectl get instances` shows e.g. an RBAC-forbidden error or a missing-`storage.shadow`
   `kopf.PermanentError` directly, without needing to read the operator pod's own logs.
 
-`storage.primary.size` and `storage.shadow.size` in `deploy/crd.yaml` carry a `pattern` validating
-the standard Kubernetes resource-quantity grammar (e.g. `3Gi`, `500Mi`, `1.5G`), so the API server
-itself rejects malformed sizes (e.g. `"banana"`) with a 422 before `create_fn` ever runs.
+`storage.primary.size`, `storage.shadow.size`, and `storage.backup.size` in `deploy/crd.yaml` carry
+a `pattern` validating the standard Kubernetes resource-quantity grammar (e.g. `3Gi`, `500Mi`,
+`1.5G`), so the API server itself rejects malformed sizes (e.g. `"banana"`) with a 422 before
+`create_fn` ever runs.
 
 Updating an `Instance` (`update_fn` in `src/kubebird/update.py`, `@kopf.on.update` on `Instance`):
 
@@ -494,7 +523,10 @@ at all is what makes kopf attach the `kopf.zalando.org/KopfFinalizerMarker` fina
 until this handler returns without raising; kopf then drops the finalizer, the `Instance` actually
 disappears, and Kubernetes garbage-collects every `kopf.adopt()`-ed object through its owner
 references — the same outcome as before `delete_fn` existed, just no longer racing the `Instance`
-object's own removal against that garbage collection.
+object's own removal against that garbage collection. The backup PVC (`storage.backup`) is the one
+object this doesn't reach, since `create_fn` never adopted it in the first place: it's left behind,
+along with whatever backup data is on it, for the user to reclaim or reattach to a future
+`Instance` of the same name.
 
 `deploy/crd.yaml` holds the `CustomResourceDefinition` (OpenAPI v3 schema for the `spec`/`status`
 shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
@@ -518,7 +550,9 @@ guidance for a namespace-scoped operator:
   `create`/`patch` on `secrets` (covers `k8s.ensure_sysdba_secret`'s create-or-reuse, the labeling
   of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create`/`patch` on
   `configmaps` (the `databases.conf` ConfigMap `create_fn`/`update_fn` build/reconcile); `create` on
-  `persistentvolumeclaims`; `create`/`patch` on `services` and `statefulsets`; `get` on `pods` and
+  `persistentvolumeclaims` (covers the primary/shadow PVCs and the unadopted backup PVC alike —
+  same verb, same resource, no separate grant needed for the backup one); `create`/`patch` on
+  `services` and `statefulsets`; `get` on `pods` and
   `get`/`create` on `pods/exec` — both verbs are genuinely required, for two separate
   authorization hops: the `isql`/`gsec` provisioning in `firebird.py` all go through the
   `kubernetes` client's `connect_get_namespaced_pod_exec`, an HTTP GET under the hood for the

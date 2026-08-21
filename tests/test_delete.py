@@ -55,6 +55,9 @@ def test_delete_instance(kubeconfig: Path) -> None:
     object kubebird adopted onto it (Secret, PVC(s), Service, StatefulSet) via
     their owner references -- exactly as already happens today without a
     delete_fn at all, just no longer racing the Instance object's own removal.
+    The one exception is the backup PVC (spec.storage.backup): it is
+    deliberately not adopted, so it must still be present after the Instance
+    itself is gone.
     """
     config.load_kube_config(config_file=str(kubeconfig))
 
@@ -66,12 +69,14 @@ def test_delete_instance(kubeconfig: Path) -> None:
     plural = crd_body["spec"]["names"]["plural"]
     namespace = "default"
     name = cr_body["metadata"]["name"]
+    backup_pvc_name = f"{name}-backup"
 
     extensions_api = client.ApiextensionsV1Api()
     _ensure_crd_established(extensions_api, crd_body)
 
     objects_api = client.CustomObjectsApi()
     apps_api = client.AppsV1Api()
+    core_api = client.CoreV1Api()
 
     with KopfRunner(
         [
@@ -98,6 +103,11 @@ def test_delete_instance(kubeconfig: Path) -> None:
         )
         assert instance["status"]["phase"] == "Ready"
 
+        # storage.backup is set on deploy/cr.yaml -- confirm the backup PVC
+        # exists before deletion, so the post-delete check below actually
+        # proves it survived rather than never having existed.
+        core_api.read_namespaced_persistent_volume_claim(backup_pvc_name, namespace)
+
         objects_api.delete_namespaced_custom_object(
             group, version, namespace, plural, name
         )
@@ -111,6 +121,11 @@ def test_delete_instance(kubeconfig: Path) -> None:
             name=name,
         )
         _wait_statefulset_gone(apps_api, namespace=namespace, name=name)
+
+        # The backup PVC is deliberately not owned by the Instance, so it
+        # must not have been garbage-collected along with everything else.
+        core_api.read_namespaced_persistent_volume_claim(backup_pvc_name, namespace)
+        core_api.delete_namespaced_persistent_volume_claim(backup_pvc_name, namespace)
 
     assert runner.exit_code == 0
     assert runner.exception is None

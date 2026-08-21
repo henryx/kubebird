@@ -100,6 +100,26 @@ def _reconcile(
         )
         shadow_pvc_name = shadow_pvc_body["metadata"]["name"]
 
+    backup_storage = storage.get("backup")
+    backup_pvc_name = None
+    if backup_storage:
+        backup_pvc_body = k8s.build_pvc(
+            pvc_name=f"{name}-backup",
+            namespace=namespace,
+            instance_name=name,
+            storage=backup_storage,
+        )
+        # Deliberately NOT kopf.adopt()-ed: unlike the primary/shadow PVCs,
+        # this one must survive Instance deletion so backup data isn't lost
+        # along with it.
+        k8s.create_or_ignore(
+            core_api.create_namespaced_persistent_volume_claim,
+            namespace,
+            backup_pvc_body,
+            logger,
+        )
+        backup_pvc_name = backup_pvc_body["metadata"]["name"]
+
     service_body = k8s.build_service(
         name=name, namespace=namespace, service_spec=spec.get("service") or {}
     )
@@ -115,6 +135,7 @@ def _reconcile(
         version=spec["version"],
         pvc_name=pvc_body["metadata"]["name"],
         shadow_pvc_name=shadow_pvc_name,
+        backup_pvc_name=backup_pvc_name,
         sysdba_secret_name=secret_name,
         databases_conf_configmap_name=databases_conf_configmap_body["metadata"]["name"],
     )

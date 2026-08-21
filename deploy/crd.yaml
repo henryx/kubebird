@@ -144,6 +144,24 @@ spec:
                           type: string
                           description: Requested size of the shadow-files PVC, e.g. "3Gi".
                           pattern: '^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkKMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$'
+                    backup:
+                      type: object
+                      required:
+                        - size
+                      description: >-
+                        Storage for a "<instance-name>-backup" PVC, on a separate PVC from the
+                        primary/shadow data. Can be omitted if backups instead go to S3 storage.
+                        Unlike the primary/shadow PVCs, this one is not owned by the Instance, so
+                        it (and the backup data on it) survives Instance deletion.
+                      properties:
+                        class:
+                          type: string
+                          default: ""
+                          description: StorageClass name. Empty string uses the cluster default StorageClass.
+                        size:
+                          type: string
+                          description: Requested size of the backup PVC, e.g. "3Gi".
+                          pattern: '^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkKMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$'
                 authentication:
                   type: object
                   properties:
