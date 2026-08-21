@@ -5,11 +5,13 @@
 # value spelled out explicitly -- fixing the operator's own namespace means there's exactly one
 # correct value, instead of a manual edit you have to remember to keep in sync.
 #
-# Install with a plain `kubectl apply -f deploy/crd.yaml -f deploy/operator.yaml` (no `-n` needed).
+# Install with a plain `kubectl apply -f deploy/crd.yaml -f deploy/backup-crd.yaml
+# -f deploy/operator.yaml` (no `-n` needed).
 #
-# The Role/RoleBinding below scope the operator's own workload (Instances, Secrets, ConfigMaps,
-# PVCs, Services, StatefulSets, pod exec) to this same "kubebird-system" namespace -- so Instance
-# CRs must be created there too. A thin ClusterRole/ClusterRoleBinding is still required even so:
+# The Role/RoleBinding below scope the operator's own workload (Instances, Backups, Secrets,
+# ConfigMaps, PVCs, Services, StatefulSets, pod exec) to this same "kubebird-system" namespace --
+# so Instance/Backup CRs must be created there too. A thin ClusterRole/ClusterRoleBinding is still
+# required even so:
 # kopf's own framework needs read access to two genuinely cluster-scoped resource types
 # (CustomResourceDefinitions, Namespaces) that have no namespaced equivalent to grant instead.
 # See: https://kopf.dev/en/stable/deployment/ and https://kopf.dev/en/stable/rbac/
@@ -69,14 +71,20 @@ rules:
     resources: [events]
     verbs: [create]
 
-  # Application: the Instance custom resource this operator watches and reconciles.
+  # Application: the Instance custom resource this operator watches and reconciles. Also read by
+  # backup.py, to look up the Instance a Backup's instanceRef points at.
   - apiGroups: [kubebird.github.io]
     resources: [instances, instances/status]
+    verbs: [get, list, watch, patch]
+  # Application: the Backup custom resource backup.py watches and reconciles.
+  - apiGroups: [kubebird.github.io]
+    resources: [backups, backups/status]
     verbs: [get, list, watch, patch]
   # Application: the SYSDBA secret (auto-generated, or read+labeled if user-provided via
   # authentication.sysdba.secretRef) -- create.py/k8s.py/update.py get/create/patch it,
   # update.py's sysdba_secret_update_fn additionally lists/watches Secrets cluster-wide-in-namespace
-  # to notice rotations.
+  # to notice rotations. backup.py also reads it (to gbak as SYSDBA) and, for spec.type: s3, a
+  # second, user-provided Secret named by spec.s3.credentials.ref holding S3 accessKey/secretKey.
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list, watch, create, patch]
@@ -86,8 +94,11 @@ rules:
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [create, patch]
-  # Application: the primary/shadow PersistentVolumeClaims -- created once, never patched/deleted
-  # (deletion happens via Kubernetes garbage-collecting kopf.adopt()-ed owner references).
+  # Application: the primary/shadow/backup PersistentVolumeClaims -- created once, never
+  # patched/deleted (deletion happens via Kubernetes garbage-collecting kopf.adopt()-ed owner
+  # references for the primary/shadow ones; the backup PVC is deliberately never adopted, so it
+  # survives Instance deletion, but that's a create.py-side choice, not an RBAC one -- the verb
+  # needed here is the same either way).
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
     verbs: [create]
@@ -101,8 +112,9 @@ rules:
   - apiGroups: [apps]
     resources: [statefulsets]
     verbs: [create, patch]
-  # Application: firebird.py execs isql/gsec into the instance's pod for provisioning and
-  # password rotation; wait_for_pod_ready/wait_for_sysdba_ready read the pod's status first.
+  # Application: firebird.py execs isql/gsec/gbak into the instance's pod for provisioning,
+  # password rotation, and backups; wait_for_pod_ready/wait_for_sysdba_ready read the pod's
+  # status first.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get]

@@ -5,20 +5,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project overview
 
 Kubebird is a Kubernetes operator, built in Python on top of `kopf`, that installs and manages
-[Firebird RDBMS](https://firebirdsql.org/) instances via a namespaced `Instance` custom resource.
+[Firebird RDBMS](https://firebirdsql.org/) instances via a namespaced `Instance` custom resource,
+plus a second, namespaced `Backup` custom resource that drives one-shot `gbak` backups of an
+`Instance`'s databases (optionally uploaded to S3).
 
 Kubebird implements the full `Instance` lifecycle described in "Architecture" below: `create_fn`
 (`src/kubebird/create.py`, `@kopf.on.create(kind="Instance", version="v1",
 group="kubebird.github.io")`) provisions it, `update_fn`/`sysdba_secret_update_fn`
 (`src/kubebird/update.py`) reconcile spec changes and SYSDBA secret rotations, and `delete_fn`
-(`src/kubebird/delete.py`) handles deletion. `kopf` and `kubernetes` (the official Python client)
-are declared dependencies. `deploy/operator.yaml` runs the operator in-cluster (Deployment + RBAC,
-see "Architecture" below); still missing: `update_fn` support for changes to
+(`src/kubebird/delete.py`) handles deletion. `backup_create_fn`/`backup_delete_fn`
+(`src/kubebird/backup.py`) implement the separate `Backup` resource's own create/delete lifecycle.
+`kopf`, `kubernetes` (the official Python client), and `boto3` (S3 uploads for `Backup`'s `type:
+s3`) are declared dependencies. `deploy/operator.yaml` runs the operator in-cluster (Deployment +
+RBAC, see "Architecture" below); still missing: `update_fn` support for changes to
 `authentication`/`storage` (only `service`/`version`/`databases` are reconciled today — this
 includes `storage.backup`: adding/changing it on an already-created `Instance` has no effect,
-only `create_fn` provisions the backup PVC).
+only `create_fn` provisions the backup PVC); `Backup` itself has no `@kopf.on.update` handler at
+all, since a `Backup` is a one-shot point-in-time job, not a reconciled-in-place resource — editing
+its spec after creation has no defined effect.
 
-The implementation is split across five modules:
+The implementation is split across six modules:
 - `src/kubebird/k8s.py` — builds the `Secret`/`PersistentVolumeClaim`/`Service`/`StatefulSet`
   manifests (plain dicts, not typed client models) and idempotent creation helpers
   (`create_or_ignore` treats a 409 Conflict as "already created by a previous handler retry").
@@ -31,7 +37,18 @@ The implementation is split across five modules:
   entry when `shadow_storage` is `None`) and is the one place both `create_fn` (the full
   `spec.databases` list) and `update_fn` (only the newly-added entries) drive database
   provisioning from — kept here rather than in `create.py`/`update.py` since it's pure pod-exec
-  orchestration with no `Instance`-specific `status`/`patch` handling of its own.
+  orchestration with no `Instance`-specific `status`/`patch` handling of its own. For the same
+  reason, `backup.py`'s pod-exec primitives live here too: `mkdir_p`/`remove_path` (plain
+  `mkdir -p`/`rm -rf`), `read_file_base64` (reads a file out of the pod, base64 over the exec
+  stream, the mirror image of `write_databases_conf`'s encode-and-write — needed since a `gbak`
+  file is binary, not text), and `create_backup` (`gbak -backup -verify`, following the same
+  `localhost:`-prefix rule as `isql`/`run_isql`). `-verify` ("report each action taken") is what
+  makes gbak log its progress instead of staying silent -- logged at INFO on success, for
+  visibility into a long-running backup -- and is also why the failure check here looks for a
+  `"gbak: ERROR"`-prefixed line rather than any output at all, unlike `gsec`/`isql -quiet`'s
+  "any output means failure" convention. A handler retry re-running this against the same,
+  timestamp-derived `backup_path` needs no special handling either: confirmed empirically that
+  gbak just overwrites an already-existing target file rather than refusing.
 - `src/kubebird/create.py` — the `@kopf.on.create` handler that orchestrates the two modules above
   and reports progress via `status.phase` (`Provisioning` → `WaitingForPod` →
   `ProvisioningDatabases` → `Ready`); its actual reconciliation work lives in a private
@@ -57,11 +74,20 @@ The implementation is split across five modules:
   reach is the backup PVC (`storage.backup`): `create_fn` deliberately never `kopf.adopt()`s it, so
   it's left behind rather than garbage-collected — see the `storage.backup` bullet under
   "Architecture" below.
+- `src/kubebird/backup.py` — `backup_create_fn`/`backup_delete_fn` (`@kopf.on.create`/
+  `@kopf.on.delete` on the separate `Backup` resource) implement the "Backup and restore" section
+  under "Architecture" below: looking up the `Backup`'s `instanceRef`, selecting which databases to
+  back up, and driving `firebird.py`'s `gbak`/S3 primitives. Follows the same
+  `_reconcile()`/`_reconcile_delete()` + `try`/`except` → `status.error` pattern as `create_fn`/
+  `update_fn`, kept as its own module (one per `Instance`-adjacent lifecycle, same reasoning as
+  `create.py`/`update.py`/`delete.py` each being their own) rather than folded into any of those
+  three, since it reconciles a distinct kind with its own independent create/delete lifecycle, not
+  a further `Instance` reconciliation step.
 
 `src/kubebird/operator.py` is the CLI entry point (`pyproject.toml`'s `[project.scripts]` maps
-`kubebird-operator` to `kubebird.operator:main`). It imports `kubebird.create`/`delete`/`update`
-purely for their `@kopf.on.*` decorators' side effect of registering handlers in kopf's default
-registry — required
+`kubebird-operator` to `kubebird.operator:main`). It imports `kubebird.backup`/`create`/`delete`/
+`update` purely for their `@kopf.on.*` decorators' side effect of registering handlers in kopf's
+default registry — required
 because, unlike the CLI's `-m` flag, `kopf.run()` only sees handlers from modules already imported
 by the time it's called. It also runs the operator on `uvloop`: kopf's own CLI auto-detects and
 injects uvloop, but only for the CLI (`kopf._kits.loops.proper_loop`) — `kopf.run()` itself does
@@ -241,8 +267,12 @@ noise. Fixed by making it match `[testenv]`'s pattern (`skip_install = True`, `d
 dependency-group, plus `pyyaml`/`types-pyyaml` (tests do `import yaml`) and a
 `[[tool.mypy.overrides]] module = "kubernetes.*" ignore_missing_imports = true` in
 `pyproject.toml` (`kubernetes` genuinely ships no stubs/`py.typed` marker at all; `kopf` and
-`testcontainers` both do, so they only needed the env fix). That left 8 real errors, since fixed,
-confined to `create.py`/`update.py`/`delete.py`:
+`testcontainers` both do, so they only needed the env fix). `boto3` (added later, for `backup.py`'s
+S3 uploads) took the other approach instead: rather than an `ignore_missing_imports` override,
+`boto3-stubs` was added to the `dev` dependency-group, which gives real, precise types for
+`boto3.client("s3", ...)` and its return value (used in both `backup.py` and
+`tests/test_backup.py`) instead of just silencing the import error. That left 8 real errors, since
+fixed, confined to `create.py`/`update.py`/`delete.py`:
 - 4 `@kopf.on.*` handlers were flagged as incompatible with `ChangingFn`, since kopf's
   `ChangingFn.__call__` protocol types every handler kwarg as `namespace: str | None` (cluster-scoped
   resources have none) — our handlers all declared `namespace: str`, which is narrower and so not a
@@ -271,16 +301,17 @@ starts a real k3s container per test session. `testcontainers` is a dev dependen
 `k3s.config_yaml()` returns a valid kubeconfig).
 
 `tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies `deploy/crd.yaml`
-and every object in `deploy/operator.yaml` (Namespace/ServiceAccount/ClusterRole/
-ClusterRoleBinding/Role/RoleBinding/Deployment, dispatched by `kind` since it's multi-document
-YAML — each namespaced object's target namespace is read from its own `metadata.namespace`, i.e.
-`kubebird-system`, rather than a namespace the test picks) via the `kubernetes` client, then uses
-`AuthorizationV1Api.create_subject_access_review` (the API `kubectl auth can-i --as=...` itself
-calls) to confirm the ServiceAccount actually gets every permission
-`create_fn`/`update_fn`/`k8s.py`/`firebird.py` call for, plus kopf's own cluster-scoped framework
-needs. This only validates the manifest/RBAC, not full pod scheduling (the Deployment's
+and `deploy/backup-crd.yaml` and every object in `deploy/operator.yaml` (Namespace/ServiceAccount/
+ClusterRole/ClusterRoleBinding/Role/RoleBinding/Deployment, dispatched by `kind` since it's
+multi-document YAML — each namespaced object's target namespace is read from its own
+`metadata.namespace`, i.e. `kubebird-system`, rather than a namespace the test picks) via the
+`kubernetes` client, then uses `AuthorizationV1Api.create_subject_access_review` (the API
+`kubectl auth can-i --as=...` itself calls) to confirm the ServiceAccount actually gets every
+permission `create_fn`/`update_fn`/`backup.py`/`k8s.py`/`firebird.py` call for (`instances`/
+`instances/status` and `backups`/`backups/status` both included), plus kopf's own cluster-scoped
+framework needs. This only validates the manifest/RBAC, not full pod scheduling (the Deployment's
 `image: quay.io/kubebird/operator:latest` isn't expected to actually be pullable here), so it's
-fast (~15s) compared to the `test_create`/`test_update`/`test_delete` suites below.
+fast (~15s) compared to the `test_create`/`test_update`/`test_delete`/`test_backup` suites below.
 
 Gotcha: on cgroup v2 hosts using the systemd cgroup driver, Docker gives the k3s container its own
 private cgroup namespace, which its embedded kubelet can't reconcile with the host cgroup paths
@@ -360,6 +391,37 @@ also confirms the unadopted `<name>-backup` PVC (`deploy/cr.yaml` sets `storage.
 before deletion and is *still* present afterwards — a plain `read_namespaced_persistent_volume_claim`
 call, not a wait loop, since there's no expected transition to poll for; the test deletes it itself
 at the end, since nothing else will.
+
+`tests/test_backup.py` covers `backup.py` the same way, against `deploy/backup-crd.yaml`/
+`deploy/backup-cr.yaml`, importing `CR_PATH`/`CRD_PATH`/`_ensure_crd_established`/`_wait_ready`
+from `test_create` and `_wait_gone` from `test_delete` (both generic enough, taking `plural` as a
+parameter, to reuse directly for the `Backup` kind rather than duplicating them). Two tests:
+- `test_backup_instance_local` — loads `-m kubebird.create -m kubebird.backup`; creates a `Ready`
+  `Instance` from `deploy/cr.yaml` (which already sets `storage.backup`), then a `type: local`
+  `Backup` from `deploy/backup-cr.yaml` (with its `s3` key deleted, since it's irrelevant for
+  `type: local` and the test doesn't stand up any S3 credentials for this test), waits for
+  `status.phase == "Ready"` (`_wait_backup_ready`, a `_wait_ready`-alike that also fails fast — via
+  `AssertionError`, not just letting the timeout expire — the moment `status.error` is non-empty,
+  since an error here means the `Backup` will never reach `Ready`), execs into the `Instance`'s pod
+  to confirm `<status.path>/instance.fdb.fbk` exists, deletes the `Backup`, and confirms
+  `status.path` itself is gone from the pod afterwards.
+- `test_backup_instance_s3` — the same flow with `type: s3`, additionally standing up a throwaway
+  `pgsty/silo` container (`testcontainers.core.container.DockerContainer`, a *generic* container —
+  there's no dedicated `testcontainers` module for this image, unlike `K3SContainer` above) as the
+  S3 endpoint: `pgsty/silo` is a maintained, drop-in, API- and env-var-compatible fork of MinIO
+  (confirmed against its own GitHub releases/docs), so it's configured exactly like MinIO would be
+  — `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` env vars, port `9000` for the S3 API, and a
+  `server /data --console-address :9001` command override, since the image's own default `CMD`
+  doesn't start the server by itself. `DockerContainer.__enter__` calls `.start()` itself, so every
+  `with_env`/`with_exposed_ports`/`with_command` call must be chained *before* entering the `with`
+  block, not after (confirmed the hard way: configuring them inside the `with` body is silently too
+  late, since the container's already running by then). Readiness is polled directly against the
+  S3 API itself (`boto3`'s own `list_buckets()`, retried until it stops raising) rather than a log
+  line, since no confirmed readiness log message for this image turned up. Once the `Backup`
+  reaches `Ready`, the test reads `status.timestamp` to reconstruct the expected object key
+  (`<timestamp>-<Backup name>/instance.fdb.fbk`) and confirms it exists via `head_object`, then
+  that deleting the `Backup` removes it too (`head_object` raising a `ClientError` with code `404`/
+  `NoSuchKey`).
 
 Gotcha: as soon as the `kubernetes` package is importable, `kopf` prefers piggybacking on it for
 authentication (`kopf._core.intents.piggybacking.login_via_client`) over its own lightweight
@@ -528,33 +590,131 @@ object this doesn't reach, since `create_fn` never adopted it in the first place
 along with whatever backup data is on it, for the user to reclaim or reattach to a future
 `Instance` of the same name.
 
-`deploy/crd.yaml` holds the `CustomResourceDefinition` (OpenAPI v3 schema for the `spec`/`status`
-shape above) and `deploy/cr.yaml` holds a sample `Instance` matching it. Keep both files in sync
-with each other and with the README's sample whenever the CR shape changes.
+### Backup and restore
+
+The second CRD, `Backup` (also `kubebird.github.io/v1`, namespaced), drives a one-shot backup of
+one `Instance`'s databases. Example spec (see README.md for the full annotated version):
+
+```yaml
+apiVersion: kubebird.github.io/v1
+kind: Backup
+metadata:
+  name: test
+spec:
+  instanceRef: firebird
+  type: local # local or s3
+  include: [instance.fdb]
+  exclude: [shadowed.fdb]
+  s3: # only used if type is s3
+    location: "https://s3.remote-storage.com"
+    credentials:
+      ref: "secret"
+    bucket: "firebird"
+    path: "/"
+```
+
+Reconciling this CR (`backup_create_fn` in `src/kubebird/backup.py`, `@kopf.on.create` on
+`Backup`):
+
+- Looks up `spec.instanceRef` via `CustomObjectsApi.get_namespaced_custom_object` (raising
+  `kopf.PermanentError` on a 404 — an `instanceRef` typo or an `Instance` that doesn't exist yet is
+  not worth kopf's default retry/backoff), and requires that `Instance` to have `storage.backup`
+  configured (same `kopf.PermanentError`-on-missing-config pattern as the shadow-storage check in
+  `firebird.provision_databases`) — that PVC, mounted at `k8s.BACKUP_MOUNT_PATH`, is where a backup
+  is staged regardless of `spec.type`.
+- Resolves which databases to back up (`_select_databases`): `spec.include` (validated against the
+  `Instance`'s own `spec.databases[].name` entries, raising `kopf.PermanentError` for any name that
+  doesn't match one) defaults to every database on the `Instance` when omitted; `spec.exclude` is
+  then subtracted from that set, defaulting to none; ending up with zero databases after both is
+  also a `kopf.PermanentError` rather than a silent no-op backup.
+- Computes a timestamp (`%Y%m%dT%H%M%SZ`, UTC) *once*, recording it into `status.timestamp`
+  immediately — a retry of this handler (kopf persists `patch.status` even when the handler
+  ultimately raises, the same mechanism `create_fn`/`update_fn` rely on for their own phase
+  progress) reuses whatever's already there via `status.timestamp` instead of computing a new one,
+  so a failed-and-retried `Backup` doesn't leave a trail of half-finished, differently-timestamped
+  directories behind. The backup directory itself is `<k8s.BACKUP_MOUNT_PATH>/<timestamp>-<Backup
+  name>` (recorded into `status.path`) — combining the two is what the user asked for explicitly,
+  and incidentally also what keeps concurrent `Backup`s (different names) and repeated runs of the
+  same `Backup` name (different timestamps) from ever colliding on the same directory.
+- Resolves the SYSDBA password the same way `create_fn`/`update_fn` do (`k8s.ensure_sysdba_secret`,
+  reading the *Instance's* `authentication.sysdba.secretRef`/auto-generated secret — a `Backup` has
+  no authentication section of its own), wrapping the plain dict `get_namespaced_custom_object`
+  returns in `kopf.Body(...)` purely to satisfy `ensure_sysdba_secret`'s type signature; in practice
+  the secret this reads already exists (the `Instance` must already be reconciled for a `Backup`
+  against it to make sense), so the "create it via `kopf.adopt()`" branch inside
+  `ensure_sysdba_secret` that actually needs a real `kopf.Body` essentially never runs here.
+- For each selected database, execs `gbak -backup -verify` into the `Instance`'s pod (`firebird.
+  create_backup`) producing `<path>/<database-name>.fbk`, appending that filename to `status.files`
+  *inside the loop* (not once at the end) — so if a later database in a multi-database `Backup`
+  fails, this attempt's patch still remembers every file already produced (and, for `type: s3`,
+  already uploaded) before that point; without this, a `Backup` deleted after such a partial
+  failure would have no record of an S3 object this same attempt had already created, leaking it.
+- For `spec.type: s3`, additionally reads each `.fbk` file back out of the pod
+  (`firebird.read_file_base64` — base64-over-the-exec-stream, the same wire-safety reasoning as
+  `firebird.write_databases_conf` but in the opposite direction, needed here since a `gbak` file is
+  binary) and uploads it via `boto3` (`_s3_client`, built from `spec.s3.location` as the
+  `endpoint_url` and a Secret named by `spec.s3.credentials.ref` — read via `k8s.read_secret_value`
+  for `accessKey`/`secretKey` keys, a kubebird convention parallel to the SYSDBA secret's
+  `username`/`password` keys, not documented anywhere else) to
+  `s3://<spec.s3.bucket>/<spec.s3.path>/<timestamp>-<Backup name>/<database-name>.fbk`
+  (`_s3_key`, stripping `spec.s3.path`'s leading/trailing slashes so a `"/"` default doesn't
+  produce a doubled-up `//` prefix).
+- Ends in `status.phase = "Ready"`, `status.message = "Backup completed."`, following the same
+  `_reconcile()` + `try`/`except` → `status.error` pattern as `create_fn`/`update_fn`.
+
+Deleting a `Backup` (`backup_delete_fn`/`_reconcile_delete` in the same module, `@kopf.on.delete`
+on `Backup`):
+
+- Removes the whole `status.path` directory from the `Instance`'s pod in one `rm -rf`
+  (`firebird.remove_path`) — not a per-file removal, so it's correct even if `status.files` is
+  incomplete for some reason. Tolerates a 404 from the exec call (the `Instance`, and therefore its
+  pod, may already be gone — the backup PVC itself, and any files still on it, are unaffected
+  either way; this handler just has nothing left to exec into) by logging a warning instead of
+  raising.
+- For `spec.type: s3`, also deletes every object named in `status.files` (reconstructing each key
+  from `status.timestamp`/`status.files` the same way `_reconcile` built them originally) via one
+  `delete_objects` call, but only if both `status.files` and `status.timestamp` were actually
+  recorded — an attempt that failed before getting that far left nothing to clean up on the S3 side
+  either.
+- Also follows the `try`/`except` → `status.error` pattern, unlike `Instance`'s own minimal
+  `delete_fn` — there's real failure-prone work here (the pod exec, the S3 calls), unlike
+  `Instance`'s deletion, which is just Kubernetes garbage collection kubebird doesn't have to drive
+  itself.
+- There is no `@kopf.on.update` handler for `Backup` at all: it's a one-shot job, not a
+  continuously-reconciled resource, so editing its spec after creation has no defined effect. There
+  is also no restore implementation yet, despite the section name — only the backup half.
+
+`deploy/crd.yaml`/`deploy/cr.yaml` hold the `Instance` CRD/sample; `deploy/backup-crd.yaml`/
+`deploy/backup-cr.yaml` hold the `Backup` CRD/sample, following the same pattern (OpenAPI v3
+`spec`/`status` schema, `Instance`/`Type`/`Phase`/`Error`/`Age` printer columns mirroring
+`Instance`'s own `Image`/`Version`/`Phase`/`Error`/`Age`). Keep all four files in sync with each
+other and with the README's samples whenever either CR's shape changes.
 
 `deploy/operator.yaml` is the Namespace/Deployment/RBAC manifest for running the operator itself
 in-cluster (the README's Installation section documents a plain `kubectl apply -f deploy/crd.yaml
--f deploy/operator.yaml`, no `-n` flag needed), following kopf's own
-[deployment](https://docs.kopf.dev/en/stable/deployment/)/[RBAC](https://docs.kopf.dev/en/stable/rbac/)
-guidance for a namespace-scoped operator:
+-f deploy/backup-crd.yaml` then `-f deploy/operator.yaml`, no `-n` flag needed), following kopf's
+own [deployment](https://docs.kopf.dev/en/stable/deployment/)/
+[RBAC](https://docs.kopf.dev/en/stable/rbac/) guidance for a namespace-scoped operator:
 - A `Namespace` object creates a fixed `kubebird-system` namespace, and every other namespaced
   object in the file (`ServiceAccount`/`Role`/`RoleBinding`/`Deployment`) hardcodes
   `metadata.namespace: kubebird-system` to match — rather than the previous design of leaving them
   namespace-less and relying on `kubectl apply -n <namespace>` to pick one at apply-time. This is
   what lets the `ClusterRoleBinding`'s `subjects[].namespace` (see below) be correct by construction
-  instead of a manual edit someone has to remember to keep in sync. The tradeoff: `Instance` CRs
-  must now be created in `kubebird-system` too, since the namespaced `Role`/`RoleBinding` only grant
-  access there.
+  instead of a manual edit someone has to remember to keep in sync. The tradeoff: `Instance`/
+  `Backup` CRs must now be created in `kubebird-system` too, since the namespaced `Role`/
+  `RoleBinding` only grant access there.
 - A `ServiceAccount` plus that namespaced `Role`/`RoleBinding` granting exactly what the code above
-  calls: `get`/`list`/`watch`/`patch` on `instances` and `instances/status`; `get`/`list`/`watch`/
-  `create`/`patch` on `secrets` (covers `k8s.ensure_sysdba_secret`'s create-or-reuse, the labeling
-  of user-provided `secretRef` secrets, and `sysdba_secret_update_fn`'s watch); `create`/`patch` on
+  calls: `get`/`list`/`watch`/`patch` on `instances` and `instances/status`, and the same four verbs
+  on `backups`/`backups/status` for `backup.py`; `get`/`list`/`watch`/`create`/`patch` on `secrets`
+  (covers `k8s.ensure_sysdba_secret`'s create-or-reuse, the labeling of user-provided `secretRef`
+  secrets, `sysdba_secret_update_fn`'s watch, and `backup.py` reading both the `Instance`'s SYSDBA
+  secret and, for `spec.type: s3`, the `spec.s3.credentials.ref` Secret); `create`/`patch` on
   `configmaps` (the `databases.conf` ConfigMap `create_fn`/`update_fn` build/reconcile); `create` on
   `persistentvolumeclaims` (covers the primary/shadow PVCs and the unadopted backup PVC alike —
   same verb, same resource, no separate grant needed for the backup one); `create`/`patch` on
   `services` and `statefulsets`; `get` on `pods` and
   `get`/`create` on `pods/exec` — both verbs are genuinely required, for two separate
-  authorization hops: the `isql`/`gsec` provisioning in `firebird.py` all go through the
+  authorization hops: the `isql`/`gsec`/`gbak` pod-exec calls in `firebird.py` all go through the
   `kubernetes` client's `connect_get_namespaced_pod_exec`, an HTTP GET under the hood for the
   websocket upgrade, so the API server's own front-door RBAC check (which maps the HTTP method to
   a verb) needs `get`; the request is then proxied to the kubelet on the pod's node, which performs
@@ -564,7 +724,9 @@ guidance for a namespace-scoped operator:
   RBAC-denial message, naming the verb/resource/namespace explicitly; missing `create`: an empty
   `pods "<name>" is forbidden: ` from the kubelet hop instead); `create` on `events`;
   and a `kopfpeerings` rule kopf's own docs recommend (a harmless no-op unless a `KopfPeering` CRD
-  is separately installed — kubebird runs a single replica, so peering itself isn't required).
+  is separately installed — kubebird runs a single replica, so peering itself isn't required). None
+  of this grants anything for reaching an S3 endpoint itself — that's a plain outbound HTTP(S) call
+  `boto3` makes directly, entirely outside Kubernetes RBAC.
 - A thin cluster-scoped `ClusterRole`/`ClusterRoleBinding`, still needed even though the operator
   itself is namespace-scoped: kopf's framework needs `list`/`watch` on `customresourcedefinitions`
   and `namespaces`, both genuinely cluster-scoped resource types with no namespaced equivalent to

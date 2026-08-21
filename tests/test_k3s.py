@@ -7,6 +7,7 @@ from testcontainers.community.k3s import K3SContainer
 
 DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 CRD_PATH = DEPLOY_DIR / "crd.yaml"
+BACKUP_CRD_PATH = DEPLOY_DIR / "backup-crd.yaml"
 OPERATOR_PATH = DEPLOY_DIR / "operator.yaml"
 
 
@@ -84,12 +85,13 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
     service_account = "kubebird-operator"
 
     ext_api = client.ApiextensionsV1Api()
-    crd_body = yaml.safe_load(CRD_PATH.read_text())
-    try:
-        ext_api.create_custom_resource_definition(crd_body)
-    except ApiException as e:
-        if e.status != 409:
-            raise
+    for path in (CRD_PATH, BACKUP_CRD_PATH):
+        crd_body = yaml.safe_load(path.read_text())
+        try:
+            ext_api.create_custom_resource_definition(crd_body)
+        except ApiException as e:
+            if e.status != 409:
+                raise
 
     for doc in yaml.safe_load_all(OPERATOR_PATH.read_text()):
         _create_object(doc["kind"], doc)
@@ -129,12 +131,17 @@ def test_operator_yaml_deploys_and_grants_expected_rbac(kubeconfig: Path) -> Non
             subresource=subresource,
         )
 
-    # Application-level: exactly what create.py/update.py/k8s.py/firebird.py call.
+    # Application-level: exactly what create.py/update.py/backup.py/k8s.py/firebird.py call.
     assert can("get", "instances", group="kubebird.github.io")
     assert can("list", "instances", group="kubebird.github.io")
     assert can("watch", "instances", group="kubebird.github.io")
     assert can("patch", "instances", group="kubebird.github.io")
     assert can("patch", "instances", group="kubebird.github.io", subresource="status")
+    assert can("get", "backups", group="kubebird.github.io")
+    assert can("list", "backups", group="kubebird.github.io")
+    assert can("watch", "backups", group="kubebird.github.io")
+    assert can("patch", "backups", group="kubebird.github.io")
+    assert can("patch", "backups", group="kubebird.github.io", subresource="status")
     assert can("get", "secrets")
     assert can("create", "secrets")
     assert can("patch", "secrets")

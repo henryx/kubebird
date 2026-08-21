@@ -17,7 +17,7 @@ import uvloop
 # Import for their @kopf.on.* decorators' side effect: registering handlers
 # in kopf's default registry. kopf.run() only sees handlers from modules that
 # have actually been imported by the time it starts.
-from kubebird import create, delete, update  # noqa: F401
+from kubebird import backup, create, delete, update  # noqa: F401
 
 DEFAULT_LOG_LEVEL = "INFO"
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

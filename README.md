@@ -116,16 +116,67 @@ it (they're all owned by the `Instance`); the operator itself just logs the dele
 `Instance`, so deleting the `Instance` leaves it (and any backup data on it) in place instead of
 garbage-collecting it along with everything else.
 
+### Backup and restore
+
+Backup is made by dedicated CR:
+```yaml
+apiVersion: kubebird.github.io/v1
+kind: Backup
+metadata:
+  name: test
+spec:
+  instanceRef: firebird
+  type: local # can be local or s3
+  include:
+    - instance.fdb
+  exclude:
+    - shadowed.fdb
+  s3: # used only if type is S3
+    location: "https://s3.remote-storage.com"
+    credentials:
+      ref: "secret"
+    bucket: "firebird"
+    path: "/"
+```
+
+When CR is created, backup is made in dedicated path in the pod. If S3 is configured,
+backup is transferred to a configured S3 instance. If include and exclude fields are
+missing, all databases are backupped. When CR is deleted, backup is removed.
+
+Implementation notes:
+- Requires the referenced `Instance` to have `storage.backup` configured (see above) — that's
+  where the backup is staged, regardless of `type`. Each database is backed up with Firebird's
+  own `gbak` tool (`gbak -backup -verify`, so its progress is visible in the operator's own logs),
+  producing one `<database-name>.fbk` file per database.
+- The backup directory is `<storage.backup mount>/<timestamp>-<Backup name>` (e.g.
+  `/var/lib/firebird/backup/20260615T120000Z-test`), so backups from different `Backup` CRs (or
+  repeated runs of the same name) never collide. The timestamp is generated once, on the first
+  reconcile attempt, and recorded in `status.timestamp`; a retry after a transient failure reuses
+  it instead of creating a new directory.
+- `include`/`exclude` are matched against the referenced `Instance`'s own `spec.databases[].name`
+  entries — `include` defaults to every database on the `Instance` when omitted, `exclude` is
+  applied after that (removing any listed names) and defaults to none.
+- `type: s3` requires a Secret, named by `s3.credentials.ref` in the same namespace, holding
+  `accessKey`/`secretKey` keys. Backups still land in the local path first either way; with `type:
+  s3` each file is additionally uploaded (via `boto3`) to `s3://<s3.bucket>/<s3.path>/<timestamp>-<Backup
+  name>/<database-name>.fbk`.
+- Deleting the `Backup` CR removes the local backup directory from the `Instance`'s pod and, for
+  `type: s3`, the uploaded S3 object(s) too — both the local files and, if applicable, the S3
+  copies are considered part of that one `Backup`'s lifecycle. If the `Instance` was already
+  deleted first, the local removal is skipped (there's no pod left to exec into) but the PVC
+  itself, and any S3 copies, are unaffected.
+- Restore isn't implemented yet — only the backup half of this section.
+
 ## Installation
 
 To install Kubebird in the Kubernetes cluster, you can use these commands:
 ```bash
-kubectl apply -f deploy/crd.yaml
+kubectl apply -f deploy/crd.yaml -f deploy/backup-crd.yaml
 kubectl apply -f deploy/operator.yaml
 ```
 `deploy/operator.yaml` creates its own `kubebird-system` namespace and deploys the operator into it
-(Deployment, ServiceAccount, and the RBAC it needs) — no `-n <namespace>` needed. `Instance` CRs
-must be created in `kubebird-system` too, since the namespaced `Role`/`RoleBinding` only grant
+(Deployment, ServiceAccount, and the RBAC it needs) — no `-n <namespace>` needed. `Instance`/`Backup`
+CRs must be created in `kubebird-system` too, since the namespaced `Role`/`RoleBinding` only grant
 access there.
 
 The operator itself runs via the `kubebird-operator` console script (on `uvloop`):
@@ -151,8 +202,8 @@ The image runs as a non-root `appuser` (uid 8877) on a Red Hat UBI10 base and st
 ```bash
 # Setup
 $ uv init --name Kubebird --app --description "Kubebird - A Kubernetes operator for Firebird" --build-backend uv --no-readme
-$ uv add kopf kubernetes uvloop
-$ uv add --dev pytest pytest-cov tox ruff mypy pyyaml types-pyyaml
+$ uv add kopf kubernetes uvloop boto3
+$ uv add --dev pytest pytest-cov tox ruff mypy pyyaml types-pyyaml boto3-stubs
 $ uv add --dev testcontainers
 ```
 For e2e tests, `testcontainers` is used to run a k3s cluster: `tests/conftest.py` defines a
@@ -180,11 +231,24 @@ confirming the change actually took effect against the live `Service`/`StatefulS
 actually disappears (not just that the delete call returned) and that Kubernetes garbage-collects
 the `StatefulSet` it owned.
 
-`tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies `deploy/operator.yaml`
-(Namespace, ServiceAccount, ClusterRole/ClusterRoleBinding, Role/RoleBinding, Deployment) and
-checks, via `SubjectAccessReview`, that the resulting ServiceAccount actually gets every permission
-the operator's code calls for — much faster than the other suites since it doesn't need the
-container image to actually be pullable or any pod to schedule.
+`tests/test_backup.py` covers the `Backup` CR the same way, against `deploy/backup-crd.yaml`/
+`deploy/backup-cr.yaml`. `test_backup_instance_local` creates a `Ready` `Instance`, then a `type:
+local` `Backup`, waits for it to reach `status.phase == "Ready"`, execs into the pod to confirm the
+`.fbk` file exists under the recorded `status.path`, deletes the `Backup`, and confirms that path is
+gone. `test_backup_instance_s3` does the same with `type: s3`, additionally starting a throwaway
+`pgsty/silo` container (`testcontainers.core.container.DockerContainer`, not a dedicated
+testcontainers module — a maintained, S3-API-compatible MinIO fork) as the S3 target: it polls
+`list_buckets()` until the container accepts connections, creates the test bucket, then after the
+`Backup` reaches `Ready` confirms the uploaded object exists via `head_object`, and that it's gone
+(a `ClientError` with code `404`/`NoSuchKey`) after the `Backup` is deleted.
+
+`tests/test_k3s.py::test_operator_yaml_deploys_and_grants_expected_rbac` applies both
+`deploy/crd.yaml`/`deploy/backup-crd.yaml` and every object in `deploy/operator.yaml` (Namespace,
+ServiceAccount, ClusterRole/ClusterRoleBinding, Role/RoleBinding, Deployment), then checks, via
+`SubjectAccessReview`, that the resulting ServiceAccount actually gets every permission the
+operator's code calls for (`instances`/`instances/status` and `backups`/`backups/status` included)
+— much faster than the other suites since it doesn't need the container image to actually be
+pullable or any pod to schedule.
 
 ## CI
 

@@ -1,0 +1,17 @@
+apiVersion: kubebird.github.io/v1
+kind: Backup
+metadata:
+  name: test
+spec:
+  instanceRef: test
+  type: local # can be local or s3
+  include:
+    - instance.fdb
+  exclude:
+    - shadowed.fdb
+  s3: # used only if type is s3
+    location: "https://s3.remote-storage.com"
+    credentials:
+      ref: "secret"
+    bucket: "firebird"
+    path: "/"

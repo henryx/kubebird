@@ -287,6 +287,147 @@ def create_shadow(
     )
 
 
+def mkdir_p(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    path: str,
+    logger: kopf.Logger,
+) -> None:
+    shell_command = f"mkdir -p {shlex.quote(path)}"
+    command = ["/bin/sh", "-c", shell_command]
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=container,
+        command=command,
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    logger.debug(f"mkdir command={command!r} output={output!r}")
+    if output.strip():
+        raise kopf.PermanentError(f"Failed to create directory {path!r}: {output}")
+
+
+def remove_path(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    path: str,
+    logger: kopf.Logger,
+) -> None:
+    shell_command = f"rm -rf {shlex.quote(path)}"
+    command = ["/bin/sh", "-c", shell_command]
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=container,
+        command=command,
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    logger.debug(f"rm command={command!r} output={output!r}")
+    if output.strip():
+        raise kopf.PermanentError(f"Failed to remove {path!r}: {output}")
+
+
+def read_file_base64(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    path: str,
+    logger: kopf.Logger,
+) -> bytes:
+    """Read a file out of the pod, base64-encoded over the exec stream --
+    the same wire-safety reasoning as write_databases_conf but in the
+    opposite direction, and required here since a gbak backup file's
+    content is binary, not text."""
+    shell_command = f"base64 {shlex.quote(path)}"
+    command = ["/bin/sh", "-c", shell_command]
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=container,
+        command=command,
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    logger.debug(f"read_file_base64 command={command!r} output length={len(output)}")
+    try:
+        return base64.b64decode(output)
+    except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
+        raise kopf.PermanentError(f"Failed to read {path!r}: {output}") from exc
+
+
+def create_backup(
+    core_api: client.CoreV1Api,
+    *,
+    namespace: str,
+    pod_name: str,
+    container: str,
+    sysdba_password: str,
+    database_path: str,
+    backup_path: str,
+    logger: kopf.Logger,
+) -> str:
+    """Back up one database into a `gbak` (.fbk) file via `gbak -backup -verify`.
+
+    Like isql, a bare local path would make gbak open the database through
+    Firebird's embedded provider and race the already-running SuperServer
+    for a lock -- the same "always connect via localhost:" rule applies here
+    too. `-verify` ("report each action taken") makes gbak log its progress
+    (readying the database, writing each metadata section, final byte count)
+    to stdout instead of staying silent, which is what get logged at INFO
+    below for visibility into a long-running backup; confirmed empirically
+    that a second backup into the same, already-existing target path just
+    overwrites it without complaint, so no separate handling is needed for
+    a handler retry re-running this against the same (idempotent,
+    timestamp-derived) path.
+    """
+    shell_command = (
+        f"gbak -backup -verify -user SYSDBA -password {shlex.quote(sysdba_password)} "
+        f"localhost:{shlex.quote(database_path)} {shlex.quote(backup_path)}"
+    )
+    command = ["/bin/sh", "-c", shell_command]
+    output = stream(
+        core_api.connect_get_namespaced_pod_exec,
+        pod_name,
+        namespace,
+        container=container,
+        command=command,
+        stderr=True,
+        stdin=False,
+        stdout=True,
+        tty=False,
+    )
+    logger.debug(
+        f"gbak command={_redact(shell_command, sysdba_password)!r} output={output!r}"
+    )
+    # Unlike gsec/isql -quiet, -verify means gbak's output is expected to be
+    # non-empty even on success -- it reports failures with a "gbak: ERROR"
+    # -prefixed line (and a final "Exiting before completion due to errors"),
+    # confirmed empirically, so check for that marker instead of any output.
+    if "gbak: ERROR" in output:
+        raise kopf.PermanentError(f"gbak failed to back up {database_path!r}: {output}")
+    logger.info(f"gbak backed up {database_path!r} to {backup_path!r}:\n{output}")
+    return output
+
+
 def provision_databases(
     core_api: client.CoreV1Api,
     *,
