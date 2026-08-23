@@ -6,4 +6,13 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: instance-sample
 spec:
-  # TODO(user): Add fields here
+  image: firebirdsql/firebird
+  version: 3.0.14
+  databases:
+    - name: "instance.fdb"
+  storage:
+    primary:
+      size: 3Gi
+  authentication:
+    sysdba:
+      secretRef: instance-sample-sysdba

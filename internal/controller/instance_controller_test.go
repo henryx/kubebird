@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -54,7 +55,23 @@ var _ = Describe("Instance Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: kubebirdv1.InstanceSpec{
+						Image:   "firebirdsql/firebird",
+						Version: "3.0.14",
+						Databases: []kubebirdv1.DatabaseSpec{
+							{Name: "instance.fdb"},
+						},
+						Storage: kubebirdv1.StorageSpec{
+							Primary: kubebirdv1.StorageVolumeSpec{
+								Size: apiresource.MustParse("3Gi"),
+							},
+						},
+						Authentication: kubebirdv1.AuthenticationSpec{
+							Sysdba: kubebirdv1.SysdbaAuthSpec{
+								SecretRef: "test-sysdba",
+							},
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

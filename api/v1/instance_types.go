@@ -17,23 +17,133 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // InstanceSpec defines the desired state of Instance
+// +kubebuilder:validation:XValidation:rule="!self.databases.exists(d, d.shadow) || has(self.storage.shadow)",message="storage.shadow is required when any database has shadow enabled"
 type InstanceSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// image is the container image used to run the Firebird instance.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Image string `json:"image"`
 
-	// foo is an example field of Instance. Edit instance_types.go to remove/update
+	// version is the Firebird version to deploy, used as the image tag.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Version string `json:"version"`
+
+	// databases is the list of databases to create on the instance.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=name
+	Databases []DatabaseSpec `json:"databases"`
+
+	// service configures the Service exposing the instance.
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	Service ServiceSpec `json:"service,omitzero"`
+
+	// storage configures the persistent volumes backing the instance.
+	// +kubebuilder:validation:Required
+	Storage StorageSpec `json:"storage"`
+
+	// authentication configures credentials for the instance.
+	// +kubebuilder:validation:Required
+	Authentication AuthenticationSpec `json:"authentication"`
+}
+
+// DatabaseSpec defines a single database to create on the instance.
+type DatabaseSpec struct {
+	// name is the database file name, e.g. "instance.fdb".
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// alias is the database alias clients use to connect.
+	// Defaults to the database name if not specified.
+	// +optional
+	Alias *string `json:"alias,omitempty"`
+
+	// shadow enables a shadow (mirror) database for this database.
+	// Requires storage.shadow to be set.
+	// +kubebuilder:default=false
+	// +optional
+	Shadow bool `json:"shadow,omitempty"`
+
+	// pageSize is the database page size in bytes.
+	// +kubebuilder:validation:Enum=4096;8192;16384
+	// +kubebuilder:default=8192
+	// +optional
+	PageSize int32 `json:"pageSize,omitempty"`
+
+	// charset is the database character set.
+	// +kubebuilder:default="UTF8"
+	// +optional
+	Charset string `json:"charset,omitempty"`
+
+	// collation is the database collation.
+	// +kubebuilder:default="UTF8"
+	// +optional
+	Collation string `json:"collation,omitempty"`
+}
+
+// ServiceSpec configures the Service exposing the instance.
+type ServiceSpec struct {
+	// type is the Service type.
+	// +kubebuilder:validation:Enum=ClusterIP;NodePort;LoadBalancer
+	// +kubebuilder:default="ClusterIP"
+	// +optional
+	Type corev1.ServiceType `json:"type,omitempty"`
+
+	// port is the port the Service exposes the instance on.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:default=3050
+	// +optional
+	Port int32 `json:"port,omitempty"`
+}
+
+// StorageSpec configures the persistent volumes backing the instance.
+type StorageSpec struct {
+	// primary is the volume storing the instance's primary databases.
+	// +kubebuilder:validation:Required
+	Primary StorageVolumeSpec `json:"primary"`
+
+	// shadow is the volume storing shadow databases. Required if any
+	// database in spec.databases has shadow set to true.
+	// +optional
+	Shadow *StorageVolumeSpec `json:"shadow,omitempty"`
+}
+
+// StorageVolumeSpec configures a single persistent volume.
+type StorageVolumeSpec struct {
+	// class is the StorageClass name to use. If empty, the cluster's
+	// default StorageClass is used.
+	// +optional
+	Class string `json:"class,omitempty"`
+
+	// size is the requested volume size.
+	// +kubebuilder:validation:Required
+	Size resource.Quantity `json:"size"`
+}
+
+// AuthenticationSpec configures credentials for the instance.
+type AuthenticationSpec struct {
+	// sysdba configures the SYSDBA account credentials.
+	// +kubebuilder:validation:Required
+	Sysdba SysdbaAuthSpec `json:"sysdba"`
+}
+
+// SysdbaAuthSpec configures the SYSDBA account credentials.
+type SysdbaAuthSpec struct {
+	// secretRef is the name of the Secret containing the SYSDBA password.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	SecretRef string `json:"secretRef"`
 }
 
 // InstanceStatus defines the observed state of Instance.
