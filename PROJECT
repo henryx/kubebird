@@ -9,4 +9,14 @@ layout:
 namespaced: true
 projectName: kubebuilder
 repo: github.com/henryx/kubebird
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: github.io
+  group: kubebird
+  kind: Instance
+  path: github.com/henryx/kubebird/api/v1
+  version: v1
 version: "3"
