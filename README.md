@@ -98,5 +98,11 @@ Kubebird also reacts to updates on an existing `Instance`:
   the secret and the running instance never drift apart.
 
 Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
-it (they're all owned by the `Instance`); the operator itself just logs the deletion and reports
-`status.phase: Deleting` while that garbage collection runs.
+it (the Secret, aliases ConfigMap, Service and StatefulSet are all owned by the `Instance`); the
+operator itself just logs the deletion and reports `status.phase: Deleting` while that garbage
+collection runs. The primary/shadow PVCs are **not** removed with it — Kubernetes retains a
+StatefulSet's PVCs by default, so an `Instance`'s data survives its deletion. Delete the PVCs
+yourself once you're sure you no longer need the data:
+```bash
+kubectl delete pvc -l kubebird.github.io/instance=<name>
+```
