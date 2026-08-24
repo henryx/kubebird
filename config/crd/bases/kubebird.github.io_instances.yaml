@@ -14,7 +14,11 @@ spec:
     singular: instance
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.error
+      name: Error
+      type: string
+    name: v1
     schema:
       openAPIV3Schema:
         description: Instance is the Schema for the instances API
@@ -46,15 +50,13 @@ spec:
                     description: sysdba configures the SYSDBA account credentials.
                     properties:
                       secretRef:
-                        description: secretRef is the name of the Secret containing
-                          the SYSDBA password.
-                        minLength: 1
+                        description: |-
+                          secretRef is the name of the Secret containing the SYSDBA
+                          credentials. Defaults to "<instance-name>-sysdba" if not specified;
+                          that Secret is created automatically with a generated password if
+                          it doesn't already exist.
                         type: string
-                    required:
-                    - secretRef
                     type: object
-                required:
-                - sysdba
                 type: object
               databases:
                 description: databases is the list of databases to create on the instance.
@@ -179,7 +181,6 @@ spec:
                 minLength: 1
                 type: string
             required:
-            - authentication
             - databases
             - image
             - storage
@@ -260,6 +261,31 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              databases:
+                description: |-
+                  databases lists the databases from spec.databases that have
+                  already been created on the instance, so they are not recreated
+                  on subsequent reconciles.
+                items:
+                  type: string
+                type: array
+              error:
+                description: |-
+                  error is the message from the most recent reconcile failure, if
+                  any. Cleared automatically once the Instance reconciles
+                  successfully again.
+                type: string
+              phase:
+                description: |-
+                  phase is a high-level summary of the Instance's lifecycle state,
+                  e.g. "Deleting" while owned resources are being garbage collected.
+                type: string
+              sysdbaPasswordHash:
+                description: |-
+                  sysdbaPasswordHash is a hash of the SYSDBA password Kubebird last
+                  applied to the live server, used to detect when the referenced
+                  Secret's password has been rotated.
+                type: string
             type: object
         required:
         - spec

@@ -52,8 +52,8 @@ type InstanceSpec struct {
 	Storage StorageSpec `json:"storage"`
 
 	// authentication configures credentials for the instance.
-	// +kubebuilder:validation:Required
-	Authentication AuthenticationSpec `json:"authentication"`
+	// +optional
+	Authentication AuthenticationSpec `json:"authentication,omitzero"`
 }
 
 // DatabaseSpec defines a single database to create on the instance.
@@ -134,16 +134,18 @@ type StorageVolumeSpec struct {
 // AuthenticationSpec configures credentials for the instance.
 type AuthenticationSpec struct {
 	// sysdba configures the SYSDBA account credentials.
-	// +kubebuilder:validation:Required
-	Sysdba SysdbaAuthSpec `json:"sysdba"`
+	// +optional
+	Sysdba SysdbaAuthSpec `json:"sysdba,omitzero"`
 }
 
 // SysdbaAuthSpec configures the SYSDBA account credentials.
 type SysdbaAuthSpec struct {
-	// secretRef is the name of the Secret containing the SYSDBA password.
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	SecretRef string `json:"secretRef"`
+	// secretRef is the name of the Secret containing the SYSDBA
+	// credentials. Defaults to "<instance-name>-sysdba" if not specified;
+	// that Secret is created automatically with a generated password if
+	// it doesn't already exist.
+	// +optional
+	SecretRef string `json:"secretRef,omitempty"`
 }
 
 // InstanceStatus defines the observed state of Instance.
@@ -167,10 +169,34 @@ type InstanceStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// databases lists the databases from spec.databases that have
+	// already been created on the instance, so they are not recreated
+	// on subsequent reconciles.
+	// +optional
+	Databases []string `json:"databases,omitempty"`
+
+	// sysdbaPasswordHash is a hash of the SYSDBA password Kubebird last
+	// applied to the live server, used to detect when the referenced
+	// Secret's password has been rotated.
+	// +optional
+	SysdbaPasswordHash string `json:"sysdbaPasswordHash,omitempty"`
+
+	// phase is a high-level summary of the Instance's lifecycle state,
+	// e.g. "Deleting" while owned resources are being garbage collected.
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
+	// error is the message from the most recent reconcile failure, if
+	// any. Cleared automatically once the Instance reconciles
+	// successfully again.
+	// +optional
+	Error string `json:"error,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Error",type=string,JSONPath=".status.error"
 
 // Instance is the Schema for the instances API
 type Instance struct {

@@ -21,7 +21,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -45,8 +48,16 @@ var _ = Describe("Instance Controller", func() {
 			Namespace: resourceNamespace,
 		}
 		instance := &kubebirdv1.Instance{}
+		secretName := types.NamespacedName{Name: "test-sysdba", Namespace: resourceNamespace}
+		aliasesConfigMapNameNN := types.NamespacedName{Name: resourceName + "-aliases", Namespace: resourceNamespace}
+		var controllerReconciler *InstanceReconciler
 
 		BeforeEach(func() {
+			controllerReconciler = &InstanceReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
 			By("creating the custom resource for the Kind Instance")
 			err := k8sClient.Get(ctx, typeNamespacedName, instance)
 			if err != nil && errors.IsNotFound(err) {
@@ -78,27 +89,74 @@ var _ = Describe("Instance Controller", func() {
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &kubebirdv1.Instance{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Cleanup the specific resource instance Instance")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &InstanceReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 
+			By("Letting the controller process the deletion and remove its finalizer")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(HaveOccurred())
+
+			By("Cleanup the SYSDBA Secret")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, secretName, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
+		It("should reconcile the Service, ConfigMap and StatefulSet for the instance", func() {
+			By("Reconciling the created resource")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("auto-creating the SYSDBA Secret with a generated password")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, secretName, secret)).To(Succeed())
+			Expect(secret.Data).To(HaveKeyWithValue("username", []byte("SYSDBA")))
+			Expect(secret.Data).To(HaveKey("password"))
+			Expect(secret.Data["password"]).NotTo(BeEmpty())
+			Expect(secret.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+
+			By("registering a database alias in the aliases ConfigMap")
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, aliasesConfigMapNameNN, cm)).To(Succeed())
+			Expect(cm.Data["databases.conf"]).To(ContainSubstring("instance.fdb = /var/lib/firebird/data/instance.fdb"))
+
+			By("creating the Service exposing the instance")
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, svc)).To(Succeed())
+			Expect(svc.Spec.Ports).To(HaveLen(1))
+			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(3050)))
+			Expect(svc.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+
+			By("creating the StatefulSet running Firebird")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
+			Expect(sts.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+
+			By("marking the instance as not yet Available")
+			updated := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			cond := apimeta.FindStatusCondition(updated.Status.Conditions, conditionTypeAvailable)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+
+			By("not yet provisioning any database, since the StatefulSet pod isn't ready")
+			Expect(updated.Status.Databases).To(BeEmpty())
+
+			By("not reporting any reconcile error")
+			Expect(updated.Status.Error).To(BeEmpty())
+
+			By("adding the finalizer so deletion can be observed")
+			Expect(updated.Finalizers).To(ContainElement(finalizerName))
 		})
 	})
 })
