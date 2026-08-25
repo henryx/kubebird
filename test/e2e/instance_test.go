@@ -221,6 +221,51 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 		})
 
+		It("should drop a removed database without disturbing others", func() {
+			By("recording the pod's current start time")
+			startTimeBefore, err := getPodStartTime()
+			Expect(err).NotTo(HaveOccurred())
+
+			By("removing the database added in the previous spec from spec.databases")
+			cmd := exec.Command("kubectl", "patch", "instance", instanceName, "-n", namespace,
+				"--type=json", "-p", `[{"op":"remove","path":"/spec/databases/2"}]`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("dropping only the removed database from status.databases")
+			Eventually(func(g Gomega) {
+				names, err := getInstanceDatabases()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(names).To(ConsistOf("instance.fdb", "shadowed.fdb"))
+			}, 3*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("removing its alias from the aliases ConfigMap")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "configmap", instanceAliasesCMName, "-n", namespace,
+					"-o", `jsonpath={.data.databases\.conf}`)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(ContainSubstring("added.fdb"))
+			}).Should(Succeed())
+
+			By("not restarting the pod to do so")
+			startTimeAfter, err := getPodStartTime()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(startTimeAfter).To(Equal(startTimeBefore))
+
+			By("actually deleting the dropped database's file inside the pod")
+			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
+				"--", "test", "-f", "/var/lib/firebird/data/added.fdb")
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "added.fdb should have been dropped")
+
+			By("keeping the other database files in place")
+			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
+				"--", "test", "-f", "/var/lib/firebird/data/instance.fdb")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
 		It("should push a rotated SYSDBA password to the live server", func() {
 			const newPassword = "e2e-rotated-Pa55word!"
 

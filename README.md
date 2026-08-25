@@ -119,6 +119,9 @@ Kubebird also reacts to updates on an existing `Instance`:
   `Service`/`StatefulSet` in place.
 - Adding an entry to `spec.databases` provisions just that new database (existing ones are left
   alone) and registers its alias immediately, without needing a pod restart.
+- Removing an entry from `spec.databases` runs `DROP DATABASE` for just that database (Firebird
+  removes its shadow file, if any, along with it), drops it from `status.databases`, and removes
+  its alias from `databases.conf` — again without a pod restart.
 - Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
   `authentication.sysdba.secretRef`) pushes the new password to the live server automatically, so
   the secret and the running instance never drift apart.

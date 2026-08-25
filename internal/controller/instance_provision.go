@@ -43,7 +43,9 @@ const securityDatabaseDir = "/usr/local/firebird"
 
 // reconcileDatabases exec's isql inside the Firebird pod, once it is
 // ready, to run CREATE DATABASE/CREATE SHADOW for each entry in
-// instance.Spec.Databases not yet recorded in instance.Status.Databases.
+// instance.Spec.Databases not yet recorded in instance.Status.Databases,
+// and DROP DATABASE for each entry in instance.Status.Databases no longer
+// present in instance.Spec.Databases.
 //
 // Provisioning happens this way, rather than via a mounted init script,
 // because the nakagami/firebirdsql Go driver's own database-creation path
@@ -54,6 +56,11 @@ const securityDatabaseDir = "/usr/local/firebird"
 func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *kubebirdv1.Instance, sts *appsv1.StatefulSet) error {
 	if sts.Status.ReadyReplicas == 0 {
 		return nil
+	}
+
+	desired := make(map[string]bool, len(instance.Spec.Databases))
+	for _, db := range instance.Spec.Databases {
+		desired[db.Name] = true
 	}
 
 	created := make(map[string]bool, len(instance.Status.Databases))
@@ -67,7 +74,15 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 			pending = append(pending, db)
 		}
 	}
-	if len(pending) == 0 {
+
+	removed := make([]string, 0, len(instance.Status.Databases))
+	for _, name := range instance.Status.Databases {
+		if !desired[name] {
+			removed = append(removed, name)
+		}
+	}
+
+	if len(pending) == 0 && len(removed) == 0 {
 		return nil
 	}
 
@@ -78,13 +93,37 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 
 	podName := instance.Name + "-0"
 	sysdbaCommand := []string{"isql", "-user", sysdbaUsername, "-password", password}
+
+	for _, name := range removed {
+		dropCommand := append(append([]string{}, sysdbaCommand...), path.Join(primaryDataMountPath, name))
+		if err := r.execIsql(ctx, instance.Namespace, podName, dropCommand, databaseDropScript); err != nil {
+			return fmt.Errorf("failed to drop database %q: %w", name, err)
+		}
+		logf.FromContext(ctx).Info("Dropped database", "database", name)
+	}
+
 	for _, db := range pending {
 		if err := r.execIsql(ctx, instance.Namespace, podName, sysdbaCommand, databaseCreateScript(db)); err != nil {
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
-		instance.Status.Databases = append(instance.Status.Databases, db.Name)
 		logf.FromContext(ctx).Info("Created database", "database", db.Name)
 	}
+
+	removedSet := make(map[string]bool, len(removed))
+	for _, name := range removed {
+		removedSet[name] = true
+	}
+	databases := make([]string, 0, len(instance.Status.Databases)+len(pending))
+	for _, name := range instance.Status.Databases {
+		if !removedSet[name] {
+			databases = append(databases, name)
+		}
+	}
+	for _, db := range pending {
+		databases = append(databases, db.Name)
+	}
+	instance.Status.Databases = databases
+	instance.Status.DatabaseCount = int32(len(databases))
 
 	return r.Status().Update(ctx, instance)
 }
@@ -172,6 +211,13 @@ func (r *InstanceReconciler) sysdbaPassword(ctx context.Context, instance *kubeb
 	}
 	return string(secret.Data[sysdbaSecretPasswordKey]), nil
 }
+
+// databaseDropScript is the isql script that drops the database isql is
+// connected to (see reconcileDatabases, which connects by passing the
+// database's path as isql's positional argument). Firebird removes any
+// attached shadow files along with it, so no separate cleanup is needed
+// for databases created with shadow: true.
+const databaseDropScript = "DROP DATABASE;\nQUIT;\n"
 
 // databaseCreateScript renders the isql script that creates a single
 // database, applying its page size, charset and collation, and adding a
