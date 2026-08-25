@@ -1,0 +1,670 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+    control-plane: controller-manager
+  name: kubebird-system
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: instances.kubebird.github.io
+spec:
+  group: kubebird.github.io
+  names:
+    kind: Instance
+    listKind: InstanceList
+    plural: instances
+    singular: instance
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.error
+      name: Error
+      type: string
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: Instance is the Schema for the instances API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of Instance
+            properties:
+              authentication:
+                description: authentication configures credentials for the instance.
+                properties:
+                  sysdba:
+                    description: sysdba configures the SYSDBA account credentials.
+                    properties:
+                      secretRef:
+                        description: |-
+                          secretRef is the name of the Secret containing the SYSDBA
+                          credentials. Defaults to "<instance-name>-sysdba" if not specified;
+                          that Secret is created automatically with a generated password if
+                          it doesn't already exist.
+                        type: string
+                    type: object
+                type: object
+              databases:
+                description: databases is the list of databases to create on the instance.
+                items:
+                  description: DatabaseSpec defines a single database to create on
+                    the instance.
+                  properties:
+                    alias:
+                      description: |-
+                        alias is the database alias clients use to connect.
+                        Defaults to the database name if not specified.
+                      type: string
+                    charset:
+                      default: UTF8
+                      description: charset is the database character set.
+                      type: string
+                    collation:
+                      default: UTF8
+                      description: collation is the database collation.
+                      type: string
+                    name:
+                      description: name is the database file name, e.g. "instance.fdb".
+                      minLength: 1
+                      type: string
+                    pageSize:
+                      default: 8192
+                      description: pageSize is the database page size in bytes.
+                      enum:
+                      - 4096
+                      - 8192
+                      - 16384
+                      format: int32
+                      type: integer
+                    shadow:
+                      default: false
+                      description: |-
+                        shadow enables a shadow (mirror) database for this database.
+                        Requires storage.shadow to be set.
+                      type: boolean
+                  required:
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              image:
+                description: image is the container image used to run the Firebird
+                  instance.
+                minLength: 1
+                type: string
+              service:
+                description: service configures the Service exposing the instance.
+                properties:
+                  port:
+                    default: 3050
+                    description: port is the port the Service exposes the instance
+                      on.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  type:
+                    default: ClusterIP
+                    description: type is the Service type.
+                    enum:
+                    - ClusterIP
+                    - NodePort
+                    - LoadBalancer
+                    type: string
+                type: object
+              storage:
+                description: storage configures the persistent volumes backing the
+                  instance.
+                properties:
+                  primary:
+                    description: primary is the volume storing the instance's primary
+                      databases.
+                    properties:
+                      class:
+                        description: |-
+                          class is the StorageClass name to use. If empty, the cluster's
+                          default StorageClass is used.
+                        type: string
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested volume size.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - size
+                    type: object
+                  shadow:
+                    description: |-
+                      shadow is the volume storing shadow databases. Required if any
+                      database in spec.databases has shadow set to true.
+                    properties:
+                      class:
+                        description: |-
+                          class is the StorageClass name to use. If empty, the cluster's
+                          default StorageClass is used.
+                        type: string
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested volume size.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - size
+                    type: object
+                required:
+                - primary
+                type: object
+              version:
+                description: version is the Firebird version to deploy, used as the
+                  image tag.
+                minLength: 1
+                type: string
+            required:
+            - databases
+            - image
+            - storage
+            - version
+            type: object
+            x-kubernetes-validations:
+            - message: storage.shadow is required when any database has shadow enabled
+              rule: '!self.databases.exists(d, d.shadow) || has(self.storage.shadow)'
+          status:
+            description: status defines the observed state of Instance
+            properties:
+              conditions:
+                description: |-
+                  conditions represent the current state of the Instance resource.
+                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
+
+                  Standard condition types include:
+                  - "Available": the resource is fully functional
+                  - "Progressing": the resource is being created or updated
+                  - "Degraded": the resource failed to reach or maintain its desired state
+
+                  The status of each condition is one of True, False, or Unknown.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              databases:
+                description: |-
+                  databases lists the databases from spec.databases that have
+                  already been created on the instance, so they are not recreated
+                  on subsequent reconciles.
+                items:
+                  type: string
+                type: array
+              error:
+                description: |-
+                  error is the message from the most recent reconcile failure, if
+                  any. Cleared automatically once the Instance reconciles
+                  successfully again.
+                type: string
+              phase:
+                description: |-
+                  phase is a high-level summary of the Instance's lifecycle state,
+                  e.g. "Deleting" while owned resources are being garbage collected.
+                type: string
+              sysdbaPasswordHash:
+                description: |-
+                  sysdbaPasswordHash is a hash of the SYSDBA password Kubebird last
+                  applied to the live server, used to detect when the referenced
+                  Secret's password has been rotated.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-controller-manager
+  namespace: kubebird-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-instance-admin-role
+  namespace: kubebird-system
+rules:
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances
+  verbs:
+  - '*'
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-instance-editor-role
+  namespace: kubebird-system
+rules:
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-instance-viewer-role
+  namespace: kubebird-system
+rules:
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-leader-election-role
+  namespace: kubebird-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubebird-manager-role
+  namespace: kubebird-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - kubebird.github.io
+  resources:
+  - instances/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubebird-metrics-auth-role
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubebird-metrics-reader
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-leader-election-rolebinding
+  namespace: kubebird-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubebird-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: kubebird-controller-manager
+  namespace: kubebird-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+  name: kubebird-manager-rolebinding
+  namespace: kubebird-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubebird-manager-role
+subjects:
+- kind: ServiceAccount
+  name: kubebird-controller-manager
+  namespace: kubebird-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubebird-metrics-auth-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubebird-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: kubebird-controller-manager
+  namespace: kubebird-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+    control-plane: controller-manager
+  name: kubebird-controller-manager-metrics-service
+  namespace: kubebird-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    app.kubernetes.io/name: kubebird
+    control-plane: controller-manager
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: kubebird
+    control-plane: controller-manager
+  name: kubebird-controller-manager
+  namespace: kubebird-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubebird
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/name: kubebird
+        control-plane: controller-manager
+    spec:
+      containers:
+      - args:
+        - --metrics-bind-address=:8443
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        command:
+        - /manager
+        env:
+        - name: WATCH_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        image: quay.io/kubebird/controller:latest
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: manager
+        ports:
+        - containerPort: 8081
+          name: health
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts: []
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: kubebird-controller-manager
+      terminationGracePeriodSeconds: 10
+      volumes: []
