@@ -147,7 +147,12 @@ func generateRandomPassword() (string, error) {
 // databases.conf file registering one alias per database in
 // instance.Spec.Databases, so clients can connect using the alias
 // instead of the in-pod filesystem path. Uses db.Alias if set, otherwise
-// falls back to the database's own name.
+// falls back to the database's own name. It also registers a security.db
+// alias for the instance's security database, since mounting this file
+// over the image's own databases.conf (see aliasesMountPath) would
+// otherwise drop the image's default one; RemoteAccess is disabled on it
+// so it's only reachable through the embedded/local connection Kubebird
+// itself uses (see reconcileSysdbaPassword).
 func (r *InstanceReconciler) mutateAliasesConfigMap(cm *corev1.ConfigMap, instance *kubebirdv1.Instance) error {
 	cm.Labels = labelsForInstance(instance.Name)
 
@@ -159,6 +164,8 @@ func (r *InstanceReconciler) mutateAliasesConfigMap(cm *corev1.ConfigMap, instan
 		}
 		fmt.Fprintf(&b, "%s = %s\n", alias, path.Join(primaryDataMountPath, db.Name))
 	}
+	fmt.Fprintf(&b, "security.db = $(dir_secDb)/%s\n{\n\tRemoteAccess = false\n\tDefaultDbCachePages = 50\n}\n",
+		securityDatabaseFileName(instance))
 	cm.Data = map[string]string{aliasesConfigMapKey: b.String()}
 
 	return controllerutil.SetControllerReference(instance, cm, r.Scheme)

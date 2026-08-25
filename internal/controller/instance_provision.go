@@ -139,11 +139,18 @@ func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instan
 // database matching the instance's Firebird major version, e.g.
 // "/usr/local/firebird/security3.fdb" for version "3.0.14".
 func securityDatabasePath(instance *kubebirdv1.Instance) string {
+	return path.Join(securityDatabaseDir, securityDatabaseFileName(instance))
+}
+
+// securityDatabaseFileName returns the security database's file name for
+// the instance's Firebird major version, e.g. "security3.fdb" for version
+// "3.0.14".
+func securityDatabaseFileName(instance *kubebirdv1.Instance) string {
 	major, _, _ := strings.Cut(instance.Spec.Version, ".")
 	if major == "" {
 		major = "4"
 	}
-	return path.Join(securityDatabaseDir, fmt.Sprintf("security%s.fdb", major))
+	return fmt.Sprintf("security%s.fdb", major)
 }
 
 // sha256Hex returns the hex-encoded SHA-256 digest of s.

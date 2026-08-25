@@ -128,6 +128,10 @@ var _ = Describe("Instance Controller", func() {
 			Expect(k8sClient.Get(ctx, aliasesConfigMapNameNN, cm)).To(Succeed())
 			Expect(cm.Data["databases.conf"]).To(ContainSubstring("instance.fdb = /var/lib/firebird/data/instance.fdb"))
 
+			By("also registering the security database alias, since it mounts over the image's own databases.conf")
+			Expect(cm.Data["databases.conf"]).To(ContainSubstring("security.db = $(dir_secDb)/security3.fdb"))
+			Expect(cm.Data["databases.conf"]).To(ContainSubstring("RemoteAccess = false"))
+
 			By("creating the Service exposing the instance")
 			svc := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, svc)).To(Succeed())
