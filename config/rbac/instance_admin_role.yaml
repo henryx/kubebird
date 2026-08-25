@@ -9,7 +9,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   labels:
-    app.kubernetes.io/name: kubebuilder
+    app.kubernetes.io/name: kubebird
     app.kubernetes.io/managed-by: kustomize
   name: instance-admin-role
 rules:

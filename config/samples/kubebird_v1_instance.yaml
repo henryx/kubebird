@@ -2,7 +2,7 @@ apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
   labels:
-    app.kubernetes.io/name: kubebuilder
+    app.kubernetes.io/name: kubebird
     app.kubernetes.io/managed-by: kustomize
   name: instance-sample
 spec:

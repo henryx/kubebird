@@ -68,14 +68,14 @@ type InstanceReconciler struct {
 	ClientSet  kubernetes.Interface
 }
 
-// +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebuilder-system,resources=instances,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebuilder-system,resources=instances/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebuilder-system,resources=instances/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,namespace=kubebuilder-system,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",namespace=kubebuilder-system,resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",namespace=kubebuilder-system,resources=secrets,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",namespace=kubebuilder-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",namespace=kubebuilder-system,resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebird-system,resources=instances,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebird-system,resources=instances/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebird-system,resources=instances/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,namespace=kubebird-system,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=secrets,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods/exec,verbs=create
 
 // Reconcile drives the cluster state for an Instance towards the desired
 // state: a Secret-backed StatefulSet running Firebird, a Service exposing
