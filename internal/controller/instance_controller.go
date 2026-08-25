@@ -83,6 +83,7 @@ type InstanceReconciler struct {
 // +kubebuilder:rbac:groups=apps,namespace=kubebird-system,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=secrets,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=persistentvolumeclaims,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods/exec,verbs=create
 
@@ -137,6 +138,10 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 		return r.mutateService(svc, instance)
 	}); err != nil {
 		return fmt.Errorf("failed to reconcile Service: %w", err)
+	}
+
+	if err := r.reconcilePVCs(ctx, instance); err != nil {
+		return err
 	}
 
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace}}

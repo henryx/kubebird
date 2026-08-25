@@ -92,6 +92,70 @@ func aliasesConfigMapName(instance *kubebirdv1.Instance) string {
 	return instance.Name + "-aliases"
 }
 
+// primaryPVCName returns the name of the PVC backing the instance's
+// primary data.
+func primaryPVCName(instance *kubebirdv1.Instance) string {
+	return instance.Name + "-" + primaryVolumeName
+}
+
+// shadowPVCName returns the name of the PVC backing the instance's
+// shadow databases.
+func shadowPVCName(instance *kubebirdv1.Instance) string {
+	return instance.Name + "-" + shadowVolumeName
+}
+
+// reconcilePVCs ensures the PVCs backing instance.Spec.Storage exist,
+// creating any that are missing.
+func (r *InstanceReconciler) reconcilePVCs(ctx context.Context, instance *kubebirdv1.Instance) error {
+	if err := r.reconcilePVC(ctx, instance, primaryPVCName(instance), instance.Spec.Storage.Primary); err != nil {
+		return fmt.Errorf("failed to reconcile primary PVC: %w", err)
+	}
+	if instance.Spec.Storage.Shadow != nil {
+		if err := r.reconcilePVC(ctx, instance, shadowPVCName(instance), *instance.Spec.Storage.Shadow); err != nil {
+			return fmt.Errorf("failed to reconcile shadow PVC: %w", err)
+		}
+	}
+	return nil
+}
+
+// reconcilePVC ensures a single PVC exists, creating it from vol when it
+// doesn't. Like a StatefulSet's own volumeClaimTemplates, size and
+// storage class are only applied at creation time: an existing PVC is
+// left untouched. Unlike a StatefulSet's own PVCs, it isn't
+// owner-referenced to the Instance, so its data survives the Instance
+// being deleted (see reconcileDeletion).
+func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebirdv1.Instance, name string, vol kubebirdv1.StorageVolumeSpec) error {
+	nsName := types.NamespacedName{Name: name, Namespace: instance.Namespace}
+	if err := r.Get(ctx, nsName, &corev1.PersistentVolumeClaim{}); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get PVC %q: %w", name, err)
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: instance.Namespace,
+			Labels:    labelsForInstance(instance.Name),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: vol.Size},
+			},
+		},
+	}
+	if vol.Class != "" {
+		pvc.Spec.StorageClassName = &vol.Class
+	}
+
+	if err := r.Create(ctx, pvc); err != nil {
+		return fmt.Errorf("failed to create PVC %q: %w", name, err)
+	}
+	logf.FromContext(ctx).Info("Created PVC", "name", name)
+	return nil
+}
+
 // reconcileSysdbaSecret ensures the Secret backing spec.authentication.sysdba
 // exists, creating it with a freshly generated random password when it does
 // not. An existing Secret, whether created by a previous reconcile or
@@ -200,15 +264,14 @@ func (r *InstanceReconciler) mutateService(svc *corev1.Service, instance *kubebi
 }
 
 // mutateStatefulSet applies the desired spec to the StatefulSet running
-// the Firebird server. Fields that are immutable after creation
-// (selector, volumeClaimTemplates) are only set the first time.
+// the Firebird server. The selector is immutable after creation, so it's
+// only set the first time.
 func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance *kubebirdv1.Instance) error {
 	labels := labelsForInstance(instance.Name)
 	replicas := int32(1)
 
 	if sts.CreationTimestamp.IsZero() {
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
-		sts.Spec.VolumeClaimTemplates = volumeClaimTemplates(instance)
 	}
 
 	sts.Labels = labels
@@ -238,6 +301,12 @@ func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance
 	}
 	sts.Spec.Template.Spec.Volumes = []corev1.Volume{
 		{
+			Name: primaryVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: primaryPVCName(instance)},
+			},
+		},
+		{
 			Name: aliasesVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -245,6 +314,14 @@ func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance
 				},
 			},
 		},
+	}
+	if instance.Spec.Storage.Shadow != nil {
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: shadowVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: shadowPVCName(instance)},
+			},
+		})
 	}
 
 	return controllerutil.SetControllerReference(instance, sts, r.Scheme)
@@ -264,30 +341,4 @@ func volumeMounts(instance *kubebirdv1.Instance) []corev1.VolumeMount {
 		mounts = append(mounts, corev1.VolumeMount{Name: shadowVolumeName, MountPath: shadowDataMountPath})
 	}
 	return mounts
-}
-
-func volumeClaimTemplates(instance *kubebirdv1.Instance) []corev1.PersistentVolumeClaim {
-	templates := []corev1.PersistentVolumeClaim{
-		volumeClaimTemplate(primaryVolumeName, instance.Spec.Storage.Primary, labelsForInstance(instance.Name)),
-	}
-	if instance.Spec.Storage.Shadow != nil {
-		templates = append(templates, volumeClaimTemplate(shadowVolumeName, *instance.Spec.Storage.Shadow, labelsForInstance(instance.Name)))
-	}
-	return templates
-}
-
-func volumeClaimTemplate(name string, vol kubebirdv1.StorageVolumeSpec, labels map[string]string) corev1.PersistentVolumeClaim {
-	pvc := corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceStorage: vol.Size},
-			},
-		},
-	}
-	if vol.Class != "" {
-		pvc.Spec.StorageClassName = &vol.Class
-	}
-	return pvc
 }

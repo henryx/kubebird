@@ -33,11 +33,13 @@ import (
 )
 
 const (
-	instanceName          = "e2e-instance"
-	instanceSecretName    = instanceName + "-sysdba"
-	instanceAliasesCMName = instanceName + "-aliases"
-	instanceAliasName     = "enforced"
-	firebirdContainer     = "firebird"
+	instanceName           = "e2e-instance"
+	instanceSecretName     = instanceName + "-sysdba"
+	instanceAliasesCMName  = instanceName + "-aliases"
+	instancePrimaryPVCName = instanceName + "-primary"
+	instanceShadowPVCName  = instanceName + "-shadow"
+	instanceAliasName      = "enforced"
+	firebirdContainer      = "firebird"
 )
 
 // instanceLifecycleSpecs exercises the full Instance lifecycle against a
@@ -130,6 +132,14 @@ spec:
 				g.Expect(output).To(ContainSubstring("instance.fdb = /var/lib/firebird/data/instance.fdb"))
 				g.Expect(output).To(ContainSubstring(instanceAliasName + " = /var/lib/firebird/data/shadowed.fdb"))
 			}).Should(Succeed())
+
+			By("creating PVCs named <instance>-primary and <instance>-shadow")
+			cmd = exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
 
 			By("exposing the instance on a ClusterIP Service")
 			cmd = exec.Command("kubectl", "get", "service", instanceName, "-n", namespace,
@@ -252,6 +262,14 @@ spec:
 					g.Expect(err).To(HaveOccurred(), fmt.Sprintf("%s/%s should have been garbage collected", kind, name))
 				}, 2*time.Minute, 2*time.Second).Should(Succeed())
 			}
+
+			By("keeping the primary and shadow PVCs, since they aren't owned by the Instance")
+			cmd = exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 }

@@ -139,12 +139,31 @@ var _ = Describe("Instance Controller", func() {
 			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(3050)))
 			Expect(svc.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
 
+			By("creating a PVC named <instance>-primary for the primary data")
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-primary", Namespace: resourceNamespace}, pvc)).To(Succeed())
+			Expect(pvc.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(apiresource.MustParse("3Gi")))
+			Expect(pvc.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+			Expect(pvc.OwnerReferences).To(BeEmpty(), "the PVC must not be owned by the Instance, so its data survives deletion")
+
 			By("creating the StatefulSet running Firebird")
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
 			Expect(sts.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+
+			By("mounting the primary PVC by name rather than via a volumeClaimTemplate")
+			Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+			var primaryVolume *corev1.Volume
+			for i := range sts.Spec.Template.Spec.Volumes {
+				if sts.Spec.Template.Spec.Volumes[i].Name == "primary" {
+					primaryVolume = &sts.Spec.Template.Spec.Volumes[i]
+				}
+			}
+			Expect(primaryVolume).NotTo(BeNil())
+			Expect(primaryVolume.PersistentVolumeClaim).NotTo(BeNil())
+			Expect(primaryVolume.PersistentVolumeClaim.ClaimName).To(Equal(resourceName + "-primary"))
 
 			By("marking the instance as not yet Available")
 			updated := &kubebirdv1.Instance{}
