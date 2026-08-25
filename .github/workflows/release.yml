@@ -1,0 +1,56 @@
+name: Release
+
+# Triggered by pushing a semver tag (e.g. "0.2.0"). Builds the manager
+# image, pushes it to quay.io tagged with both the release version and
+# "latest", then publishes a GitHub Release with the consolidated
+# CRD+RBAC+Deployment manifest (dist/install.yaml) attached.
+#
+# Requires these repository secrets:
+#   QUAY_USERNAME - quay.io robot account (or user) name
+#   QUAY_PASSWORD - quay.io robot account token (or password)
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    name: Build, push image and publish release manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to quay.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and push the versioned image
+        run: make docker-build docker-push IMG=quay.io/kubebird/controller:${{ github.ref_name }}
+
+      - name: Build and push the latest image
+        run: make docker-build docker-push IMG=quay.io/kubebird/controller:latest
+
+      - name: Generate the release install manifest
+        run: make build-installer IMG=quay.io/kubebird/controller:${{ github.ref_name }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/install.yaml
+          generate_release_notes: true
