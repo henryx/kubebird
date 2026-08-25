@@ -23,8 +23,14 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.error
-      name: Error
+    - jsonPath: .spec.version
+      name: Version
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .status.message
+      name: Message
       type: string
     name: v1
     schema:
@@ -283,10 +289,20 @@ spec:
                   any. Cleared automatically once the Instance reconciles
                   successfully again.
                 type: string
+              message:
+                description: |-
+                  message is a human-readable summary of the Instance's current
+                  state: the reconcile error when the last reconcile failed,
+                  otherwise a description of what phase it's in (e.g. why it isn't
+                  Ready yet).
+                type: string
               phase:
                 description: |-
-                  phase is a high-level summary of the Instance's lifecycle state,
-                  e.g. "Deleting" while owned resources are being garbage collected.
+                  phase is a high-level summary of the Instance's lifecycle state:
+                  "Provisioning" while the StatefulSet or its databases aren't ready
+                  yet, "Ready" once the pod is ready and every database in
+                  spec.databases has been created, or "Deleting" while owned
+                  resources are being garbage collected.
                 type: string
               sysdbaPasswordHash:
                 description: |-

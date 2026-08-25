@@ -53,6 +53,15 @@ const secretRefIndexField = ".spec.authentication.sysdba.secretRef"
 // garbage collected.
 const finalizerName = "kubebird.github.io/finalizer"
 
+// phaseProvisioning is the value Reconcile reports in status.phase while
+// the StatefulSet or its databases aren't ready yet.
+const phaseProvisioning = "Provisioning"
+
+// phaseReady is the value Reconcile reports in status.phase once the
+// StatefulSet pod is ready and every database in spec.databases has been
+// created.
+const phaseReady = "Ready"
+
 // phaseDeleting is the value Reconcile reports in status.phase while an
 // Instance's owned resources are being garbage collected.
 const phaseDeleting = "Deleting"
@@ -145,9 +154,15 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 		return err
 	}
 
-	if sts.Status.ReadyReplicas > 0 {
+	if sts.Status.ReadyReplicas > 0 && len(instance.Status.Databases) >= len(instance.Spec.Databases) {
+		if err := r.setPhase(ctx, instance, phaseReady); err != nil {
+			return err
+		}
 		return r.setAvailable(ctx, instance, metav1.ConditionTrue,
 			"StatefulSetReady", "Firebird instance is ready")
+	}
+	if err := r.setPhase(ctx, instance, phaseProvisioning); err != nil {
+		return err
 	}
 	return r.setAvailable(ctx, instance, metav1.ConditionFalse,
 		"StatefulSetNotReady", "Waiting for the Firebird StatefulSet to become ready")
@@ -164,11 +179,8 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 
 	logf.FromContext(ctx).Info("Deleting Instance", "name", instance.Name)
 
-	if instance.Status.Phase != phaseDeleting {
-		instance.Status.Phase = phaseDeleting
-		if err := r.Status().Update(ctx, instance); err != nil {
-			return fmt.Errorf("failed to report Deleting phase: %w", err)
-		}
+	if err := r.setPhase(ctx, instance, phaseDeleting); err != nil {
+		return fmt.Errorf("failed to report Deleting phase: %w", err)
 	}
 
 	controllerutil.RemoveFinalizer(instance, finalizerName)
@@ -179,17 +191,38 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 }
 
 // setError records the message from the most recent reconcile failure in
-// status.error, clearing it once Reconcile succeeds again. It skips the
-// status write when nothing changed.
+// status.error, clearing it once Reconcile succeeds again, and mirrors a
+// human-readable summary into status.message: the error itself when set,
+// otherwise the Available condition's message. It skips the status write
+// when nothing changed.
 func (r *InstanceReconciler) setError(ctx context.Context, instance *kubebirdv1.Instance, reconcileErr error) error {
 	message := ""
 	if reconcileErr != nil {
 		message = reconcileErr.Error()
 	}
-	if instance.Status.Error == message {
+
+	summary := message
+	if summary == "" {
+		if cond := apimeta.FindStatusCondition(instance.Status.Conditions, conditionTypeAvailable); cond != nil {
+			summary = cond.Message
+		}
+	}
+
+	if instance.Status.Error == message && instance.Status.Message == summary {
 		return nil
 	}
 	instance.Status.Error = message
+	instance.Status.Message = summary
+	return r.Status().Update(ctx, instance)
+}
+
+// setPhase records instance's high-level lifecycle phase, skipping the
+// status write when nothing changed.
+func (r *InstanceReconciler) setPhase(ctx context.Context, instance *kubebirdv1.Instance, phase string) error {
+	if instance.Status.Phase == phase {
+		return nil
+	}
+	instance.Status.Phase = phase
 	return r.Status().Update(ctx, instance)
 }
 

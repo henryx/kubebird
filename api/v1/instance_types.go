@@ -182,8 +182,11 @@ type InstanceStatus struct {
 	// +optional
 	SysdbaPasswordHash string `json:"sysdbaPasswordHash,omitempty"`
 
-	// phase is a high-level summary of the Instance's lifecycle state,
-	// e.g. "Deleting" while owned resources are being garbage collected.
+	// phase is a high-level summary of the Instance's lifecycle state:
+	// "Provisioning" while the StatefulSet or its databases aren't ready
+	// yet, "Ready" once the pod is ready and every database in
+	// spec.databases has been created, or "Deleting" while owned
+	// resources are being garbage collected.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -192,11 +195,20 @@ type InstanceStatus struct {
 	// successfully again.
 	// +optional
 	Error string `json:"error,omitempty"`
+
+	// message is a human-readable summary of the Instance's current
+	// state: the reconcile error when the last reconcile failed,
+	// otherwise a description of what phase it's in (e.g. why it isn't
+	// Ready yet).
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Error",type=string,JSONPath=".status.error"
+// +kubebuilder:printcolumn:name="Version",type=string,JSONPath=".spec.version"
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Message",type=string,JSONPath=".status.message"
 
 // Instance is the Schema for the instances API
 type Instance struct {

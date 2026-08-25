@@ -149,11 +149,17 @@ var _ = Describe("Instance Controller", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 
+			By("reporting the Provisioning phase, since the StatefulSet pod isn't ready")
+			Expect(updated.Status.Phase).To(Equal("Provisioning"))
+
 			By("not yet provisioning any database, since the StatefulSet pod isn't ready")
 			Expect(updated.Status.Databases).To(BeEmpty())
 
 			By("not reporting any reconcile error")
 			Expect(updated.Status.Error).To(BeEmpty())
+
+			By("mirroring the Available condition's message into status.message")
+			Expect(updated.Status.Message).To(Equal("Waiting for the Firebird StatefulSet to become ready"))
 
 			By("adding the finalizer so deletion can be observed")
 			Expect(updated.Finalizers).To(ContainElement(finalizerName))
