@@ -3,6 +3,26 @@
 ## Overview
 [Kubebird](https://github.com/henryx/kubebird) is a Kubernetes operator based on kubebuilder to install and manage [Firebird RDBMS](https://firebirdsql.org/) instances
 
+## Installation
+
+Tagging the repository with a semver tag (e.g. `0.2.0`) triggers the `Release` GitHub Actions
+workflow, which builds and pushes the manager image to `quay.io/kubebird/controller` (tagged with
+both the release version and `latest`) and publishes a GitHub Release with a consolidated
+`install.yaml` (CRD + RBAC + Deployment) attached.
+
+Install the latest release directly:
+
+```bash
+kubectl apply -f https://github.com/henryx/kubebird/releases/latest/download/install.yaml
+```
+
+This deploys the operator into the `kubebird-system` namespace. The manager requires a
+`WATCH_NAMESPACE` env var (set on the Deployment) naming the namespace, or comma-separated list of
+namespaces, whose `Instance` resources it should reconcile.
+
+To build the manifest yourself instead: `make build-installer IMG=<your-registry>/controller:<tag>`
+produces the same consolidated YAML at `dist/install.yaml`.
+
 ## Architecture
 Project uses the namespaced CR `Instances` that defines Firebird instance.
 
