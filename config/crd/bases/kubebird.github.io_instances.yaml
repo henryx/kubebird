@@ -21,6 +21,9 @@ spec:
     - jsonPath: .status.phase
       name: Status
       type: string
+    - jsonPath: .status.databaseCount
+      name: Databases
+      type: integer
     - jsonPath: .status.message
       name: Message
       type: string
@@ -267,6 +270,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              databaseCount:
+                description: |-
+                  databaseCount is the number of databases currently managed by the
+                  instance, i.e. len(databases).
+                format: int32
+                type: integer
               databases:
                 description: |-
                   databases lists the databases from spec.databases that have

@@ -177,6 +177,7 @@ var _ = Describe("Instance Controller", func() {
 
 			By("not yet provisioning any database, since the StatefulSet pod isn't ready")
 			Expect(updated.Status.Databases).To(BeEmpty())
+			Expect(updated.Status.DatabaseCount).To(Equal(int32(0)))
 
 			By("not reporting any reconcile error")
 			Expect(updated.Status.Error).To(BeEmpty())

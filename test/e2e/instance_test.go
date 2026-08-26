@@ -169,6 +169,10 @@ spec:
 				names, err := getInstanceDatabases()
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(names).To(ConsistOf("instance.fdb", "shadowed.fdb"))
+
+				count, err := getInstanceDatabaseCount()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(count).To(Equal("2"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("not reporting any reconcile error")
@@ -207,6 +211,10 @@ spec:
 				names, err := getInstanceDatabases()
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(names).To(ConsistOf("instance.fdb", "shadowed.fdb", "added.fdb"))
+
+				count, err := getInstanceDatabaseCount()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(count).To(Equal("3"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("not restarting the pod to do so")
@@ -237,6 +245,10 @@ spec:
 				names, err := getInstanceDatabases()
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(names).To(ConsistOf("instance.fdb", "shadowed.fdb"))
+
+				count, err := getInstanceDatabaseCount()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(count).To(Equal("2"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("removing its alias from the aliases ConfigMap")
@@ -356,6 +368,13 @@ func getInstanceDatabases() ([]string, error) {
 		return nil, err
 	}
 	return strings.Fields(output), nil
+}
+
+// getInstanceDatabaseCount returns the e2e Instance's status.databaseCount.
+func getInstanceDatabaseCount() (string, error) {
+	cmd := exec.Command("kubectl", "get", "instance", instanceName, "-n", namespace,
+		"-o", "jsonpath={.status.databaseCount}")
+	return utils.Run(cmd)
 }
 
 // getPodStartTime returns the e2e Instance pod's start time, used to prove

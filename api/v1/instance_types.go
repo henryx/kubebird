@@ -176,6 +176,11 @@ type InstanceStatus struct {
 	// +optional
 	Databases []string `json:"databases,omitempty"`
 
+	// databaseCount is the number of databases currently managed by the
+	// instance, i.e. len(databases).
+	// +optional
+	DatabaseCount int32 `json:"databaseCount"`
+
 	// sysdbaPasswordHash is a hash of the SYSDBA password Kubebird last
 	// applied to the live server, used to detect when the referenced
 	// Secret's password has been rotated.
@@ -208,6 +213,7 @@ type InstanceStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=".spec.version"
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Databases",type=integer,JSONPath=".status.databaseCount"
 // +kubebuilder:printcolumn:name="Message",type=string,JSONPath=".status.message"
 
 // Instance is the Schema for the instances API
