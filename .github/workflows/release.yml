@@ -41,13 +41,13 @@ jobs:
           password: ${{ secrets.QUAY_PASSWORD }}
 
       - name: Build and push the versioned image
-        run: make docker-build docker-push IMG=quay.io/kubebird/controller:${{ github.ref_name }}
+        run: make docker-build docker-push IMG=quay.io/kubebird/operator:${{ github.ref_name }}
 
       - name: Build and push the latest image
-        run: make docker-build docker-push IMG=quay.io/kubebird/controller:latest
+        run: make docker-build docker-push IMG=quay.io/kubebird/operator:latest
 
       - name: Generate the release install manifest
-        run: make build-installer IMG=quay.io/kubebird/controller:${{ github.ref_name }}
+        run: make build-installer IMG=quay.io/kubebird/operator:${{ github.ref_name }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

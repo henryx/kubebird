@@ -37,7 +37,7 @@ its spec shape are unchanged; this section tracks where the implementation diffe
   `deploy/operator.yaml`; `make build-installer` emits a consolidated `dist/install.yaml`.
 - GitHub Actions workflows split into `lint.yml`, `test.yml` (envtest/Ginkgo), `test-e2e.yml`
   (against a Kind cluster), and `release.yml` (triggered by pushing a semver tag, publishing to
-  `quay.io/kubebird/controller` and attaching `install.yaml` to a GitHub Release).
+  `quay.io/kubebird/operator` and attaching `install.yaml` to a GitHub Release).
 - Manager configuration moved from `NAMESPACE`/`LOG_LEVEL` environment variables to a required
   `WATCH_NAMESPACE` environment variable (single or comma-separated namespaces) plus standard
   `controller-runtime` flags (e.g. `--zap-log-level`) for logging.

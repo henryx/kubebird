@@ -6,7 +6,7 @@
 ## Installation
 
 Tagging the repository with a semver tag (e.g. `0.2.0`) triggers the `Release` GitHub Actions
-workflow, which builds and pushes the manager image to `quay.io/kubebird/controller` (tagged with
+workflow, which builds and pushes the manager image to `quay.io/kubebird/operator` (tagged with
 both the release version and `latest`) and publishes a GitHub Release with a consolidated
 `install.yaml` (CRD + RBAC + Deployment) attached.
 
