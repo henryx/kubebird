@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -282,6 +283,16 @@ func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance
 		{
 			Name:  containerName,
 			Image: fmt.Sprintf("%s:%s", instance.Spec.Image, instance.Spec.Version),
+			// firebirdsql/firebird's entrypoint needs root's full DAC override (e.g. to
+			// remove /opt/firebird/SYSDBA.password, and to write into /tmp/firebird,
+			// both owned by the image's own "firebird" user) whenever FIREBIRD_ROOT_PASSWORD
+			// is set, which Kubebird always does. So RunAsNonRoot is left unset and
+			// Capabilities aren't dropped; this satisfies the "baseline" Pod Security
+			// Standard, not "restricted".
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
 			Ports: []corev1.ContainerPort{
 				{Name: containerName, ContainerPort: firebirdPort},
 			},

@@ -49,19 +49,25 @@ var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
 	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
+	// enforcing the baseline security policy on the namespace, installing CRDs,
 	// and deploying the controller.
+	//
+	// This namespace hosts both the manager and every Instance's Firebird pod, and
+	// the latter can't satisfy "restricted" (e.g. RunAsNonRoot): the firebirdsql/firebird
+	// image's entrypoint needs root's full DAC override whenever Kubebird sets
+	// FIREBIRD_ROOT_PASSWORD, which it always does. See instance_resources.go's
+	// mutateStatefulSet for the SecurityContext this pod actually satisfies.
 	BeforeAll(func() {
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
-		By("labeling the namespace to enforce the restricted security policy")
+		By("labeling the namespace to enforce the baseline security policy")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
+			"pod-security.kubernetes.io/enforce=baseline")
 		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with baseline policy")
 
 		By("installing CRDs")
 		cmd = exec.Command("make", "install")
