@@ -1,0 +1,43 @@
+name: Dev image
+
+# Triggered by pushing to main. Builds the manager image and pushes it to
+# quay.io tagged "dev", giving a rolling image that tracks main without
+# cutting a versioned release or GitHub Release.
+#
+# Requires these repository secrets:
+#   QUAY_USERNAME - quay.io robot account (or user) name
+#   QUAY_PASSWORD - quay.io robot account token (or password)
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  dev-image:
+    permissions:
+      contents: read
+    name: Build and push dev image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to quay.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and push the dev image
+        run: make docker-build docker-push IMG=quay.io/kubebird/operator:dev
