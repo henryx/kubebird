@@ -5,6 +5,15 @@
 
 ## Installation
 
+### Prerequisites
+
+- A Kubernetes cluster you have `cluster-admin` on (needed to install the CRD and RBAC).
+- `kubectl`, configured against that cluster.
+- To build from source: Go (see `go.mod` for the required version), `make`, and a container tool
+  (Docker or podman) if you also want to build/push your own manager image.
+
+### From the latest release
+
 Tagging the repository with a semver tag (e.g. `0.2.0`) triggers the `Release` GitHub Actions
 workflow, which builds and pushes the manager image to `quay.io/kubebird/operator` (tagged with
 both the release version and `latest`) and publishes a GitHub Release with a consolidated
@@ -18,10 +27,45 @@ kubectl apply -f https://github.com/henryx/kubebird/releases/latest/download/ins
 
 This deploys the operator into the `kubebird-system` namespace. The manager requires a
 `WATCH_NAMESPACE` env var (set on the Deployment) naming the namespace, or comma-separated list of
-namespaces, whose `Instance` resources it should reconcile.
+namespaces, whose `Instance` resources it should reconcile. Edit the Deployment's env after
+applying, or edit `config/manager/manager.yaml` before building your own manifest, to change it.
 
-To build the manifest yourself instead: `make build-installer IMG=<your-registry>/controller:<tag>`
-produces the same consolidated YAML at `dist/install.yaml`.
+Uninstall by deleting the same manifest (this also removes the CRD, and with it every `Instance`
+resource cluster-wide):
+
+```bash
+kubectl delete -f https://github.com/henryx/kubebird/releases/latest/download/install.yaml
+```
+
+### From source
+
+Clone the repository, then either build a consolidated manifest yourself:
+
+```bash
+make build-installer IMG=<your-registry>/operator:<tag>
+kubectl apply -f dist/install.yaml
+```
+
+or deploy directly against the cluster in your current `~/.kube/config` context:
+
+```bash
+make deploy IMG=<your-registry>/operator:<tag>
+```
+
+`IMG` defaults to `quay.io/kubebird/operator:latest` if omitted, so if you haven't built and pushed
+your own image, set it to a registry you control (`make docker-build docker-push IMG=...`) first.
+`make deploy` runs `make manifests` first, so it always installs the CRD matching your checked-out
+code.
+
+To install just the CRD, without the operator itself (useful when running the manager locally via
+`make run`):
+
+```bash
+make install
+```
+
+Tear down what you deployed with the matching target: `make undeploy` for `make deploy`, or
+`make uninstall` for `make install` (both accept `ignore-not-found=true`).
 
 ## Architecture
 Project uses the namespaced CR `Instances` that defines Firebird instance.
