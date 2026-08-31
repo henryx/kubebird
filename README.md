@@ -37,6 +37,20 @@ resource cluster-wide):
 kubectl delete -f https://github.com/henryx/kubebird/releases/latest/download/install.yaml
 ```
 
+Both the release and the `dev` build below only publish once lint, unit/envtest, and e2e tests all
+pass on the triggering commit.
+
+### Development builds
+
+Every push to `main` also publishes `quay.io/kubebird/operator:dev`, a rolling image for trying
+out unreleased changes. It's not attached to a versioned tag or a GitHub Release, so build your
+own manifest against it:
+
+```bash
+make build-installer IMG=quay.io/kubebird/operator:dev
+kubectl apply -f dist/install.yaml
+```
+
 ### From source
 
 Clone the repository, then either build a consolidated manifest yourself:
@@ -179,3 +193,7 @@ yourself once you're sure you no longer need the data:
 ```bash
 kubectl delete pvc -l kubebird.github.io/instance=<name>
 ```
+
+## License
+
+Kubebird is licensed under the [Apache License 2.0](LICENSE).

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 Rewrite of the operator from Python/`kopf` to Go, scaffolded with Kubebuilder v4
 (`go.kubebuilder.io/v4`, single-group layout). The `Instance` CRD (`kubebird.github.io/v1`) and
@@ -38,6 +38,17 @@ its spec shape are unchanged; this section tracks where the implementation diffe
 - GitHub Actions workflows split into `lint.yml`, `test.yml` (envtest/Ginkgo), `test-e2e.yml`
   (against a Kind cluster), and `release.yml` (triggered by pushing a semver tag, publishing to
   `quay.io/kubebird/operator` and attaching `install.yaml` to a GitHub Release).
+- `dev-image.yml` builds and pushes `quay.io/kubebird/operator:dev` on every push to `main`,
+  giving a rolling image that tracks `main` without cutting a versioned release or GitHub
+  Release.
+- `release.yml` and `dev-image.yml` both call `lint.yml`, `test.yml`, and `test-e2e.yml` as
+  reusable workflows and gate their build/publish job on all three succeeding
+  (`needs: [lint, test, test-e2e]`), so a tag or `main` push that fails lint, tests, or e2e
+  tests never reaches `quay.io` or cuts a release.
+- The `firebird` container sets `allowPrivilegeEscalation: false` and a `RuntimeDefault` seccomp
+  profile, satisfying the `baseline` Pod Security Standard (it still runs as root, since the
+  `firebirdsql/firebird` entrypoint needs full DAC override whenever `FIREBIRD_ROOT_PASSWORD` is
+  set, which Kubebird always does — so it cannot satisfy `restricted`).
 - Manager configuration moved from `NAMESPACE`/`LOG_LEVEL` environment variables to a required
   `WATCH_NAMESPACE` environment variable (single or comma-separated namespaces) plus standard
   `controller-runtime` flags (e.g. `--zap-log-level`) for logging.
