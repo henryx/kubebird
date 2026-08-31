@@ -1,8 +1,9 @@
 name: Dev image
 
-# Triggered by pushing to main. Builds the manager image and pushes it to
-# quay.io tagged "dev", giving a rolling image that tracks main without
-# cutting a versioned release or GitHub Release.
+# Triggered by pushing to main. Runs the Lint, Tests and E2E Tests workflows
+# first and only proceeds if all of them pass, then builds the manager image
+# and pushes it to quay.io tagged "dev", giving a rolling image that tracks
+# main without cutting a versioned release or GitHub Release.
 #
 # Requires these repository secrets:
 #   QUAY_USERNAME - quay.io robot account (or user) name
@@ -16,7 +17,23 @@ on:
 permissions: {}
 
 jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+    permissions:
+      contents: read
+
+  test:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  test-e2e:
+    uses: ./.github/workflows/test-e2e.yml
+    permissions:
+      contents: read
+
   dev-image:
+    needs: [lint, test, test-e2e]
     permissions:
       contents: read
     name: Build and push dev image

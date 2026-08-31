@@ -1,9 +1,10 @@
 name: Release
 
-# Triggered by pushing a semver tag (e.g. "0.2.0"). Builds the manager
-# image, pushes it to quay.io tagged with both the release version and
-# "latest", then publishes a GitHub Release with the consolidated
-# CRD+RBAC+Deployment manifest (dist/install.yaml) attached.
+# Triggered by pushing a semver tag (e.g. "0.2.0"). Runs the Lint, Tests and
+# E2E Tests workflows first and only proceeds if all of them pass, then
+# builds the manager image, pushes it to quay.io tagged with both the
+# release version and "latest", and publishes a GitHub Release with the
+# consolidated CRD+RBAC+Deployment manifest (dist/install.yaml) attached.
 #
 # Requires these repository secrets:
 #   QUAY_USERNAME - quay.io robot account (or user) name
@@ -17,7 +18,23 @@ on:
 permissions: {}
 
 jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+    permissions:
+      contents: read
+
+  test:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  test-e2e:
+    uses: ./.github/workflows/test-e2e.yml
+    permissions:
+      contents: read
+
   release:
+    needs: [lint, test, test-e2e]
     permissions:
       contents: write
     name: Build, push image and publish release manifest
