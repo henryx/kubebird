@@ -283,6 +283,12 @@ var _ = Describe("Manager", Ordered, func() {
 		// to a running Instance, live SYSDBA password rotation, and
 		// cleanup on deletion.
 		instanceLifecycleSpecs()
+
+		// instancePVCReuseSpecs (test/e2e/instance_test.go) exercises
+		// reusing a primary PVC left behind by an earlier Instance of the
+		// same name: the database file on it must be registered, not
+		// recreated.
+		instancePVCReuseSpecs()
 	})
 })
 

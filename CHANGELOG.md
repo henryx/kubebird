@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `storage.backup`: an optional PVC (`<instance-name>-backup`), mounted into the pod at
+  `/var/lib/firebird/backup`, for staging backups. Like the primary/shadow PVCs, it is never
+  owner-referenced to the `Instance`.
+- Deleting an `Instance` with `storage.backup` configured now backs up every database in
+  `status.databases` into a subdirectory of the backup volume dedicated to that `Instance`
+  (`<mount>/<instance-name>/<database>.fbk`, via `gbak -backup -verify`) before removing its
+  finalizer, then releases the primary and shadow PVCs (deleting them outright, unlike the
+  default behavior of leaving all storage in place) — the backup PVC itself is left untouched.
+  The dedicated per-instance subdirectory keeps backups from different `Instance`s, or from
+  successive generations of one reusing the same backup PVC, from colliding.
+
+### Fixed
+
+- Reusing a primary PVC left behind by an earlier `Instance` of the same name (PVCs are never
+  owner-referenced, so a later `Instance` reusing the name reuses the PVC too) no longer fails:
+  `reconcileDatabases` now checks whether a pending database's file already exists on it before
+  running `CREATE DATABASE`, and just registers it into `status.databases` — alongside its
+  already-unconditional `databases.conf` alias — instead of re-creating (and risking clobbering)
+  it.
+
 ## 0.2.0
 
 Rewrite of the operator from Python/`kopf` to Go, scaffolded with Kubebuilder v4

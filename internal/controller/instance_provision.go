@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
+	utilexec "k8s.io/client-go/util/exec"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
@@ -103,6 +105,21 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 
 	for _, db := range pending {
+		// The primary PVC isn't owner-referenced, so it can survive an
+		// Instance's deletion and be reused by a later Instance with the
+		// same name (see reconcilePVC) — in which case this database's
+		// file may already exist on it. CREATE DATABASE would fail (or,
+		// via the Go driver, silently overwrite it) against an existing
+		// file, so check first and just register it if it's already
+		// there instead of trying to recreate it.
+		exists, err := r.databaseFileExists(ctx, instance.Namespace, podName, path.Join(primaryDataMountPath, db.Name))
+		if err != nil {
+			return fmt.Errorf("failed to check whether database %q already exists: %w", db.Name, err)
+		}
+		if exists {
+			logf.FromContext(ctx).Info("Database file already exists on the primary PVC, registering it without recreating", "database", db.Name)
+			continue
+		}
 		if err := r.execInPod(ctx, instance.Namespace, podName, sysdbaCommand, databaseCreateScript(db)); err != nil {
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
@@ -269,6 +286,21 @@ func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName s
 		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 	return nil
+}
+
+// databaseFileExists reports whether dbPath already exists inside
+// podName's firebird container, by exec-ing "test -f" and inspecting its
+// exit code.
+func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, podName, dbPath string) (bool, error) {
+	err := r.execInPod(ctx, namespace, podName, []string{"test", "-f", dbPath}, "")
+	if err == nil {
+		return true, nil
+	}
+	var exitErr utilexec.CodeExitError
+	if errors.As(err, &exitErr) {
+		return false, nil
+	}
+	return false, err
 }
 
 // backupDatabases exec's gbak inside the Firebird pod to back up every
