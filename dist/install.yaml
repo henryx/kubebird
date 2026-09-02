@@ -150,6 +150,29 @@ spec:
                 description: storage configures the persistent volumes backing the
                   instance.
                 properties:
+                  backup:
+                    description: |-
+                      backup is the volume mounted into the instance for staging backups.
+                      Optional; when omitted, no backup volume is created or mounted. When
+                      set, deleting the Instance backs up every database into this volume
+                      (via gbak) before removing the primary and shadow PVCs; the backup
+                      PVC itself is never removed.
+                    properties:
+                      class:
+                        description: |-
+                          class is the StorageClass name to use. If empty, the cluster's
+                          default StorageClass is used.
+                        type: string
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested volume size.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - size
+                    type: object
                   primary:
                     description: primary is the volume storing the instance's primary
                       databases.
@@ -475,9 +498,9 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
-  - secrets
   verbs:
   - create
+  - delete
   - get
   - list
   - watch
@@ -487,6 +510,15 @@ rules:
   - pods/exec
   verbs:
   - create
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - watch
 - apiGroups:
   - apps
   resources:
@@ -655,7 +687,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        image: quay.io/kubebird/operator:latest
+        image: quay.io/kubebird/operator:dev
         livenessProbe:
           httpGet:
             path: /healthz
