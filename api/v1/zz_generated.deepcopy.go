@@ -191,6 +191,11 @@ func (in *ServiceSpec) DeepCopy() *ServiceSpec {
 func (in *StorageSpec) DeepCopyInto(out *StorageSpec) {
 	*out = *in
 	in.Primary.DeepCopyInto(&out.Primary)
+	if in.Backup != nil {
+		in, out := &in.Backup, &out.Backup
+		*out = new(StorageVolumeSpec)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.Shadow != nil {
 		in, out := &in.Shadow, &out.Shadow
 		*out = new(StorageVolumeSpec)

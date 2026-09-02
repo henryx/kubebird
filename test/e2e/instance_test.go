@@ -37,6 +37,7 @@ const (
 	instanceSecretName     = instanceName + "-sysdba"
 	instanceAliasesCMName  = instanceName + "-aliases"
 	instancePrimaryPVCName = instanceName + "-primary"
+	instanceBackupPVCName  = instanceName + "-backup"
 	instanceShadowPVCName  = instanceName + "-shadow"
 	instanceAliasName      = "enforced"
 	firebirdContainer      = "firebird"
@@ -104,6 +105,8 @@ spec:
   storage:
     primary:
       size: 1Gi
+    backup:
+      size: 1Gi
     shadow:
       size: 1Gi
 `, instanceName, namespace, instanceAliasName)
@@ -133,8 +136,11 @@ spec:
 				g.Expect(output).To(ContainSubstring(instanceAliasName + " = /var/lib/firebird/data/shadowed.fdb"))
 			}).Should(Succeed())
 
-			By("creating PVCs named <instance>-primary and <instance>-shadow")
+			By("creating PVCs named <instance>-primary, <instance>-backup and <instance>-shadow")
 			cmd = exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "get", "pvc", instanceBackupPVCName, "-n", namespace)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			cmd = exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)
@@ -191,6 +197,12 @@ spec:
 			By("actually creating the shadow file for the shadowed database")
 			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
 				"--", "test", "-f", "/var/lib/firebird/shadow/shadowed.fdb")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("mounting the backup PVC into the pod")
+			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
+				"--", "test", "-d", "/var/lib/firebird/backup")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 		})
@@ -320,8 +332,11 @@ spec:
 				}, 2*time.Minute, 2*time.Second).Should(Succeed())
 			}
 
-			By("keeping the primary and shadow PVCs, since they aren't owned by the Instance")
+			By("keeping the primary, backup and shadow PVCs, since they aren't owned by the Instance")
 			cmd = exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "get", "pvc", instanceBackupPVCName, "-n", namespace)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			cmd = exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)

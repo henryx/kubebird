@@ -113,6 +113,11 @@ type StorageSpec struct {
 	// +kubebuilder:validation:Required
 	Primary StorageVolumeSpec `json:"primary"`
 
+	// backup is the volume mounted into the instance for staging backups.
+	// Optional; when omitted, no backup volume is created or mounted.
+	// +optional
+	Backup *StorageVolumeSpec `json:"backup,omitempty"`
+
 	// shadow is the volume storing shadow databases. Required if any
 	// database in spec.databases has shadow set to true.
 	// +optional

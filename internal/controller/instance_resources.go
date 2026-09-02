@@ -48,6 +48,7 @@ const (
 	firebirdPort            = 3050
 	primaryDataMountPath    = "/var/lib/firebird/data"
 	shadowDataMountPath     = "/var/lib/firebird/shadow"
+	backupDataMountPath     = "/var/lib/firebird/backup"
 	sysdbaSecretUsernameKey = "username"
 	sysdbaSecretPasswordKey = "password"
 	sysdbaUsername          = "SYSDBA"
@@ -58,6 +59,7 @@ const (
 
 	primaryVolumeName = "primary"
 	shadowVolumeName  = "shadow"
+	backupVolumeName  = "backup"
 	aliasesVolumeName = "aliases"
 
 	containerName = "firebird"
@@ -105,11 +107,22 @@ func shadowPVCName(instance *kubebirdv1.Instance) string {
 	return instance.Name + "-" + shadowVolumeName
 }
 
+// backupPVCName returns the name of the PVC staging backups for the
+// instance.
+func backupPVCName(instance *kubebirdv1.Instance) string {
+	return instance.Name + "-" + backupVolumeName
+}
+
 // reconcilePVCs ensures the PVCs backing instance.Spec.Storage exist,
 // creating any that are missing.
 func (r *InstanceReconciler) reconcilePVCs(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if err := r.reconcilePVC(ctx, instance, primaryPVCName(instance), instance.Spec.Storage.Primary); err != nil {
 		return fmt.Errorf("failed to reconcile primary PVC: %w", err)
+	}
+	if instance.Spec.Storage.Backup != nil {
+		if err := r.reconcilePVC(ctx, instance, backupPVCName(instance), *instance.Spec.Storage.Backup); err != nil {
+			return fmt.Errorf("failed to reconcile backup PVC: %w", err)
+		}
 	}
 	if instance.Spec.Storage.Shadow != nil {
 		if err := r.reconcilePVC(ctx, instance, shadowPVCName(instance), *instance.Spec.Storage.Shadow); err != nil {
@@ -326,6 +339,14 @@ func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance
 			},
 		},
 	}
+	if instance.Spec.Storage.Backup != nil {
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: backupVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)},
+			},
+		})
+	}
 	if instance.Spec.Storage.Shadow != nil {
 		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: shadowVolumeName,
@@ -347,6 +368,9 @@ func volumeMounts(instance *kubebirdv1.Instance) []corev1.VolumeMount {
 			SubPath:   aliasesMountFileName,
 			ReadOnly:  true,
 		},
+	}
+	if instance.Spec.Storage.Backup != nil {
+		mounts = append(mounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
 	}
 	if instance.Spec.Storage.Shadow != nil {
 		mounts = append(mounts, corev1.VolumeMount{Name: shadowVolumeName, MountPath: shadowDataMountPath})

@@ -142,6 +142,26 @@ spec:
                 description: storage configures the persistent volumes backing the
                   instance.
                 properties:
+                  backup:
+                    description: |-
+                      backup is the volume mounted into the instance for staging backups.
+                      Optional; when omitted, no backup volume is created or mounted.
+                    properties:
+                      class:
+                        description: |-
+                          class is the StorageClass name to use. If empty, the cluster's
+                          default StorageClass is used.
+                        type: string
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: size is the requested volume size.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - size
+                    type: object
                   primary:
                     description: primary is the volume storing the instance's primary
                       databases.
