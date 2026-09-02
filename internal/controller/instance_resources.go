@@ -170,6 +170,21 @@ func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebir
 	return nil
 }
 
+// deletePVC deletes the PVC named name, ignoring an already-missing one.
+// Used by backupAndReleaseStorage to release the primary/shadow PVCs once
+// storage.backup holds a final backup of their databases.
+func (r *InstanceReconciler) deletePVC(ctx context.Context, instance *kubebirdv1.Instance, name string) error {
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace}}
+	if err := r.Delete(ctx, pvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete PVC %q: %w", name, err)
+	}
+	logf.FromContext(ctx).Info("Deleted PVC", "name", name)
+	return nil
+}
+
 // reconcileSysdbaSecret ensures the Secret backing spec.authentication.sysdba
 // exists, creating it with a freshly generated random password when it does
 // not. An existing Secret, whether created by a previous reconcile or

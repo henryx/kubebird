@@ -332,16 +332,25 @@ spec:
 				}, 2*time.Minute, 2*time.Second).Should(Succeed())
 			}
 
-			By("keeping the primary, backup and shadow PVCs, since they aren't owned by the Instance")
-			cmd = exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			By("releasing the primary and shadow PVCs, since storage.backup was configured")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred(), "primary PVC should have been released")
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred(), "shadow PVC should have been released")
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("keeping the backup PVC itself, since it isn't owned by the Instance")
 			cmd = exec.Command("kubectl", "get", "pvc", instanceBackupPVCName, "-n", namespace)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			cmd = exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+
+			By("actually backing up every provisioned database into the backup volume before releasing storage")
+			verifyBackupFiles(instanceBackupPVCName, instanceName+"/instance.fbk", instanceName+"/shadowed.fbk")
 		})
 	})
 }
@@ -398,4 +407,46 @@ func getPodStartTime() (string, error) {
 	cmd := exec.Command("kubectl", "get", "pod", instancePod(), "-n", namespace,
 		"-o", "jsonpath={.status.startTime}")
 	return utils.Run(cmd)
+}
+
+// verifyBackupFiles spins up a throwaway Pod mounting pvcName to confirm
+// each of files actually exists on it, then removes the pod. Used to prove
+// backupAndReleaseStorage's gbak backup actually ran, rather than just
+// checking the backup PVC survived.
+func verifyBackupFiles(pvcName string, files ...string) {
+	checks := make([]string, len(files))
+	for i, f := range files {
+		checks[i] = fmt.Sprintf("test -f /backup/%s", f)
+	}
+	script := strings.Join(checks, " && ")
+
+	cmd := exec.Command("kubectl", "run", "verify-backup", "--restart=Never",
+		"--namespace", namespace,
+		"--image=busybox",
+		"--overrides",
+		fmt.Sprintf(`{
+			"spec": {
+				"containers": [{
+					"name": "verify",
+					"image": "busybox",
+					"command": ["sh", "-c", "%s"],
+					"volumeMounts": [{"name": "backup", "mountPath": "/backup"}]
+				}],
+				"volumes": [{"name": "backup", "persistentVolumeClaim": {"claimName": "%s"}}]
+			}
+		}`, script, pvcName))
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "failed to create verify-backup pod")
+	defer func() {
+		cmd := exec.Command("kubectl", "delete", "pod", "verify-backup", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+	}()
+
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "get", "pod", "verify-backup", "-n", namespace,
+			"-o", "jsonpath={.status.phase}")
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(output).To(Equal("Succeeded"))
+	}, 2*time.Minute, 2*time.Second).Should(Succeed())
 }

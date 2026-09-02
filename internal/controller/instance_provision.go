@@ -96,14 +96,14 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 
 	for _, name := range removed {
 		dropCommand := append(append([]string{}, sysdbaCommand...), path.Join(primaryDataMountPath, name))
-		if err := r.execIsql(ctx, instance.Namespace, podName, dropCommand, databaseDropScript); err != nil {
+		if err := r.execInPod(ctx, instance.Namespace, podName, dropCommand, databaseDropScript); err != nil {
 			return fmt.Errorf("failed to drop database %q: %w", name, err)
 		}
 		logf.FromContext(ctx).Info("Dropped database", "database", name)
 	}
 
 	for _, db := range pending {
-		if err := r.execIsql(ctx, instance.Namespace, podName, sysdbaCommand, databaseCreateScript(db)); err != nil {
+		if err := r.execInPod(ctx, instance.Namespace, podName, sysdbaCommand, databaseCreateScript(db)); err != nil {
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
 		logf.FromContext(ctx).Info("Created database", "database", db.Name)
@@ -164,7 +164,7 @@ func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instan
 		// recover a lost SYSDBA password locally.
 		embeddedCommand := []string{"isql", securityDatabasePath(instance)}
 		script := fmt.Sprintf("ALTER USER %s PASSWORD '%s';\nQUIT;\n", sysdbaUsername, password)
-		if err := r.execIsql(ctx, instance.Namespace, podName, embeddedCommand, script); err != nil {
+		if err := r.execInPod(ctx, instance.Namespace, podName, embeddedCommand, script); err != nil {
 			return fmt.Errorf("failed to rotate SYSDBA password: %w", err)
 		}
 		logf.FromContext(ctx).Info("Rotated SYSDBA password on the live server")
@@ -238,9 +238,10 @@ func databaseCreateScript(db kubebirdv1.DatabaseSpec) string {
 	return b.String()
 }
 
-// execIsql runs command (an isql invocation) inside the firebird
-// container of podName, piping script in as its stdin.
-func (r *InstanceReconciler) execIsql(ctx context.Context, namespace, podName string, command []string, script string) error {
+// execInPod runs command inside the firebird container of podName,
+// piping stdin in as its stdin. Used both for isql invocations (stdin
+// carrying the script to run) and for gbak, which takes no stdin.
+func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName string, command []string, stdin string) error {
 	req := r.ClientSet.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Namespace(namespace).
@@ -261,11 +262,53 @@ func (r *InstanceReconciler) execIsql(ctx context.Context, namespace, podName st
 
 	var stdout, stderr bytes.Buffer
 	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdin:  strings.NewReader(script),
+		Stdin:  strings.NewReader(stdin),
 		Stdout: &stdout,
 		Stderr: &stderr,
 	}); err != nil {
-		return fmt.Errorf("isql exec failed: %w (stderr: %s)", err, stderr.String())
+		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 	return nil
+}
+
+// backupDatabases exec's gbak inside the Firebird pod to back up every
+// database recorded in instance.Status.Databases into a subdirectory of
+// storage.backup dedicated to this instance (see instanceBackupDir), so
+// their data survives even after the primary/shadow PVCs are removed (see
+// backupAndReleaseStorage).
+func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kubebirdv1.Instance, podName string) error {
+	password, err := r.sysdbaPassword(ctx, instance)
+	if err != nil {
+		return err
+	}
+
+	dir := instanceBackupDir(instance)
+	if err := r.execInPod(ctx, instance.Namespace, podName, []string{"mkdir", "-p", dir}, ""); err != nil {
+		return fmt.Errorf("failed to create backup directory %q: %w", dir, err)
+	}
+
+	for _, name := range instance.Status.Databases {
+		src := path.Join(primaryDataMountPath, name)
+		dst := path.Join(dir, backupFileName(name))
+		command := []string{"gbak", "-backup", "-verify", "-user", sysdbaUsername, "-password", password, src, dst}
+		if err := r.execInPod(ctx, instance.Namespace, podName, command, ""); err != nil {
+			return fmt.Errorf("failed to back up database %q: %w", name, err)
+		}
+		logf.FromContext(ctx).Info("Backed up database", "database", name, "path", dst)
+	}
+	return nil
+}
+
+// instanceBackupDir returns the instance's dedicated subdirectory of
+// storage.backup, e.g. "/var/lib/firebird/backup/test", so backups from
+// different Instances (or successive generations of one reusing the same
+// backup PVC, since it survives deletion) don't collide.
+func instanceBackupDir(instance *kubebirdv1.Instance) string {
+	return path.Join(backupDataMountPath, instance.Name)
+}
+
+// backupFileName returns the gbak backup file name for a database, e.g.
+// "instance.fdb" -> "instance.fbk".
+func backupFileName(dbName string) string {
+	return strings.TrimSuffix(dbName, ".fdb") + ".fbk"
 }

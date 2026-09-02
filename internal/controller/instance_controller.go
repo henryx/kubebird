@@ -83,7 +83,7 @@ type InstanceReconciler struct {
 // +kubebuilder:rbac:groups=apps,namespace=kubebird-system,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=secrets,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=persistentvolumeclaims,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods/exec,verbs=create
 
@@ -174,9 +174,11 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 }
 
 // reconcileDeletion logs an Instance's deletion, reports status.phase as
-// Deleting, and removes the finalizer so the API server can complete the
-// deletion; the objects Kubebird created are removed by Kubernetes'
-// garbage collection of their owner references.
+// Deleting, backs up its databases and releases the primary/shadow PVCs
+// when storage.backup is configured (see backupAndReleaseStorage), and
+// removes the finalizer so the API server can complete the deletion; the
+// objects Kubebird created are removed by Kubernetes' garbage collection
+// of their owner references.
 func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if !controllerutil.ContainsFinalizer(instance, finalizerName) {
 		return nil
@@ -188,9 +190,53 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 		return fmt.Errorf("failed to report Deleting phase: %w", err)
 	}
 
+	if instance.Spec.Storage.Backup != nil {
+		if err := r.backupAndReleaseStorage(ctx, instance); err != nil {
+			return err
+		}
+	}
+
 	controllerutil.RemoveFinalizer(instance, finalizerName)
 	if err := r.Update(ctx, instance); err != nil {
 		return fmt.Errorf("failed to remove finalizer: %w", err)
+	}
+	return nil
+}
+
+// backupAndReleaseStorage runs a final backup of every database recorded
+// in instance.Status.Databases into storage.backup, then deletes the
+// primary and shadow PVCs — but not the backup PVC itself — since their
+// data is now preserved in the backup volume.
+//
+// A backup requires the StatefulSet's pod to still be running, which
+// Reconcile guarantees by calling this before removing the finalizer
+// (Kubernetes only garbage collects the owner-referenced StatefulSet once
+// the Instance itself is fully deleted). If no database was ever
+// provisioned there is nothing to back up, so the pod's readiness isn't
+// required and the primary/shadow PVCs are released immediately.
+func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
+	if len(instance.Status.Databases) > 0 {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				logf.FromContext(ctx).Info("Skipping final backup: StatefulSet no longer exists", "name", instance.Name)
+			} else {
+				return fmt.Errorf("failed to get StatefulSet: %w", err)
+			}
+		} else if sts.Status.ReadyReplicas == 0 {
+			return fmt.Errorf("waiting for the Firebird pod to be ready before backing up databases")
+		} else if err := r.backupDatabases(ctx, instance, instance.Name+"-0"); err != nil {
+			return err
+		}
+	}
+
+	if err := r.deletePVC(ctx, instance, primaryPVCName(instance)); err != nil {
+		return err
+	}
+	if instance.Spec.Storage.Shadow != nil {
+		if err := r.deletePVC(ctx, instance, shadowPVCName(instance)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

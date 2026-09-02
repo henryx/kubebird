@@ -114,7 +114,10 @@ type StorageSpec struct {
 	Primary StorageVolumeSpec `json:"primary"`
 
 	// backup is the volume mounted into the instance for staging backups.
-	// Optional; when omitted, no backup volume is created or mounted.
+	// Optional; when omitted, no backup volume is created or mounted. When
+	// set, deleting the Instance backs up every database into this volume
+	// (via gbak) before removing the primary and shadow PVCs; the backup
+	// PVC itself is never removed.
 	// +optional
 	Backup *StorageVolumeSpec `json:"backup,omitempty"`
 

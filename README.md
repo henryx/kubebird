@@ -124,7 +124,7 @@ With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in. The `firebird` container sets `allowPrivilegeEscalation: false` and a `RuntimeDefault` seccomp profile, satisfying the `baseline` Pod Security Standard; it does **not** run as non-root or drop capabilities, since the `firebirdsql/firebird` image's entrypoint needs root's full DAC override (e.g. to manage files owned by its own `firebird` user) whenever `FIREBIRD_ROOT_PASSWORD` is set, which Kubebird always does — so `Instance` pods can't satisfy the stricter `restricted` standard, and the namespace they run in must enforce `baseline` or looser.
 - Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`), named `<instance-name>-primary`, with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else.
-- Optionally define a `<instance-name>-backup` PVC (`storage.backup`), mounted into the pod at `/var/lib/firebird/backup` for whatever backs up the instance's data to use. Omit it if you don't need a dedicated backup volume. Like the primary/shadow PVCs, it isn't owned by the `Instance` — deleting the `Instance` leaves it (and any backup data on it) in place instead of garbage-collecting it.
+- Optionally define a `<instance-name>-backup` PVC (`storage.backup`), mounted into the pod at `/var/lib/firebird/backup`. Omit it if you don't need a dedicated backup volume. Like the primary/shadow PVCs, it isn't owned by the `Instance` — deleting the `Instance` leaves it (and its backup data) in place instead of garbage-collecting it. Setting it also changes what happens to the *other* storage on deletion — see "Deleting an Instance" below.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
 - Authentication is optional. If `authentication.sysdba.secretRef` is specified, Kubebird uses that Secret for the SYSDBA password; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password. Either way, the secret has `username` (always `SYSDBA`) and `password` keys.
@@ -200,6 +200,16 @@ yourself once you're sure you no longer need the data:
 ```bash
 kubectl delete pvc -l kubebird.github.io/instance=<name>
 ```
+
+If `storage.backup` is configured, deletion does one more thing first: before removing its
+finalizer, Kubebird backs up every database in `status.databases` into a subdirectory of
+`storage.backup` dedicated to this `Instance` (`<mount>/<instance-name>/<database>.fbk`, via
+`gbak -backup -verify`) — keeping backups from different `Instance`s, or from successive
+generations of one reusing the same backup PVC (since it survives deletion), from colliding — then
+deletes the primary and shadow PVCs itself; the backup PVC is the only one left behind. This
+requires the StatefulSet's pod to be ready, so deletion waits for it if needed; if no database was
+ever provisioned, the primary/shadow PVCs are released immediately without waiting for a running
+pod.
 
 ## License
 

@@ -34,12 +34,11 @@ import (
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
 )
 
+const resourceNamespace = "default"
+
 var _ = Describe("Instance Controller", func() {
 	Context("When reconciling a resource", func() {
-		const (
-			resourceName      = "test-resource"
-			resourceNamespace = "default"
-		)
+		const resourceName = "test-resource"
 
 		ctx := context.Background()
 
@@ -187,6 +186,90 @@ var _ = Describe("Instance Controller", func() {
 
 			By("adding the finalizer so deletion can be observed")
 			Expect(updated.Finalizers).To(ContainElement(finalizerName))
+		})
+	})
+
+	Context("When deleting an Instance with storage.backup configured", func() {
+		const (
+			backupResourceName = "test-backup-resource"
+			backupSecretName   = "test-backup-sysdba"
+		)
+
+		ctx := context.Background()
+		backupTypeNamespacedName := types.NamespacedName{Name: backupResourceName, Namespace: resourceNamespace}
+		var controllerReconciler *InstanceReconciler
+
+		BeforeEach(func() {
+			controllerReconciler = &InstanceReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      backupResourceName,
+					Namespace: resourceNamespace,
+				},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:   "firebirdsql/firebird",
+					Version: "3.0.14",
+					Databases: []kubebirdv1.DatabaseSpec{
+						{Name: "instance.fdb"},
+					},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+						Backup:  &kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Authentication: kubebirdv1.AuthenticationSpec{
+						Sysdba: kubebirdv1.SysdbaAuthSpec{SecretRef: backupSecretName},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("releases the primary PVC but keeps the backup PVC, without needing the pod to be ready", func() {
+			By("the primary and backup PVCs existing after the first reconcile")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-primary", Namespace: resourceNamespace},
+				&corev1.PersistentVolumeClaim{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-backup", Namespace: resourceNamespace},
+				&corev1.PersistentVolumeClaim{})).To(Succeed())
+
+			By("deleting the Instance before any database was ever provisioned")
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(HaveOccurred())
+
+			By("requesting deletion of the primary PVC, since storage.backup was configured")
+			primaryPVC := &corev1.PersistentVolumeClaim{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-primary", Namespace: resourceNamespace}, primaryPVC)
+			if err == nil {
+				// The StorageObjectInUseProtection admission plugin adds a
+				// finalizer that only the (unrunning, in envtest)
+				// pvc-protection controller removes, so the object may
+				// still exist with a DeletionTimestamp rather than being
+				// fully gone.
+				Expect(primaryPVC.DeletionTimestamp).NotTo(BeNil())
+			} else {
+				Expect(errors.IsNotFound(err)).To(BeTrue())
+			}
+
+			By("not requesting deletion of the backup PVC itself")
+			backupPVC := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-backup", Namespace: resourceNamespace}, backupPVC)).To(Succeed())
+			Expect(backupPVC.DeletionTimestamp).To(BeNil())
+
+			By("Cleanup the SYSDBA Secret")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
 		})
 	})
 })

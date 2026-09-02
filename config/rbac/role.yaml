@@ -22,9 +22,9 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
-  - secrets
   verbs:
   - create
+  - delete
   - get
   - list
   - watch
@@ -34,6 +34,15 @@ rules:
   - pods/exec
   verbs:
   - create
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - watch
 - apiGroups:
   - apps
   resources:
