@@ -43,6 +43,16 @@ import (
 // server's security database (securityN.fdb, N being the major version).
 const securityDatabaseDir = "/usr/local/firebird"
 
+// isql/gbak binaries and flags shared across the exec'd commands in this
+// file.
+const (
+	binIsql = "isql"
+	binGbak = "gbak"
+
+	flagUser     = "-user"
+	flagPassword = "-password"
+)
+
 // reconcileDatabases exec's isql inside the Firebird pod, once it is
 // ready, to run CREATE DATABASE/CREATE SHADOW for each entry in
 // instance.Spec.Databases not yet recorded in instance.Status.Databases,
@@ -94,7 +104,7 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 
 	podName := instance.Name + "-0"
-	sysdbaCommand := []string{"isql", "-user", sysdbaUsername, "-password", password}
+	sysdbaCommand := []string{binIsql, flagUser, sysdbaUsername, flagPassword, password}
 
 	for _, name := range removed {
 		dropCommand := append(append([]string{}, sysdbaCommand...), path.Join(primaryDataMountPath, name))
@@ -120,6 +130,18 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 			logf.FromContext(ctx).Info("Database file already exists on the primary PVC, registering it without recreating", "database", db.Name)
 			continue
 		}
+
+		if instance.Spec.Storage.Backup != nil {
+			restored, err := r.restoreDatabaseIfBackedUp(ctx, instance, podName, password, db)
+			if err != nil {
+				return fmt.Errorf("failed to restore database %q from backup: %w", db.Name, err)
+			}
+			if restored {
+				logf.FromContext(ctx).Info("Restored database from its backup", "database", db.Name)
+				continue
+			}
+		}
+
 		if err := r.execInPod(ctx, instance.Namespace, podName, sysdbaCommand, databaseCreateScript(db)); err != nil {
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
@@ -179,7 +201,7 @@ func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instan
 		// is trusted based on the OS user running isql instead of
 		// requiring a password - the same mechanism admins rely on to
 		// recover a lost SYSDBA password locally.
-		embeddedCommand := []string{"isql", securityDatabasePath(instance)}
+		embeddedCommand := []string{binIsql, securityDatabasePath(instance)}
 		script := fmt.Sprintf("ALTER USER %s PASSWORD '%s';\nQUIT;\n", sysdbaUsername, password)
 		if err := r.execInPod(ctx, instance.Namespace, podName, embeddedCommand, script); err != nil {
 			return fmt.Errorf("failed to rotate SYSDBA password: %w", err)
@@ -288,11 +310,12 @@ func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName s
 	return nil
 }
 
-// databaseFileExists reports whether dbPath already exists inside
+// databaseFileExists reports whether filePath already exists inside
 // podName's firebird container, by exec-ing "test -f" and inspecting its
-// exit code.
-func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, podName, dbPath string) (bool, error) {
-	err := r.execInPod(ctx, namespace, podName, []string{"test", "-f", dbPath}, "")
+// exit code. Used both for a database's own file (see reconcileDatabases)
+// and for its backup file (see restoreDatabaseIfBackedUp).
+func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, podName, filePath string) (bool, error) {
+	err := r.execInPod(ctx, namespace, podName, []string{"test", "-f", filePath}, "")
 	if err == nil {
 		return true, nil
 	}
@@ -301,6 +324,40 @@ func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, 
 		return false, nil
 	}
 	return false, err
+}
+
+// restoreDatabaseIfBackedUp restores db from its backup file in
+// storage.backup's instance-dedicated subdirectory (instanceBackupDir),
+// if one exists there — e.g. because an earlier Instance with this same
+// name was deleted with storage.backup configured (see
+// backupAndReleaseStorage), and this Instance is recreating it. Reports
+// whether a backup was found and restored.
+func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, instance *kubebirdv1.Instance, podName, password string, db kubebirdv1.DatabaseSpec) (bool, error) {
+	backupPath := path.Join(instanceBackupDir(instance), backupFileName(db.Name))
+	exists, err := r.databaseFileExists(ctx, instance.Namespace, podName, backupPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to check for a backup at %q: %w", backupPath, err)
+	}
+	if !exists {
+		return false, nil
+	}
+
+	dbPath := path.Join(primaryDataMountPath, db.Name)
+	restoreCommand := []string{binGbak, "-create", "-verify", flagUser, sysdbaUsername, flagPassword, password, backupPath, dbPath}
+	if err := r.execInPod(ctx, instance.Namespace, podName, restoreCommand, ""); err != nil {
+		return false, fmt.Errorf("gbak restore failed: %w", err)
+	}
+
+	if db.Shadow {
+		shadowPath := path.Join(shadowDataMountPath, db.Name)
+		connectCommand := []string{binIsql, flagUser, sysdbaUsername, flagPassword, password, dbPath}
+		script := fmt.Sprintf("CREATE SHADOW 1 '%s';\nQUIT;\n", shadowPath)
+		if err := r.execInPod(ctx, instance.Namespace, podName, connectCommand, script); err != nil {
+			return false, fmt.Errorf("failed to recreate shadow file after restore: %w", err)
+		}
+	}
+
+	return true, nil
 }
 
 // backupDatabases exec's gbak inside the Firebird pod to back up every
@@ -322,7 +379,7 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 	for _, name := range instance.Status.Databases {
 		src := path.Join(primaryDataMountPath, name)
 		dst := path.Join(dir, backupFileName(name))
-		command := []string{"gbak", "-backup", "-verify", "-user", sysdbaUsername, "-password", password, src, dst}
+		command := []string{binGbak, "-backup", "-verify", flagUser, sysdbaUsername, flagPassword, password, src, dst}
 		if err := r.execInPod(ctx, instance.Namespace, podName, command, ""); err != nil {
 			return fmt.Errorf("failed to back up database %q: %w", name, err)
 		}

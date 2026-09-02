@@ -14,6 +14,15 @@
   default behavior of leaving all storage in place) — the backup PVC itself is left untouched.
   The dedicated per-instance subdirectory keeps backups from different `Instance`s, or from
   successive generations of one reusing the same backup PVC, from colliding.
+- Recreating an `Instance` closes that loop: for a database not already on the primary PVC,
+  `storage.backup` is checked for a matching `<instance-name>/<database>.fbk` backup, and if one
+  is there it's restored via `gbak -create -verify` (recreating the shadow file too, for a
+  `shadow: true` database) instead of creating an empty database — so an `Instance` deleted with
+  `storage.backup` configured can be fully recreated from its own backup PVC.
+- `status.message` now tracks deletion progress instead of showing a stale pre-deletion value:
+  `"Deleting Instance"`, then (when `storage.backup` is set) `"Waiting for the Firebird pod to be
+  ready before backing up databases"` if it has to block, `"Backing up databases into
+  storage.backup"`, and `"Releasing primary and shadow storage"`, then `"Removing finalizer"`.
 
 ### Fixed
 

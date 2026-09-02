@@ -352,6 +352,62 @@ spec:
 			By("actually backing up every provisioned database into the backup volume before releasing storage")
 			verifyBackupFiles(instanceBackupPVCName, instanceName+"/instance.fbk", instanceName+"/shadowed.fbk")
 		})
+
+		It("should restore databases from their backups when the Instance is recreated", func() {
+			By("re-applying the Instance CR under the same name, reusing the surviving backup PVC")
+			manifest := fmt.Sprintf(`
+apiVersion: kubebird.github.io/v1
+kind: Instance
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  image: firebirdsql/firebird
+  version: 3.0.14
+  databases:
+    - name: "instance.fdb"
+    - name: "shadowed.fdb"
+      alias: "%s"
+      shadow: true
+  storage:
+    primary:
+      size: 1Gi
+    backup:
+      size: 1Gi
+    shadow:
+      size: 1Gi
+`, instanceName, namespace, instanceAliasName)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(manifest)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("restoring both databases from their backups instead of creating them empty")
+			Eventually(func(g Gomega) {
+				names, err := getInstanceDatabases()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(names).To(ConsistOf("instance.fdb", "shadowed.fdb"))
+			}, 5*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("not reporting any reconcile error, since gbak restored rather than tried CREATE DATABASE")
+			cmd = exec.Command("kubectl", "get", "instance", instanceName, "-n", namespace,
+				"-o", "jsonpath={.status.error}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(BeEmpty())
+
+			By("actually restoring the primary database file inside the pod")
+			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
+				"--", "test", "-f", "/var/lib/firebird/data/instance.fdb")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("recreating the shadow file for the restored shadowed database")
+			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
+				"--", "test", "-f", "/var/lib/firebird/shadow/shadowed.fdb")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+		})
 	})
 }
 

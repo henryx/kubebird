@@ -174,11 +174,12 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 }
 
 // reconcileDeletion logs an Instance's deletion, reports status.phase as
-// Deleting, backs up its databases and releases the primary/shadow PVCs
-// when storage.backup is configured (see backupAndReleaseStorage), and
-// removes the finalizer so the API server can complete the deletion; the
-// objects Kubebird created are removed by Kubernetes' garbage collection
-// of their owner references.
+// Deleting and status.message with the specific operation currently
+// underway (see setDeletionMessage), backs up its databases and releases
+// the primary/shadow PVCs when storage.backup is configured (see
+// backupAndReleaseStorage), and removes the finalizer so the API server
+// can complete the deletion; the objects Kubebird created are removed by
+// Kubernetes' garbage collection of their owner references.
 func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if !controllerutil.ContainsFinalizer(instance, finalizerName) {
 		return nil
@@ -189,6 +190,9 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 	if err := r.setPhase(ctx, instance, phaseDeleting); err != nil {
 		return fmt.Errorf("failed to report Deleting phase: %w", err)
 	}
+	if err := r.setDeletionMessage(ctx, instance, "Deleting Instance"); err != nil {
+		return err
+	}
 
 	if instance.Spec.Storage.Backup != nil {
 		if err := r.backupAndReleaseStorage(ctx, instance); err != nil {
@@ -196,9 +200,29 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 		}
 	}
 
+	if err := r.setDeletionMessage(ctx, instance, "Removing finalizer"); err != nil {
+		return err
+	}
 	controllerutil.RemoveFinalizer(instance, finalizerName)
 	if err := r.Update(ctx, instance); err != nil {
 		return fmt.Errorf("failed to remove finalizer: %w", err)
+	}
+	return nil
+}
+
+// setDeletionMessage records the operation reconcileDeletion is currently
+// performing in status.message, so `kubectl get instances` reflects
+// deletion progress (e.g. while backupAndReleaseStorage waits on the pod)
+// instead of showing a stale pre-deletion message. Skips the write when
+// the message hasn't changed. Unlike setError, this never touches
+// status.error: deletion isn't a reconcile failure.
+func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *kubebirdv1.Instance, message string) error {
+	if instance.Status.Message == message {
+		return nil
+	}
+	instance.Status.Message = message
+	if err := r.Status().Update(ctx, instance); err != nil {
+		return fmt.Errorf("failed to report deletion progress: %w", err)
 	}
 	return nil
 }
@@ -224,12 +248,23 @@ func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instan
 				return fmt.Errorf("failed to get StatefulSet: %w", err)
 			}
 		} else if sts.Status.ReadyReplicas == 0 {
+			if err := r.setDeletionMessage(ctx, instance, "Waiting for the Firebird pod to be ready before backing up databases"); err != nil {
+				return err
+			}
 			return fmt.Errorf("waiting for the Firebird pod to be ready before backing up databases")
-		} else if err := r.backupDatabases(ctx, instance, instance.Name+"-0"); err != nil {
-			return err
+		} else {
+			if err := r.setDeletionMessage(ctx, instance, "Backing up databases into storage.backup"); err != nil {
+				return err
+			}
+			if err := r.backupDatabases(ctx, instance, instance.Name+"-0"); err != nil {
+				return err
+			}
 		}
 	}
 
+	if err := r.setDeletionMessage(ctx, instance, "Releasing primary and shadow storage"); err != nil {
+		return err
+	}
 	if err := r.deletePVC(ctx, instance, primaryPVCName(instance)); err != nil {
 		return err
 	}
