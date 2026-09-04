@@ -289,6 +289,15 @@ var _ = Describe("Manager", Ordered, func() {
 		// same name: the database file on it must be registered, not
 		// recreated.
 		instancePVCReuseSpecs()
+
+		// instanceBackupOrphanSpecs (test/e2e/instance_test.go) exercises
+		// deleting and recreating an Instance under the same name with a
+		// changed spec.databases: a database dropped from the new
+		// generation is never restored and its backup file is left
+		// orphaned, a database kept in both generations is restored from
+		// its backup, and a database newly added has no backup to restore
+		// from and is created fresh.
+		instanceBackupOrphanSpecs()
 	})
 })
 
