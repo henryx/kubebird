@@ -3,6 +3,26 @@
 ## Overview
 [Kubebird](https://github.com/henryx/kubebird) is a Kubernetes operator based on kubebuilder to install and manage [Firebird RDBMS](https://firebirdsql.org/) instances
 
+## Features
+
+- Deploys a Firebird instance as a single-replica StatefulSet from a namespaced `Instance` custom
+  resource, exposed via a `ClusterIP` (or other) `Service`.
+- Manages dedicated primary, backup, and shadow PVCs, with the primary (and, when configured,
+  backup) volume surviving deletion of the `Instance` so its data can be reused or restored later.
+- Provisions and drops databases declared in `spec.databases` (including page size, charset,
+  collation, and shadow files) as the list changes, without requiring a pod restart.
+- Registers a Firebird alias per database automatically, so clients can connect by alias instead of
+  in-pod filesystem path.
+- Generates a SYSDBA credentials Secret (or uses one you supply) and keeps the live server's
+  password in sync whenever the Secret changes.
+- Backs up every database with `gbak` and releases the primary/shadow storage on deletion when a
+  backup volume is configured, then restores from those backups automatically if an `Instance` with
+  the same name is recreated.
+- Warns via `status.warning`/`status.message` about orphaned backups left behind when a recreated
+  `Instance` no longer declares a database that has a backup on disk.
+- Surfaces `VERSION`, `STATUS`, `DATABASES`, and `MESSAGE` printer columns on `kubectl get instances`
+  for at-a-glance visibility into each instance's state.
+
 ## Installation
 
 ### Prerequisites
@@ -130,7 +150,8 @@ With this CR, Kubebird can:
 - Authentication is optional. If `authentication.sysdba.secretRef` is specified, Kubebird uses that Secret for the SYSDBA password; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password. Either way, the secret has `username` (always `SYSDBA`) and `password` keys.
 - Label every object it creates (PVCs, Service, StatefulSet, the aliases ConfigMap, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets,configmaps -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 - Report the most recent error, if any, in `status.error` — surfaced without needing to check the operator's own logs, via the `MESSAGE` column below. It's cleared automatically once the `Instance` reconciles successfully again.
-- Surface `kubectl get instances` columns beyond the default `NAME`/`AGE`: `VERSION` (the Firebird version deployed, from `spec.version`), `STATUS` (`Provisioning`, `Ready`, or `Deleting`), `DATABASES` (the number of databases currently provisioned, i.e. `len(status.databases)`), and `MESSAGE` (the reconcile error if the last reconcile failed; otherwise, while `Provisioning`/`Ready`, why it's currently in that phase; while `Deleting`, the specific operation deletion is currently performing, e.g. "Backing up databases into storage.backup" — see "Deleting an Instance" below).
+- Warn, in `status.warning`, when a database that's provisioned or restored (i.e. `spec.databases` has a pending entry) leaves behind an orphaned backup: a `.fbk` file in `storage.backup`'s `<instance-name>/` subdirectory whose database is no longer in `spec.databases` — typically because the `Instance` was recreated with a different database list, or a database was dropped after its backup was taken. Cleared automatically once no orphaned backup remains.
+- Surface `kubectl get instances` columns beyond the default `NAME`/`AGE`: `VERSION` (the Firebird version deployed, from `spec.version`), `STATUS` (`Provisioning`, `Ready`, or `Deleting`), `DATABASES` (the number of databases currently provisioned, i.e. `len(status.databases)`), and `MESSAGE` (the reconcile error if the last reconcile failed; otherwise `status.warning` if one is set; otherwise, while `Provisioning`/`Ready`, why it's currently in that phase; while `Deleting`, the specific operation deletion is currently performing, e.g. "Backing up databases into storage.backup" — see "Deleting an Instance" below).
 
 ### Object creation flow
 
@@ -218,7 +239,9 @@ into storage.backup", then "Releasing primary and shadow storage", then "Removin
 
 Recreating an `Instance` with the same name closes the loop: since the backup PVC was left behind,
 its databases are restored from those `.fbk` files instead of being created empty — see the
-`storage.backup` bullet above.
+`storage.backup` bullet above. If the recreated `Instance` declares a different `spec.databases`
+list than the one that was backed up, any `.fbk` file with no matching entry is left unrestored and
+reported in `status.warning` (and thus in the `MESSAGE` column) instead of being silently ignored.
 
 ## License
 

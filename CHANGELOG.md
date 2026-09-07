@@ -23,6 +23,11 @@
   `"Deleting Instance"`, then (when `storage.backup` is set) `"Waiting for the Firebird pod to be
   ready before backing up databases"` if it has to block, `"Backing up databases into
   storage.backup"`, and `"Releasing primary and shadow storage"`, then `"Removing finalizer"`.
+- `status.warning`: a non-fatal notice, surfaced through `status.message`/the `MESSAGE` printer
+  column, that `storage.backup` holds a `.fbk` for a database no longer in `spec.databases` — e.g.
+  because the `Instance` was recreated with a different database list, or a database was dropped
+  after its backup was taken — so it was left unrestored instead of silently ignored. Cleared once
+  no orphaned backup remains.
 
 ### Fixed
 

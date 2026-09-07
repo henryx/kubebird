@@ -72,12 +72,33 @@ KUBEBUILDER_ASSETS="$(bin/setup-envtest use -p path)" go test ./internal/control
 
 Standard Kubebuilder single-group layout — see `AGENTS.md` in this repo for the full scaffolding reference (file layout, marker conventions, RBAC markers, CLI commands for adding APIs/webhooks). Key points specific to this repo:
 
-- **API group wiring**: `PROJECT` declares `group: kubebird`, `domain: github.io`; these compose to `kubebird.github.io`, which must stay consistent across `api/v1/groupversion_info.go` (`+groupName`), the RBAC markers in `internal/controller/instance_controller.go`, and any sample/manifest YAML. A mismatch here (e.g. a doubled `kubebird.github.io.github.io`) breaks the CRD/manifest wiring silently.
-- **Generated vs. owned files**: `api/v1/zz_generated.deepcopy.go`, `config/crd/bases/*.yaml`, and `config/rbac/role.yaml` are produced by `make manifests generate` — never hand-edit them. `api/v1/instance_types.go` and `internal/controller/*.go` are the owned files to extend.
-- **envtest CRD source**: `internal/controller/suite_test.go` loads CRDs from `config/crd/bases/` for the test API server (`ErrorIfCRDPathMissing: true`), so `make manifests` must be run (and the CRD committed/present) before `make test` will pass.
-- **Namespace scoping**: `cmd/main.go` requires a `WATCH_NAMESPACE` env var and configures the manager's cache to watch only that namespace (or comma-separated list) via `setupCacheNamespaces` — the manager will not start without it. Don't confuse this with where the operator itself runs: `config/default/kustomization.yaml` deploys the manager, RBAC and Service into the `kubebird-system` namespace (via `namespace:`/`namePrefix: kubebird-`), which must stay paired — kustomize requires `namePrefix` to match the text before the first `-` in `namespace`. The `app.kubernetes.io/name: kubebird` label/selector pair (`config/manager/manager.yaml`, `config/default/metrics_service.yaml`, `config/network-policy/allow-metrics-traffic.yaml`, `config/prometheus/monitor.yaml`) must also change together — it's how the metrics Service, NetworkPolicy and ServiceMonitor find the manager Pod.
-- **Release/publishing**: `.github/workflows/release.yml` triggers only on pushing a semver tag (`[0-9]+.[0-9]+.[0-9]+`, e.g. `0.2.0`) — it builds/pushes the manager image to `quay.io/kubebird/operator` (versioned + `latest`) and attaches `dist/install.yaml` to a GitHub Release. `.github/workflows/dev-image.yml` triggers on every push to `main` and just builds/pushes `quay.io/kubebird/operator:dev` — no versioned tag, no `latest`, no GitHub Release — giving a rolling image that tracks `main` for testing unreleased changes. Both workflows call `lint.yml`, `test.yml` and `test-e2e.yml` as reusable workflows (`uses: ./.github/workflows/*.yml`, invoked via the `workflow_call` trigger added to each) and gate their build/publish job on all three succeeding (`needs: [lint, test, test-e2e]`) — a tag or `main` push that fails lint, unit/envtest, or e2e tests never reaches quay.io or cuts a GitHub Release. `Makefile`'s `IMG` default and `config/manager/kustomization.yaml`'s `images:` transform both point at that same registry, so `make build-installer`/`make docker-build docker-push` without an explicit `IMG=` also target `quay.io/kubebird/operator`.
-- **Logging convention**: this repo follows the Kubernetes logging style guide (capitalized message, no trailing period, active/past voice, object type named explicitly) — enforced in part by the custom `logcheck` golangci-lint module in `.golangci.yml`.
+### Scaffolding commands
+
+Recorded in `PROJECT` — never hand-edit that file either. The project was bootstrapped with `kubebuilder init --domain github.io --repo github.com/henryx/kubebird` (kubebuilder v4.15.0, single-group layout, namespaced), then the `Instance` CR was added with `kubebuilder create api --group kubebird --version v1 --kind Instance --resource --controller`. No `kubebuilder create webhook` has been run for `Instance` — `PROJECT` has no webhook entry and there's no `api/v1/instance_webhook.go`. Use the same two commands (never hand-write scaffolding) for any future API or webhook — see `AGENTS.md`'s CLI Commands Cheat Sheet for the full flag reference.
+
+### API group wiring
+
+`PROJECT` declares `group: kubebird`, `domain: github.io`; these compose to `kubebird.github.io`, which must stay consistent across `api/v1/groupversion_info.go` (`+groupName`), the RBAC markers in `internal/controller/instance_controller.go`, and any sample/manifest YAML. A mismatch here (e.g. a doubled `kubebird.github.io.github.io`) breaks the CRD/manifest wiring silently.
+
+### Generated vs. owned files
+
+`api/v1/zz_generated.deepcopy.go`, `config/crd/bases/*.yaml`, and `config/rbac/role.yaml` are produced by `make manifests generate` — never hand-edit them. `api/v1/instance_types.go` and `internal/controller/*.go` are the owned files to extend.
+
+### envtest CRD source
+
+`internal/controller/suite_test.go` loads CRDs from `config/crd/bases/` for the test API server (`ErrorIfCRDPathMissing: true`), so `make manifests` must be run (and the CRD committed/present) before `make test` will pass.
+
+### Namespace scoping
+
+`cmd/main.go` requires a `WATCH_NAMESPACE` env var and configures the manager's cache to watch only that namespace (or comma-separated list) via `setupCacheNamespaces` — the manager will not start without it. Don't confuse this with where the operator itself runs: `config/default/kustomization.yaml` deploys the manager, RBAC and Service into the `kubebird-system` namespace (via `namespace:`/`namePrefix: kubebird-`), which must stay paired — kustomize requires `namePrefix` to match the text before the first `-` in `namespace`. The `app.kubernetes.io/name: kubebird` label/selector pair (`config/manager/manager.yaml`, `config/default/metrics_service.yaml`, `config/network-policy/allow-metrics-traffic.yaml`, `config/prometheus/monitor.yaml`) must also change together — it's how the metrics Service, NetworkPolicy and ServiceMonitor find the manager Pod.
+
+### Release/publishing
+
+`.github/workflows/release.yml` triggers only on pushing a semver tag (`[0-9]+.[0-9]+.[0-9]+`, e.g. `0.2.0`) — it builds/pushes the manager image to `quay.io/kubebird/operator` (versioned + `latest`) and attaches `dist/install.yaml` to a GitHub Release. `.github/workflows/dev-image.yml` triggers on every push to `main` and just builds/pushes `quay.io/kubebird/operator:dev` — no versioned tag, no `latest`, no GitHub Release — giving a rolling image that tracks `main` for testing unreleased changes. Both workflows call `lint.yml`, `test.yml` and `test-e2e.yml` as reusable workflows (`uses: ./.github/workflows/*.yml`, invoked via the `workflow_call` trigger added to each) and gate their build/publish job on all three succeeding (`needs: [lint, test, test-e2e]`) — a tag or `main` push that fails lint, unit/envtest, or e2e tests never reaches quay.io or cuts a GitHub Release. `Makefile`'s `IMG` default and `config/manager/kustomization.yaml`'s `images:` transform both point at that same registry, so `make build-installer`/`make docker-build docker-push` without an explicit `IMG=` also target `quay.io/kubebird/operator`.
+
+### Logging convention
+
+This repo follows the Kubernetes logging style guide (capitalized message, no trailing period, active/past voice, object type named explicitly) — enforced in part by the custom `logcheck` golangci-lint module in `.golangci.yml`.
 
 ### Reconcile flow
 
