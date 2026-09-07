@@ -210,11 +210,20 @@ type InstanceStatus struct {
 	Error string `json:"error,omitempty"`
 
 	// message is a human-readable summary of the Instance's current
-	// state: the reconcile error when the last reconcile failed,
-	// otherwise a description of what phase it's in (e.g. why it isn't
-	// Ready yet).
+	// state: the reconcile error when the last reconcile failed, the
+	// warning when one is set and there is no error, otherwise a
+	// description of what phase it's in (e.g. why it isn't Ready yet).
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// warning is a non-fatal notice from the most recent reconcile that
+	// touched spec.databases, e.g. that storage.backup holds a backup for
+	// a database no longer in spec.databases (so it was left unrestored)
+	// because the Instance was recreated, or had that database removed,
+	// since the backup was taken. Cleared the next time spec.databases
+	// changes and the condition no longer applies.
+	// +optional
+	Warning string `json:"warning,omitempty"`
 }
 
 // +kubebuilder:object:root=true

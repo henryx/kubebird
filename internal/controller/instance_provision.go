@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -106,6 +107,25 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	podName := instance.Name + "-0"
 	sysdbaCommand := []string{binIsql, flagUser, sysdbaUsername, flagPassword, password}
 
+	// Only worth checking when something in spec.databases is actually
+	// being created/restored: that's the event (an Instance recreated, or
+	// a database dropped and storage.backup left behind) this warning
+	// exists to surface, and skipping it otherwise keeps a steady-state
+	// reconcile (pending and removed both empty, returned above) from
+	// paying for an extra exec into the pod.
+	warning := ""
+	if len(pending) > 0 && instance.Spec.Storage.Backup != nil {
+		orphaned, err := r.orphanedBackups(ctx, instance, podName)
+		if err != nil {
+			return fmt.Errorf("failed to check for orphaned backups: %w", err)
+		}
+		if len(orphaned) > 0 {
+			warning = fmt.Sprintf(
+				"storage.backup has a backup for %s, but it's no longer in spec.databases, so it wasn't restored",
+				strings.Join(orphaned, ", "))
+		}
+	}
+
 	for _, name := range removed {
 		dropCommand := append(append([]string{}, sysdbaCommand...), path.Join(primaryDataMountPath, name))
 		if err := r.execInPod(ctx, instance.Namespace, podName, dropCommand, databaseDropScript); err != nil {
@@ -163,6 +183,7 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 	instance.Status.Databases = databases
 	instance.Status.DatabaseCount = int32(len(databases))
+	instance.Status.Warning = warning
 
 	return r.Status().Update(ctx, instance)
 }
@@ -308,6 +329,72 @@ func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName s
 		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 	return nil
+}
+
+// execInPodOutput behaves like execInPod, but returns the command's
+// stdout instead of discarding it — used by orphanedBackups to list the
+// backup directory's contents.
+func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, podName string, command []string) (string, error) {
+	req := r.ClientSet.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(namespace).
+		Name(podName).
+		SubResource("exec")
+	req.VersionedParams(&corev1.PodExecOptions{
+		Container: containerName,
+		Command:   command,
+		Stdout:    true,
+		Stderr:    true,
+	}, scheme.ParameterCodec)
+
+	executor, err := remotecommand.NewSPDYExecutor(r.RestConfig, http.MethodPost, req.URL())
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec executor: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	}); err != nil {
+		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+	}
+	return stdout.String(), nil
+}
+
+// orphanedBackups lists the databases whose backup file sits in the
+// instance's backup directory (see instanceBackupDir) without a matching
+// entry in spec.databases — e.g. because the Instance was recreated with a
+// different database list, or a database was dropped from spec.databases
+// after storage.backup was configured. Reports the database names those
+// orphaned backups belong to (reversing backupFileName), sorted.
+func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kubebirdv1.Instance, podName string) ([]string, error) {
+	desired := make(map[string]bool, len(instance.Spec.Databases))
+	for _, db := range instance.Spec.Databases {
+		desired[db.Name] = true
+	}
+
+	dir := instanceBackupDir(instance)
+	// Redirects stderr to /dev/null and always exits 0: the directory
+	// might not exist yet (e.g. no deletion has ever written a backup
+	// into it), in which case there's simply nothing orphaned to report.
+	output, err := r.execInPodOutput(ctx, instance.Namespace, podName,
+		[]string{"sh", "-c", fmt.Sprintf("ls -1 %s 2>/dev/null || true", dir)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list backup directory %q: %w", dir, err)
+	}
+
+	var orphaned []string
+	for name := range strings.FieldsSeq(output) {
+		if !strings.HasSuffix(name, ".fbk") {
+			continue
+		}
+		if dbName := strings.TrimSuffix(name, ".fbk") + ".fdb"; !desired[dbName] {
+			orphaned = append(orphaned, dbName)
+		}
+	}
+	slices.Sort(orphaned)
+	return orphaned, nil
 }
 
 // databaseFileExists reports whether filePath already exists inside

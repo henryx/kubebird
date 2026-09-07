@@ -279,8 +279,9 @@ func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instan
 // setError records the message from the most recent reconcile failure in
 // status.error, clearing it once Reconcile succeeds again, and mirrors a
 // human-readable summary into status.message: the error itself when set,
-// otherwise the Available condition's message. It skips the status write
-// when nothing changed.
+// otherwise status.warning when reconcileDatabases has set one (see
+// orphanedBackups), otherwise the Available condition's message. It skips
+// the status write when nothing changed.
 func (r *InstanceReconciler) setError(ctx context.Context, instance *kubebirdv1.Instance, reconcileErr error) error {
 	message := ""
 	if reconcileErr != nil {
@@ -288,6 +289,9 @@ func (r *InstanceReconciler) setError(ctx context.Context, instance *kubebirdv1.
 	}
 
 	summary := message
+	if summary == "" {
+		summary = instance.Status.Warning
+	}
 	if summary == "" {
 		if cond := apimeta.FindStatusCondition(instance.Status.Conditions, conditionTypeAvailable); cond != nil {
 			summary = cond.Message

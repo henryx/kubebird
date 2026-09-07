@@ -623,6 +623,22 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(BeEmpty())
 
+			By("warning that a.fdb's backup wasn't restored, since a.fdb is no longer in spec.databases")
+			cmd = exec.Command("kubectl", "get", "instance", orphanInstanceName, "-n", namespace,
+				"-o", "jsonpath={.status.warning}")
+			warning, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(warning).To(ContainSubstring("a.fdb"))
+			Expect(warning).NotTo(ContainSubstring("b.fdb"), "b.fdb was restored, so it shouldn't be reported as orphaned")
+			Expect(warning).NotTo(ContainSubstring("c.fdb"), "c.fdb was never backed up, so it shouldn't be reported as orphaned")
+
+			By("surfacing that same warning through status.message")
+			cmd = exec.Command("kubectl", "get", "instance", orphanInstanceName, "-n", namespace,
+				"-o", "jsonpath={.status.message}")
+			message, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(message).To(Equal(warning))
+
 			podName := orphanInstanceName + "-0"
 
 			By("restoring b.fdb from its backup rather than creating it empty")
