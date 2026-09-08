@@ -298,6 +298,15 @@ var _ = Describe("Manager", Ordered, func() {
 		// its backup, and a database newly added has no backup to restore
 		// from and is created fresh.
 		instanceBackupOrphanSpecs()
+
+		// instanceTableRestoreSpecs (test/e2e/instance_test.go)
+		// exercises that user data, not just the database file's
+		// existence, survives repeated delete/recreate cycles: a
+		// table created after first provisioning is still there
+		// after one backup/restore round, and a second table
+		// created after that restore joins the first after a
+		// second round.
+		instanceTableRestoreSpecs()
 	})
 })
 
