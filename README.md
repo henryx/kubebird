@@ -17,7 +17,8 @@
   password in sync whenever the Secret changes.
 - Backs up every database with `gbak` and releases the primary/shadow storage on deletion when a
   backup volume is configured, then restores from those backups automatically if an `Instance` with
-  the same name is recreated.
+  the same name is recreated — including across a Firebird major-version bump (e.g. `3.0.14` to
+  `4.0.3`), since `gbak` restores are forward-compatible with backups taken by an older version.
 - Warns via `status.warning`/`status.message` about orphaned backups left behind when a recreated
   `Instance` no longer declares a database that has a backup on disk.
 - Surfaces `VERSION`, `STATUS`, `DATABASES`, and `MESSAGE` printer columns on `kubectl get instances`
@@ -242,6 +243,10 @@ its databases are restored from those `.fbk` files instead of being created empt
 `storage.backup` bullet above. If the recreated `Instance` declares a different `spec.databases`
 list than the one that was backed up, any `.fbk` file with no matching entry is left unrestored and
 reported in `status.warning` (and thus in the `MESSAGE` column) instead of being silently ignored.
+This also works if the recreated `Instance` sets a different `spec.version`: the new version's own
+`gbak` restores a `.fbk` backed up by the old version's `gbak`, so deleting and recreating an
+`Instance` with a bumped `spec.version` (and `storage.backup` configured) doubles as a supported way
+to upgrade between Firebird major versions.
 
 ## License
 

@@ -18,7 +18,11 @@
   `storage.backup` is checked for a matching `<instance-name>/<database>.fbk` backup, and if one
   is there it's restored via `gbak -create -verify` (recreating the shadow file too, for a
   `shadow: true` database) instead of creating an empty database — so an `Instance` deleted with
-  `storage.backup` configured can be fully recreated from its own backup PVC.
+  `storage.backup` configured can be fully recreated from its own backup PVC. This also covers
+  upgrading between Firebird major versions: recreating with a different `spec.version` restores
+  the backup taken by the old version's `gbak` using the new version's own `gbak` and server,
+  verified end-to-end (backup, delete, recreate with a bumped `spec.version`, then confirm a table
+  created before deletion is still there).
 - `status.message` now tracks deletion progress instead of showing a stale pre-deletion value:
   `"Deleting Instance"`, then (when `storage.backup` is set) `"Waiting for the Firebird pod to be
   ready before backing up databases"` if it has to block, `"Backing up databases into

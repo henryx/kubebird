@@ -307,6 +307,14 @@ var _ = Describe("Manager", Ordered, func() {
 		// created after that restore joins the first after a
 		// second round.
 		instanceTableRestoreSpecs()
+
+		// instanceVersionUpgradeSpecs (test/e2e/instance_test.go)
+		// exercises deleting and recreating an Instance under the
+		// same name with spec.version bumped to a new Firebird major
+		// version: the backup taken with the old version's gbak
+		// restores cleanly under the new version's gbak and server,
+		// carrying user data across the upgrade.
+		instanceVersionUpgradeSpecs()
 	})
 })
 
