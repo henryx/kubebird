@@ -150,6 +150,8 @@ make run               # Run locally (uses current kubeconfig context)
 
 Tests use **Ginkgo + Gomega** (BDD style). Check `suite_test.go` for setup.
 
+Project is intended to develop and tested on Linux environments. On Windows environments, use WSL integration
+
 ## Deployment Workflow
 
 ```bash
