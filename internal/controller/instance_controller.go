@@ -90,8 +90,11 @@ type InstanceReconciler struct {
 // Reconcile drives the cluster state for an Instance towards the desired
 // state: a Secret-backed StatefulSet running Firebird, a Service exposing
 // it, and a ConfigMap of database aliases, then exec's isql inside the
-// pod once it is ready to create the requested databases and keep the
-// live SYSDBA password in sync with the Secret.
+// pod once it is ready to create the requested databases. The StatefulSet
+// pod template carries an annotation hashing the Secret's current
+// password (see mutateStatefulSet), so a password rotation naturally
+// triggers a pod restart, picked up by the image's own entrypoint the
+// same way a delete/recreate of the Instance already does.
 func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	instance := &kubebirdv1.Instance{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
@@ -146,13 +149,9 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
-		return r.mutateStatefulSet(sts, instance)
+		return r.mutateStatefulSet(ctx, sts, instance)
 	}); err != nil {
 		return fmt.Errorf("failed to reconcile StatefulSet: %w", err)
-	}
-
-	if err := r.reconcileSysdbaPassword(ctx, instance, sts); err != nil {
-		return err
 	}
 
 	if err := r.reconcileDatabases(ctx, instance, sts); err != nil {

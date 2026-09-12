@@ -42,18 +42,15 @@ const (
 	securityDBAppDBPath    = "/var/lib/firebird/data/" + securityDBDatabaseName
 	securityDBMarkerUser   = "MARKERUSER"
 
-	// firebirdBinaryPath mirrors the same constant in
-	// internal/controller/instance_provision.go: the firebirdsql/firebird
-	// image's own server binary, whose executable bit
-	// execOfflineOnSecurityDB toggles to get a deterministic window with
-	// no live engine holding the security database open.
+	// firebirdBinaryPath is the firebirdsql/firebird image's own server
+	// binary, whose executable bit execOfflineOnSecurityDB toggles to get
+	// a deterministic window with no live engine holding the security
+	// database open.
 	firebirdBinaryPath = "/opt/firebird/bin/firebird"
 )
 
 // execOfflineOnSecurityDB runs sql as a bare, OS-trusted embedded
-// connection directly against the security database, mirroring the
-// production technique in execWithSecurityDatabaseOffline
-// (internal/controller/instance_provision.go): neither a bare-path
+// connection directly against the security database: neither a bare-path
 // connection (conflicts with the live server's own already-open engine
 // instance, "Database already opened with engine instance, incompatible
 // with current") nor a loopback one (refused outright - "no permission
@@ -62,7 +59,12 @@ const (
 // disables the firebird binary (blocking fbguard from respawning it) and
 // kills the running process to get a deterministic offline window, runs
 // sql through isql's embedded engine, then restores the binary and waits
-// for a real connection to succeed again before returning.
+// for a real connection to succeed again before returning. Kubebird itself
+// no longer needs this trick for SYSDBA password rotation (see
+// mutateStatefulSet in internal/controller/instance_resources.go, which
+// restarts the pod instead), but directly manipulating the security
+// database - as this test does to prove a marker user survives a
+// delete/recreate - has no such shortcut available.
 func execOfflineOnSecurityDB(podName, sql string) (string, error) {
 	shellScript := fmt.Sprintf(`set -e
 trap 'chmod +x %[1]s' EXIT

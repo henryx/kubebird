@@ -69,6 +69,15 @@ const (
 	// an Instance, so `kubectl get all,pvc,secrets,configmaps
 	// -l kubebird.github.io/instance=<name>` finds all of them.
 	instanceLabelKey = "kubebird.github.io/instance"
+
+	// sysdbaPasswordAnnotationKey records a hash of the SYSDBA Secret's
+	// current password on the StatefulSet's pod template (see
+	// mutateStatefulSet), so that rotating the Secret changes the
+	// template and lets the StatefulSet controller's own rolling update
+	// restart the pod - the same path a brand-new pod already takes to
+	// pick up FIREBIRD_ROOT_PASSWORD, rather than Kubebird pushing the
+	// change to the live server itself.
+	sysdbaPasswordAnnotationKey = "kubebird.github.io/sysdba-password-hash"
 )
 
 func labelsForInstance(name string) map[string]string {
@@ -255,8 +264,8 @@ func generateRandomPassword() (string, error) {
 // over the image's own databases.conf (see aliasesMountPath) would
 // otherwise drop the image's default one; RemoteAccess is disabled on it
 // so it's only reachable through the embedded/local connection Kubebird
-// itself uses (see reconcileSysdbaPassword). The alias points at the
-// security database's actual location on the primary PVC
+// itself uses at boot to apply FIREBIRD_ROOT_PASSWORD. The alias points
+// at the security database's actual location on the primary PVC
 // (securityDatabasePath) rather than the image's built-in $(dir_secDb)
 // macro, matching the FIREBIRD_CONF_SecurityDatabase override set on the
 // firebird container in mutateStatefulSet — $(dir_secDb) is a fixed macro
@@ -310,7 +319,7 @@ func (r *InstanceReconciler) mutateService(svc *corev1.Service, instance *kubebi
 // mutateStatefulSet applies the desired spec to the StatefulSet running
 // the Firebird server. The selector is immutable after creation, so it's
 // only set the first time.
-func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance *kubebirdv1.Instance) error {
+func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, instance *kubebirdv1.Instance) error {
 	labels := labelsForInstance(instance.Name)
 	replicas := int32(1)
 
@@ -318,10 +327,24 @@ func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance
 		sts.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 	}
 
+	password, err := r.sysdbaPassword(ctx, instance)
+	if err != nil {
+		return err
+	}
+
 	sts.Labels = labels
 	sts.Spec.Replicas = &replicas
 	sts.Spec.ServiceName = instance.Name
 	sts.Spec.Template.Labels = labels
+	// Forces a rolling recreate of the pod whenever the SYSDBA Secret's
+	// password changes: FIREBIRD_ROOT_PASSWORD (below) is only resolved
+	// and applied by the image's entrypoint at container start, so
+	// nothing short of a restart picks up a rotated password. Kubebird
+	// doesn't need to detect or push the change itself - it just has to
+	// make sure the template actually changes, which this annotation
+	// guarantees regardless of what else did or didn't change this
+	// reconcile.
+	sts.Spec.Template.Annotations = map[string]string{sysdbaPasswordAnnotationKey: sha256Hex(password)}
 	sts.Spec.Template.Spec.Containers = []corev1.Container{
 		{
 			Name:  containerName,

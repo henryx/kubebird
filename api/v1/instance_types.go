@@ -189,12 +189,6 @@ type InstanceStatus struct {
 	// +optional
 	DatabaseCount int32 `json:"databaseCount"`
 
-	// sysdbaPasswordHash is a hash of the SYSDBA password Kubebird last
-	// applied to the live server, used to detect when the referenced
-	// Secret's password has been rotated.
-	// +optional
-	SysdbaPasswordHash string `json:"sysdbaPasswordHash,omitempty"`
-
 	// phase is a high-level summary of the Instance's lifecycle state:
 	// "Provisioning" while the StatefulSet or its databases aren't ready
 	// yet, "Ready" once the pod is ready and every database in

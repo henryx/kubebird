@@ -38,6 +38,12 @@
   image's own default the first time, before the `firebird` container starts; the `security.db`
   alias in `databases.conf` and a new `FIREBIRD_CONF_SecurityDatabase` environment variable both
   point the live engine at this same relocated path.
+- Rotating the SYSDBA Secret's password now restarts the pod to apply it: the `StatefulSet`'s pod
+  template carries a `kubebird.github.io/sysdba-password-hash` annotation hashing the Secret's
+  current password, so a rotation changes the template and the `StatefulSet` controller's own
+  rolling update recreates the pod, letting the image's entrypoint apply the new password the same
+  way it already does for a brand-new `Instance` — rather than Kubebird pushing the change to the
+  live server itself.
 
 ### Fixed
 
@@ -47,13 +53,10 @@
   running `CREATE DATABASE`, and just registers it into `status.databases` — alongside its
   already-unconditional `databases.conf` alias — instead of re-creating (and risking clobbering)
   it.
-- Live SYSDBA password rotation no longer fails against a running server: the direct embedded
-  connection `reconcileSysdbaPassword` uses to change the password without needing the old one
-  was attempting to open the security database file while the live server already had it open,
-  which Firebird refuses ("Database already opened with engine instance, incompatible with
-  current"). `execWithSecurityDatabaseOffline` now briefly stops the server first (disabling the
-  `firebird` binary so `fbguard` can't respawn it, killing the running process, then restoring it
-  once the password change is done) to get a clear window for that one connection.
+- The generated SYSDBA password could occasionally start with `-`, which broke any tool invoked
+  with it as a bare `-password <value>` CLI argument (e.g. `isql`, misparsing the leading `-` as a
+  flag of its own rather than part of the password). `generateRandomPassword` now rejects that
+  case and generates another password instead.
 
 ## 0.2.0
 

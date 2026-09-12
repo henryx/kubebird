@@ -154,6 +154,10 @@ var _ = Describe("Instance Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
 			Expect(sts.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
 
+			By("annotating the pod template with a hash of the SYSDBA Secret's current password")
+			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				"kubebird.github.io/sysdba-password-hash", sha256Hex(string(secret.Data["password"]))))
+
 			By("running the security-database-init initContainer before it, to seed the primary PVC's security database")
 			Expect(sts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("security-database-init"))
@@ -193,6 +197,31 @@ var _ = Describe("Instance Controller", func() {
 
 			By("adding the finalizer so deletion can be observed")
 			Expect(updated.Finalizers).To(ContainElement(finalizerName))
+		})
+
+		It("changes the StatefulSet's pod template when the SYSDBA Secret's password is rotated", func() {
+			By("reconciling once to create the StatefulSet with the initial password's hash")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+			hashBefore := sts.Spec.Template.Annotations["kubebird.github.io/sysdba-password-hash"]
+			Expect(hashBefore).NotTo(BeEmpty())
+
+			By("overwriting the Secret's password")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, secretName, secret)).To(Succeed())
+			secret.Data["password"] = []byte("a-different-password")
+			Expect(k8sClient.Update(ctx, secret)).To(Succeed())
+
+			By("reconciling again")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
+
+			By("changing the pod template's password-hash annotation, so the StatefulSet controller restarts the pod")
+			Expect(sts.Spec.Template.Annotations["kubebird.github.io/sysdba-password-hash"]).
+				NotTo(Equal(hashBefore))
 		})
 	})
 

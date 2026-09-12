@@ -45,7 +45,8 @@ const (
 // real cluster: CRD validation, deployment of the Secret, aliases
 // ConfigMap, Service and StatefulSet, real database provisioning inside
 // the Firebird container, adding a database to an already-deployed
-// Instance, live SYSDBA password rotation, and cleanup on deletion.
+// Instance, a pod restart to apply a rotated SYSDBA password, and cleanup
+// on deletion.
 //
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, after the CRDs are installed and the controller-manager is
@@ -288,14 +289,24 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should push a rotated SYSDBA password to the live server", func() {
+		It("should restart the pod to apply a rotated SYSDBA password", func() {
 			const newPassword = "e2e-rotated-Pa55word!"
+
+			startTimeBefore, err := getPodStartTime()
+			Expect(err).NotTo(HaveOccurred())
 
 			By("overwriting the SYSDBA Secret's password")
 			cmd := exec.Command("kubectl", "patch", "secret", instanceSecretName, "-n", namespace,
 				"--type=merge", "-p", fmt.Sprintf(`{"stringData":{"password":%q}}`, newPassword))
-			_, err := utils.Run(cmd)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			By("restarting the pod, since the password-hash annotation on its template changed")
+			Eventually(func(g Gomega) {
+				startTimeAfter, err := getPodStartTime()
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(startTimeAfter).NotTo(Equal(startTimeBefore))
+			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("authenticating against the running server with the new password")
 			Eventually(func(g Gomega) {

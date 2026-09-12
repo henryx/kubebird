@@ -48,12 +48,6 @@ import (
 // securityDatabasePath).
 const securityDatabaseDir = "/opt/firebird"
 
-// firebirdBinaryPath is the Firebird server daemon's own binary inside the
-// firebirdsql/firebird image. Unlike isql it's never exec'd directly -
-// callers need its literal path to briefly disable it via chmod (see
-// execWithSecurityDatabaseOffline).
-const firebirdBinaryPath = securityDatabaseDir + "/bin/firebird"
-
 // isql/gbak binaries and flags shared across the exec'd commands in this
 // file.
 const (
@@ -196,111 +190,6 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	instance.Status.Warning = warning
 
 	return r.Status().Update(ctx, instance)
-}
-
-// reconcileSysdbaPassword pushes the SYSDBA password in the referenced
-// Secret to the live server once it drifts from the password Kubebird
-// last applied.
-//
-// Firebird has no way to change a user's password without either the
-// current password or an OS-trusted local connection, and once the user
-// overwrites the Secret the previous password is gone from Kubernetes
-// state. So rather than caching it, the change is made by exec-ing isql
-// directly against the security database file (an embedded connection,
-// not the usual host:port TCP one) so that root inside the container -
-// the same account that owns the security database - is trusted without
-// a password, matching how gsec/isql are used locally to recover a lost
-// SYSDBA password. But Firebird refuses a second engine instance - even
-// this kind of embedded, OS-trusted one - on a database file another
-// engine instance already has open, and the live server always does
-// ("Database already opened with engine instance, incompatible with
-// current"); so this briefly takes the server offline for the one
-// embedded connection that's guaranteed to succeed (see
-// execWithSecurityDatabaseOffline) rather than attaching alongside it, at
-// the cost of a short window of downtime for every other connection to
-// this Instance whenever the Secret's password changes.
-func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instance *kubebirdv1.Instance, sts *appsv1.StatefulSet) error {
-	if sts.Status.ReadyReplicas == 0 {
-		return nil
-	}
-
-	password, err := r.sysdbaPassword(ctx, instance)
-	if err != nil {
-		return err
-	}
-	hash := sha256Hex(password)
-	if hash == instance.Status.SysdbaPasswordHash {
-		return nil
-	}
-
-	if instance.Status.SysdbaPasswordHash != "" {
-		podName := instance.Name + "-0"
-		// No -user/-password: a direct (embedded) connection to the
-		// security database file, rather than the usual host:port one,
-		// is trusted based on the OS user running isql instead of
-		// requiring a password - the same mechanism admins rely on to
-		// recover a lost SYSDBA password locally.
-		body := fmt.Sprintf(`isql %[1]s <<'SQLEOF'
-ALTER USER %[2]s PASSWORD '%[3]s';
-COMMIT;
-QUIT;
-SQLEOF`, securityDatabasePath(instance), sysdbaUsername, password)
-		if err := r.execWithSecurityDatabaseOffline(ctx, instance, podName, body); err != nil {
-			return fmt.Errorf("failed to rotate SYSDBA password: %w", err)
-		}
-		logf.FromContext(ctx).Info("Rotated SYSDBA password on the live server")
-	}
-
-	instance.Status.SysdbaPasswordHash = hash
-	return r.Status().Update(ctx, instance)
-}
-
-// execWithSecurityDatabaseOffline briefly takes the live Firebird server
-// offline so body - an isql heredoc needing an embedded (no-password,
-// OS-trusted) connection to the security database - can run without
-// conflicting with the server's own already-open engine instance on that
-// file. Firebird refuses a second engine instance - embedded or not - on a
-// database file another instance already has open, and the live server
-// always has the security database open; a client can still reach it
-// through the live server itself over a network or loopback connection
-// (see e.g. test/e2e/instance_security_database_test.go), but that always
-// requires knowing the current password to authenticate, which is exactly
-// what this function can't assume. So instead of attaching alongside the
-// live server, this stops it first: fbguard only respawns firebird once
-// its binary is executable again (rather than killing firebird outright,
-// which would also kill fbguard's own foreground "wait" and the whole
-// container along with it), so disabling that binary first gives a
-// deterministic offline window - no server is running, so nothing holds
-// the file open, and body's embedded connection succeeds as its own
-// private engine instead of conflicting with one. Once body has run, it
-// waits for a real connection to succeed again - not just for the process
-// to exist, since pidof firebird only proves fbguard has respawned it, not
-// that it has finished its own startup and is ready to accept a new
-// attach - before returning, so the caller can safely move on.
-func (r *InstanceReconciler) execWithSecurityDatabaseOffline(ctx context.Context, instance *kubebirdv1.Instance, podName, body string) error {
-	dbPath := securityDatabasePath(instance)
-	script := fmt.Sprintf(`set -e
-trap 'chmod +x %[1]s' EXIT
-chmod -x %[1]s
-pid=$(pidof firebird || true)
-[ -n "$pid" ] && kill -9 "$pid"
-%[2]s
-chmod +x %[1]s
-trap - EXIT
-for i in $(seq 1 300); do
-	if isql %[3]s <<'PROBEEOF' >/dev/null 2>&1
-SET BAIL ON;
-SELECT 1 FROM RDB$DATABASE;
-QUIT;
-PROBEEOF
-	then
-		exit 0
-	fi
-	sleep 0.1
-done
-echo "firebird did not become reachable again" >&2
-exit 1`, firebirdBinaryPath, body, dbPath)
-	return r.execInPod(ctx, instance.Namespace, podName, []string{"sh", "-c", script}, "")
 }
 
 // securityDatabasePath returns the in-container path of the security

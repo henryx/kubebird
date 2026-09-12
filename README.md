@@ -13,8 +13,8 @@
   collation, and shadow files) as the list changes, without requiring a pod restart.
 - Registers a Firebird alias per database automatically, so clients can connect by alias instead of
   in-pod filesystem path.
-- Generates a SYSDBA credentials Secret (or uses one you supply) and keeps the live server's
-  password in sync whenever the Secret changes.
+- Generates a SYSDBA credentials Secret (or uses one you supply) and restarts the pod to apply the
+  password whenever the Secret changes.
 - Backs up every database with `gbak` and releases the primary/shadow storage on deletion when a
   backup volume is configured, then restores from those backups automatically if an `Instance` with
   the same name is recreated — including across a Firebird major-version bump (e.g. `3.0.14` to
@@ -160,8 +160,8 @@ With this CR, Kubebird can:
 When an `Instance` is created, Kubebird creates the objects below in order (steps 1-7); every one
 except the primary/backup/shadow PVCs is owned by the `Instance` and removed automatically when the
 `Instance` is deleted (see "Deleting an Instance" below). Kubernetes then creates the Pod from the
-`StatefulSet`'s template, and once the Pod becomes ready Kubebird syncs the SYSDBA password and
-creates the requested databases inside it (steps 8-10):
+`StatefulSet`'s template, and once the Pod becomes ready Kubebird creates the requested databases
+inside it (steps 8-9):
 
 ```mermaid
 flowchart TD
@@ -186,8 +186,7 @@ flowchart TD
     STS -->|Kubernetes creates| Pod["Pod<br/>&lt;name&gt;-0"]
 
     Kubebird -->|"8: waits for readiness"| Pod
-    Kubebird -->|"9: syncs the SYSDBA password"| Pod
-    Kubebird -->|"10: creates the databases"| Pod
+    Kubebird -->|"9: creates the databases"| Pod
 
     classDef owned fill:#e6ecff,stroke:#3355ff,color:#000
     class Secret,CM,Service,STS owned
@@ -213,12 +212,11 @@ Kubebird also reacts to updates on an existing `Instance`:
   removes its shadow file, if any, along with it), drops it from `status.databases`, and removes
   its alias from `databases.conf` — again without a pod restart.
 - Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
-  `authentication.sysdba.secretRef`) pushes the new password to the live server automatically, so
-  the secret and the running instance never drift apart. Since Firebird refuses a second engine
-  instance on a database file the live server already has open — even the embedded, OS-trusted
-  connection this uses to change the password without needing the old one — this briefly stops
-  and restarts the `firebird` process to get a clear window for that one connection, causing a
-  short disruption to every other connection to the `Instance`.
+  `authentication.sysdba.secretRef`) restarts the pod: the `StatefulSet`'s pod template carries an
+  annotation hashing the secret's current password, so a rotation changes the template and the
+  `StatefulSet` controller's own rolling update recreates the pod, letting the image's entrypoint
+  apply the new password the same way it already does for a brand-new `Instance`. This causes a
+  short disruption to every connection to the `Instance` while the pod restarts.
 
 Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
 it (the Secret, aliases ConfigMap, Service and StatefulSet are all owned by the `Instance`); the
