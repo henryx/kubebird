@@ -148,6 +148,7 @@ With this CR, Kubebird can:
 - Optionally define a `<instance-name>-backup` PVC (`storage.backup`), mounted into the pod at `/var/lib/firebird/backup`. Omit it if you don't need a dedicated backup volume. Like the primary/shadow PVCs, it isn't owned by the `Instance` — deleting the `Instance` leaves it (and its backup data) in place instead of garbage-collecting it. Setting it also changes what happens to the *other* storage on deletion — see "Deleting an Instance" below. It also feeds back into provisioning: for a database that isn't already on the primary PVC, if a backup for it exists at `<mount>/<instance-name>/<database>.fbk` (e.g. because this `Instance`'s name was deleted-with-backup and is now being recreated), Kubebird restores it via `gbak -create -verify` instead of creating an empty database, recreating its shadow file too if `shadow: true`.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
+- Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart and a reused primary PVC (see above). A `security-database-init` init container seeds it there from the image's own default the first time, before the `firebird` container starts; the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
 - Authentication is optional. If `authentication.sysdba.secretRef` is specified, Kubebird uses that Secret for the SYSDBA password; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password. Either way, the secret has `username` (always `SYSDBA`) and `password` keys.
 - Label every object it creates (PVCs, Service, StatefulSet, the aliases ConfigMap, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets,configmaps -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 - Report the most recent error, if any, in `status.error` — surfaced without needing to check the operator's own logs, via the `MESSAGE` column below. It's cleared automatically once the `Instance` reconciles successfully again.
@@ -199,7 +200,9 @@ secret, database aliases from the ConfigMap, traffic routing from the Service, p
 data from the PVCs, referenced by name) rather than a separate creation step; the Pod, by contrast,
 is created directly by Kubernetes from the `StatefulSet`'s template. The backup `PVC` only exists
 when `storage.backup` is set on the `Instance`, and the shadow `PVC` only exists when
-`storage.shadow` is set.
+`storage.shadow` is set. Before the `firebird` container in that Pod starts, a `security-database-init`
+init container (mounting the primary PVC) seeds the security database onto it if it isn't already
+there — see above.
 
 Kubebird also reacts to updates on an existing `Instance`:
 - Changing `spec.service.type`, `spec.service.port`, or `spec.version` reconciles the
@@ -211,7 +214,11 @@ Kubebird also reacts to updates on an existing `Instance`:
   its alias from `databases.conf` — again without a pod restart.
 - Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
   `authentication.sysdba.secretRef`) pushes the new password to the live server automatically, so
-  the secret and the running instance never drift apart.
+  the secret and the running instance never drift apart. Since Firebird refuses a second engine
+  instance on a database file the live server already has open — even the embedded, OS-trusted
+  connection this uses to change the password without needing the old one — this briefly stops
+  and restarts the `firebird` process to get a clear window for that one connection, causing a
+  short disruption to every other connection to the `Instance`.
 
 Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
 it (the Secret, aliases ConfigMap, Service and StatefulSet are all owned by the `Instance`); the

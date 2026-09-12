@@ -315,6 +315,16 @@ var _ = Describe("Manager", Ordered, func() {
 		// restores cleanly under the new version's gbak and server,
 		// carrying user data across the upgrade.
 		instanceVersionUpgradeSpecs()
+
+		// instanceSecurityDatabaseSpecs
+		// (test/e2e/instance_security_database_test.go) exercises
+		// the security-database-init init container's "leave it
+		// alone" path: a user created directly in the security
+		// database survives deleting and recreating an Instance
+		// without storage.backup configured, since the primary PVC
+		// (carrying the security database with it) is unowned and
+		// survives deletion.
+		instanceSecurityDatabaseSpecs()
 	})
 })
 

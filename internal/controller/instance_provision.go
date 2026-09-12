@@ -40,9 +40,19 @@ import (
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
 )
 
-// securityDatabaseDir is where the firebirdsql/firebird image keeps the
-// server's security database (securityN.fdb, N being the major version).
-const securityDatabaseDir = "/usr/local/firebird"
+// securityDatabaseDir is where the firebirdsql/firebird image itself is
+// installed, including its baked-in default security database
+// (securityN.fdb, N being the major version) — used only as the seed
+// source for a brand-new instance (see securityDatabaseImageDefaultPath);
+// the live security database is kept on the primary PVC instead (see
+// securityDatabasePath).
+const securityDatabaseDir = "/opt/firebird"
+
+// firebirdBinaryPath is the Firebird server daemon's own binary inside the
+// firebirdsql/firebird image. Unlike isql it's never exec'd directly -
+// callers need its literal path to briefly disable it via chmod (see
+// execWithSecurityDatabaseOffline).
+const firebirdBinaryPath = securityDatabaseDir + "/bin/firebird"
 
 // isql/gbak binaries and flags shared across the exec'd commands in this
 // file.
@@ -200,7 +210,15 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 // not the usual host:port TCP one) so that root inside the container -
 // the same account that owns the security database - is trusted without
 // a password, matching how gsec/isql are used locally to recover a lost
-// SYSDBA password.
+// SYSDBA password. But Firebird refuses a second engine instance - even
+// this kind of embedded, OS-trusted one - on a database file another
+// engine instance already has open, and the live server always does
+// ("Database already opened with engine instance, incompatible with
+// current"); so this briefly takes the server offline for the one
+// embedded connection that's guaranteed to succeed (see
+// execWithSecurityDatabaseOffline) rather than attaching alongside it, at
+// the cost of a short window of downtime for every other connection to
+// this Instance whenever the Secret's password changes.
 func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instance *kubebirdv1.Instance, sts *appsv1.StatefulSet) error {
 	if sts.Status.ReadyReplicas == 0 {
 		return nil
@@ -222,9 +240,12 @@ func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instan
 		// is trusted based on the OS user running isql instead of
 		// requiring a password - the same mechanism admins rely on to
 		// recover a lost SYSDBA password locally.
-		embeddedCommand := []string{binIsql, securityDatabasePath(instance)}
-		script := fmt.Sprintf("ALTER USER %s PASSWORD '%s';\nQUIT;\n", sysdbaUsername, password)
-		if err := r.execInPod(ctx, instance.Namespace, podName, embeddedCommand, script); err != nil {
+		body := fmt.Sprintf(`isql %[1]s <<'SQLEOF'
+ALTER USER %[2]s PASSWORD '%[3]s';
+COMMIT;
+QUIT;
+SQLEOF`, securityDatabasePath(instance), sysdbaUsername, password)
+		if err := r.execWithSecurityDatabaseOffline(ctx, instance, podName, body); err != nil {
 			return fmt.Errorf("failed to rotate SYSDBA password: %w", err)
 		}
 		logf.FromContext(ctx).Info("Rotated SYSDBA password on the live server")
@@ -234,10 +255,72 @@ func (r *InstanceReconciler) reconcileSysdbaPassword(ctx context.Context, instan
 	return r.Status().Update(ctx, instance)
 }
 
+// execWithSecurityDatabaseOffline briefly takes the live Firebird server
+// offline so body - an isql heredoc needing an embedded (no-password,
+// OS-trusted) connection to the security database - can run without
+// conflicting with the server's own already-open engine instance on that
+// file. Firebird refuses a second engine instance - embedded or not - on a
+// database file another instance already has open, and the live server
+// always has the security database open; a client can still reach it
+// through the live server itself over a network or loopback connection
+// (see e.g. test/e2e/instance_security_database_test.go), but that always
+// requires knowing the current password to authenticate, which is exactly
+// what this function can't assume. So instead of attaching alongside the
+// live server, this stops it first: fbguard only respawns firebird once
+// its binary is executable again (rather than killing firebird outright,
+// which would also kill fbguard's own foreground "wait" and the whole
+// container along with it), so disabling that binary first gives a
+// deterministic offline window - no server is running, so nothing holds
+// the file open, and body's embedded connection succeeds as its own
+// private engine instead of conflicting with one. Once body has run, it
+// waits for a real connection to succeed again - not just for the process
+// to exist, since pidof firebird only proves fbguard has respawned it, not
+// that it has finished its own startup and is ready to accept a new
+// attach - before returning, so the caller can safely move on.
+func (r *InstanceReconciler) execWithSecurityDatabaseOffline(ctx context.Context, instance *kubebirdv1.Instance, podName, body string) error {
+	dbPath := securityDatabasePath(instance)
+	script := fmt.Sprintf(`set -e
+trap 'chmod +x %[1]s' EXIT
+chmod -x %[1]s
+pid=$(pidof firebird || true)
+[ -n "$pid" ] && kill -9 "$pid"
+%[2]s
+chmod +x %[1]s
+trap - EXIT
+for i in $(seq 1 300); do
+	if isql %[3]s <<'PROBEEOF' >/dev/null 2>&1
+SET BAIL ON;
+SELECT 1 FROM RDB$DATABASE;
+QUIT;
+PROBEEOF
+	then
+		exit 0
+	fi
+	sleep 0.1
+done
+echo "firebird did not become reachable again" >&2
+exit 1`, firebirdBinaryPath, body, dbPath)
+	return r.execInPod(ctx, instance.Namespace, podName, []string{"sh", "-c", script}, "")
+}
+
 // securityDatabasePath returns the in-container path of the security
-// database matching the instance's Firebird major version, e.g.
-// "/usr/local/firebird/security3.fdb" for version "3.0.14".
+// database matching the instance's Firebird major version, on the primary
+// PVC, e.g. "/var/lib/firebird/data/security3.fdb" for version "3.0.14" —
+// wired up as the engine's live SecurityDatabase via the
+// FIREBIRD_CONF_SecurityDatabase env var (mutateStatefulSet) and the
+// security.db alias (mutateAliasesConfigMap), and populated there by the
+// security-database-init initContainer before the firebird container ever
+// starts (see securityDatabaseInitScript).
 func securityDatabasePath(instance *kubebirdv1.Instance) string {
+	return path.Join(primaryDataMountPath, securityDatabaseFileName(instance))
+}
+
+// securityDatabaseImageDefaultPath returns the path of the security
+// database baked into the firebirdsql/firebird image itself, e.g.
+// "/opt/firebird/security3.fdb" for version "3.0.14" — used only as the
+// security-database-init initContainer's seed source when the primary PVC
+// doesn't already have one (see securityDatabaseInitScript).
+func securityDatabaseImageDefaultPath(instance *kubebirdv1.Instance) string {
 	return path.Join(securityDatabaseDir, securityDatabaseFileName(instance))
 }
 
@@ -296,6 +379,22 @@ func databaseCreateScript(db kubebirdv1.DatabaseSpec) string {
 	b.WriteString("QUIT;\n")
 
 	return b.String()
+}
+
+// securityDatabaseInitScript renders the shell script run by the
+// security-database-init initContainer (see mutateStatefulSet) before the
+// firebird container starts: if the security database isn't already
+// present on the primary PVC — e.g. because it's a reused PVC from an
+// earlier Instance with the same name (see reconcilePVC) — it's seeded
+// from the image's own baked-in default (securityDatabaseImageDefaultPath),
+// so the freshly relocated SecurityDatabase path always has a file to
+// open.
+func securityDatabaseInitScript(instance *kubebirdv1.Instance) string {
+	return fmt.Sprintf(`set -e
+if [ ! -f %[1]q ]; then
+	cp %[2]q %[1]q
+fi
+`, securityDatabasePath(instance), securityDatabaseImageDefaultPath(instance))
 }
 
 // execInPod runs command inside the firebird container of podName,

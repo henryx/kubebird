@@ -130,7 +130,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(cm.Data["databases.conf"]).To(ContainSubstring("instance.fdb = /var/lib/firebird/data/instance.fdb"))
 
 			By("also registering the security database alias, since it mounts over the image's own databases.conf")
-			Expect(cm.Data["databases.conf"]).To(ContainSubstring("security.db = $(dir_secDb)/security3.fdb"))
+			Expect(cm.Data["databases.conf"]).To(ContainSubstring("security.db = /var/lib/firebird/data/security3.fdb"))
 			Expect(cm.Data["databases.conf"]).To(ContainSubstring("RemoteAccess = false"))
 
 			By("creating the Service exposing the instance")
@@ -153,6 +153,11 @@ var _ = Describe("Instance Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
 			Expect(sts.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+
+			By("running the security-database-init initContainer before it, to seed the primary PVC's security database")
+			Expect(sts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("security-database-init"))
+			Expect(sts.Spec.Template.Spec.InitContainers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
 
 			By("mounting the primary PVC by name rather than via a volumeClaimTemplate")
 			Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())

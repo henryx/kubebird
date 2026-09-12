@@ -62,7 +62,8 @@ const (
 	backupVolumeName  = "backup"
 	aliasesVolumeName = "aliases"
 
-	containerName = "firebird"
+	containerName                     = "firebird"
+	securityDatabaseInitContainerName = "security-database-init"
 
 	// instanceLabelKey labels every object Kubebird creates on behalf of
 	// an Instance, so `kubectl get all,pvc,secrets,configmaps
@@ -227,13 +228,22 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 }
 
 // generateRandomPassword returns a cryptographically random, URL-safe
-// base64-encoded string suitable for use as the SYSDBA password.
+// base64-encoded string suitable for use as the SYSDBA password. The
+// result never starts with '-': tools invoked with it as a bare
+// "-password <value>" CLI argument (e.g. isql, in both Kubebird itself
+// and its e2e tests) would otherwise misparse a leading '-' as a flag of
+// its own rather than the password value.
 func generateRandomPassword() (string, error) {
-	buf := make([]byte, generatedPasswordLength)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
+	for {
+		buf := make([]byte, generatedPasswordLength)
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		password := base64.RawURLEncoding.EncodeToString(buf)
+		if password[0] != '-' {
+			return password, nil
+		}
 	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 // mutateAliasesConfigMap populates a ConfigMap with a Firebird
@@ -245,7 +255,12 @@ func generateRandomPassword() (string, error) {
 // over the image's own databases.conf (see aliasesMountPath) would
 // otherwise drop the image's default one; RemoteAccess is disabled on it
 // so it's only reachable through the embedded/local connection Kubebird
-// itself uses (see reconcileSysdbaPassword).
+// itself uses (see reconcileSysdbaPassword). The alias points at the
+// security database's actual location on the primary PVC
+// (securityDatabasePath) rather than the image's built-in $(dir_secDb)
+// macro, matching the FIREBIRD_CONF_SecurityDatabase override set on the
+// firebird container in mutateStatefulSet — $(dir_secDb) is a fixed macro
+// tied to the image's install root and doesn't follow that override.
 func (r *InstanceReconciler) mutateAliasesConfigMap(cm *corev1.ConfigMap, instance *kubebirdv1.Instance) error {
 	cm.Labels = labelsForInstance(instance.Name)
 
@@ -257,8 +272,8 @@ func (r *InstanceReconciler) mutateAliasesConfigMap(cm *corev1.ConfigMap, instan
 		}
 		fmt.Fprintf(&b, "%s = %s\n", alias, path.Join(primaryDataMountPath, db.Name))
 	}
-	fmt.Fprintf(&b, "security.db = $(dir_secDb)/%s\n{\n\tRemoteAccess = false\n\tDefaultDbCachePages = 50\n}\n",
-		securityDatabaseFileName(instance))
+	fmt.Fprintf(&b, "security.db = %s\n{\n\tRemoteAccess = false\n\tDefaultDbCachePages = 50\n}\n",
+		securityDatabasePath(instance))
 	cm.Data = map[string]string{aliasesConfigMapKey: b.String()}
 
 	return controllerutil.SetControllerReference(instance, cm, r.Scheme)
@@ -334,8 +349,27 @@ func (r *InstanceReconciler) mutateStatefulSet(sts *appsv1.StatefulSet, instance
 						},
 					},
 				},
+				// Points the engine's own security database at its
+				// persistent location on the primary PVC (see
+				// securityDatabasePath) instead of the image's default
+				// under /opt/firebird, which the security-database-init
+				// initContainer below has already populated by the time
+				// this container starts.
+				{Name: "FIREBIRD_CONF_SecurityDatabase", Value: securityDatabasePath(instance)},
 			},
 			VolumeMounts: volumeMounts(instance),
+		},
+	}
+	sts.Spec.Template.Spec.InitContainers = []corev1.Container{
+		{
+			Name:  securityDatabaseInitContainerName,
+			Image: fmt.Sprintf("%s:%s", instance.Spec.Image, instance.Spec.Version),
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			Command:      []string{"sh", "-c", securityDatabaseInitScript(instance)},
+			VolumeMounts: []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}},
 		},
 	}
 	sts.Spec.Template.Spec.Volumes = []corev1.Volume{
