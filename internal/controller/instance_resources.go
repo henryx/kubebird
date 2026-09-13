@@ -383,6 +383,14 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 			VolumeMounts: volumeMounts(instance),
 		},
 	}
+	initVolumeMounts := []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}}
+	if instance.Spec.Storage.Backup != nil {
+		// Lets securityDatabaseInitScript restore a security database
+		// backup left behind by an earlier Instance's
+		// backupAndReleaseStorage under the same name, instead of always
+		// falling back to the image's stock default.
+		initVolumeMounts = append(initVolumeMounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
+	}
 	sts.Spec.Template.Spec.InitContainers = []corev1.Container{
 		{
 			Name:  securityDatabaseInitContainerName,
@@ -392,7 +400,7 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Command:      []string{"sh", "-c", securityDatabaseInitScript(instance)},
-			VolumeMounts: []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}},
+			VolumeMounts: initVolumeMounts,
 		},
 	}
 	sts.Spec.Template.Spec.Volumes = []corev1.Volume{

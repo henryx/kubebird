@@ -8,15 +8,16 @@
   `/var/lib/firebird/backup`, for staging backups. Like the primary/shadow PVCs, it is never
   owner-referenced to the `Instance`.
 - Deleting an `Instance` with `storage.backup` configured now backs up every database in
-  `status.databases` into a subdirectory of the backup volume dedicated to that `Instance`
-  (`<mount>/<instance-name>/<database>.fbk`, via `gbak -backup -verify`) before removing its
-  finalizer, then releases the primary and shadow PVCs (deleting them outright, unlike the
-  default behavior of leaving all storage in place) — the backup PVC itself is left untouched.
-  The dedicated per-instance subdirectory keeps backups from different `Instance`s, or from
-  successive generations of one reusing the same backup PVC, from colliding.
+  `status.databases` into a fixed `base` subdirectory of the backup volume
+  (`<mount>/base/<database>.fbk`, via `gbak -backup -verify`) before removing its finalizer, then
+  releases the primary and shadow PVCs (deleting them outright, unlike the default behavior of
+  leaving all storage in place) — the backup PVC itself is left untouched. `base` doesn't need to
+  be named after the `Instance`: `storage.backup` is already a PVC dedicated to that `Instance`
+  (named `<instance-name>-backup`), so a fixed subdirectory name avoids stuttering the name into
+  the path a second time.
 - Recreating an `Instance` closes that loop: for a database not already on the primary PVC,
-  `storage.backup` is checked for a matching `<instance-name>/<database>.fbk` backup, and if one
-  is there it's restored via `gbak -create -verify` (recreating the shadow file too, for a
+  `storage.backup` is checked for a matching `base/<database>.fbk` backup, and if one is there
+  it's restored via `gbak -create -verify` (recreating the shadow file too, for a
   `shadow: true` database) instead of creating an empty database — so an `Instance` deleted with
   `storage.backup` configured can be fully recreated from its own backup PVC. This also covers
   upgrading between Firebird major versions: recreating with a different `spec.version` restores
@@ -38,6 +39,17 @@
   image's own default the first time, before the `firebird` container starts; the `security.db`
   alias in `databases.conf` and a new `FIREBIRD_CONF_SecurityDatabase` environment variable both
   point the live engine at this same relocated path.
+- When `storage.backup` is configured, deleting an `Instance` now also backs up the security
+  database itself (a plain file copy to `<mount>/base/securityN.fdb`, not a `gbak`
+  archive — `gbak` needs to authenticate against a security database to run, and this is that very
+  file) before releasing the primary PVC that carries it, and `security-database-init` restores
+  that backup in preference to the image's stock default when the `Instance` is recreated under
+  the same name — so users/roles created directly in the security database now survive a
+  delete/recreate cycle the same way application data in `spec.databases` already did. This backup
+  now runs unconditionally on deletion, even when `status.databases` is empty (the security
+  database always exists regardless of `spec.databases`), so deletion always waits for the
+  StatefulSet's pod to be ready before releasing storage — previously this wait, like the backup
+  itself, was skipped whenever no database had been provisioned.
 - Rotating the SYSDBA Secret's password now restarts the pod to apply it: the `StatefulSet`'s pod
   template carries a `kubebird.github.io/sysdba-password-hash` annotation hashing the Secret's
   current password, so a rotation changes the template and the `StatefulSet` controller's own

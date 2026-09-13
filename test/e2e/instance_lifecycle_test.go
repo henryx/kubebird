@@ -52,6 +52,12 @@ const (
 // e2e_test.go, after the CRDs are installed and the controller-manager is
 // deployed, and before that Describe's AfterAll tears them down.
 func instanceLifecycleSpecs() {
+	// sysdbaPasswordBeforeDelete carries the SYSDBA password captured just
+	// before deletion into the recreate/restore spec below, to prove the
+	// regenerated Secret's password actually differs and that SYSDBA
+	// authenticates with the new one, not the old one.
+	var sysdbaPasswordBeforeDelete string
+
 	Context("Instance", Ordered, func() {
 		AfterAll(func() {
 			By("deleting the e2e Instance, if it still exists")
@@ -320,9 +326,14 @@ spec:
 		})
 
 		It("should garbage collect the Secret, ConfigMap, Service and StatefulSet on deletion", func() {
+			By("recording the SYSDBA password before deletion, to later prove it isn't reused")
+			passwordBeforeDelete, err := getSecretField(instanceSecretName, "password")
+			Expect(err).NotTo(HaveOccurred())
+			sysdbaPasswordBeforeDelete = passwordBeforeDelete
+
 			By("deleting the Instance")
 			cmd := exec.Command("kubectl", "delete", "instance", instanceName, "-n", namespace)
-			_, err := utils.Run(cmd)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("garbage collecting every object it owned")
@@ -359,7 +370,10 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("actually backing up every provisioned database into the backup volume before releasing storage")
-			verifyBackupFiles(instanceBackupPVCName, instanceName+"/instance.fbk", instanceName+"/shadowed.fbk")
+			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/instance.fbk", backupBaseDir+"/shadowed.fbk")
+
+			By("also backing up the security database itself, since the primary PVC carrying it is about to be released")
+			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/security3.fdb")
 		})
 
 		It("should restore databases from their backups when the Instance is recreated", func() {
@@ -416,6 +430,27 @@ spec:
 				"--", "test", "-f", "/var/lib/firebird/shadow/shadowed.fdb")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			By("restoring the security database from its backup via the security-database-init initContainer, instead of seeding the image's stock default")
+			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
+				"--", "test", "-f", "/var/lib/firebird/data/security3.fdb")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("generating a new SYSDBA password rather than reusing the one from before deletion")
+			newPassword, err := getSecretField(instanceSecretName, "password")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(newPassword).NotTo(Equal(sysdbaPasswordBeforeDelete))
+
+			By("authenticating as SYSDBA against the restored database with the freshly-generated password")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "exec", "-i", instancePod(), "-n", namespace, "-c", firebirdContainer,
+					"--", "isql", "-user", "SYSDBA", "-password", newPassword,
+					"/var/lib/firebird/data/instance.fdb")
+				cmd.Stdin = strings.NewReader("QUIT;\n")
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 		})
 	})
 }

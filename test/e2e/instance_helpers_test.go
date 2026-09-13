@@ -33,6 +33,12 @@ import (
 
 const firebirdContainer = "firebird"
 
+// backupBaseDir is storage.backup's fixed subdirectory for an instance's
+// own backups (see instanceBackupDir in internal/controller), replacing
+// what a per-instance-name subdirectory would say — the backup PVC name
+// itself already identifies the instance.
+const backupBaseDir = "base"
+
 // getSecretField returns the decoded value of a key in a Secret's data.
 func getSecretField(secretName, key string) (string, error) {
 	cmd := exec.Command("kubectl", "get", "secret", secretName, "-n", namespace,

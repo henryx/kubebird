@@ -227,37 +227,42 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 }
 
 // backupAndReleaseStorage runs a final backup of every database recorded
-// in instance.Status.Databases into storage.backup, then deletes the
+// in instance.Status.Databases, plus the instance's security database
+// (see backupSecurityDatabase), into storage.backup, then deletes the
 // primary and shadow PVCs — but not the backup PVC itself — since their
 // data is now preserved in the backup volume.
 //
 // A backup requires the StatefulSet's pod to still be running, which
 // Reconcile guarantees by calling this before removing the finalizer
 // (Kubernetes only garbage collects the owner-referenced StatefulSet once
-// the Instance itself is fully deleted). If no database was ever
-// provisioned there is nothing to back up, so the pod's readiness isn't
-// required and the primary/shadow PVCs are released immediately.
+// the Instance itself is fully deleted). Unlike instance.Status.Databases,
+// the security database always exists by this point regardless of
+// spec.databases — the security-database-init initContainer seeds one
+// even for an Instance with none — so pod readiness is always required
+// here, rather than only when instance.Status.Databases is non-empty.
 func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
-	if len(instance.Status.Databases) > 0 {
-		sts := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, sts); err != nil {
-			if apierrors.IsNotFound(err) {
-				logf.FromContext(ctx).Info("Skipping final backup: StatefulSet no longer exists", "name", instance.Name)
-			} else {
-				return fmt.Errorf("failed to get StatefulSet: %w", err)
-			}
-		} else if sts.Status.ReadyReplicas == 0 {
-			if err := r.setDeletionMessage(ctx, instance, "Waiting for the Firebird pod to be ready before backing up databases"); err != nil {
-				return err
-			}
-			return fmt.Errorf("waiting for the Firebird pod to be ready before backing up databases")
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			logf.FromContext(ctx).Info("Skipping final backup: StatefulSet no longer exists", "name", instance.Name)
 		} else {
-			if err := r.setDeletionMessage(ctx, instance, "Backing up databases into storage.backup"); err != nil {
-				return err
-			}
-			if err := r.backupDatabases(ctx, instance, instance.Name+"-0"); err != nil {
-				return err
-			}
+			return fmt.Errorf("failed to get StatefulSet: %w", err)
+		}
+	} else if sts.Status.ReadyReplicas == 0 {
+		if err := r.setDeletionMessage(ctx, instance, "Waiting for the Firebird pod to be ready before backing up databases"); err != nil {
+			return err
+		}
+		return fmt.Errorf("waiting for the Firebird pod to be ready before backing up databases")
+	} else {
+		if err := r.setDeletionMessage(ctx, instance, "Backing up databases into storage.backup"); err != nil {
+			return err
+		}
+		podName := instance.Name + "-0"
+		if err := r.backupDatabases(ctx, instance, podName); err != nil {
+			return err
+		}
+		if err := r.backupSecurityDatabase(ctx, instance, podName); err != nil {
+			return err
 		}
 	}
 

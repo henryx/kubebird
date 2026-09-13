@@ -267,7 +267,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("releases the primary PVC but keeps the backup PVC, without needing the pod to be ready", func() {
+		It("blocks deletion until the Firebird pod is ready, then releases the primary PVC but keeps the backup PVC", func() {
 			By("the primary and backup PVCs existing after the first reconcile")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-primary", Namespace: resourceNamespace},
 				&corev1.PersistentVolumeClaim{})).To(Succeed())
@@ -279,7 +279,18 @@ var _ = Describe("Instance Controller", func() {
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 
+			By("reconciling once, which blocks on the StatefulSet pod not being ready to back up the security database")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).To(HaveOccurred())
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
+			Expect(resource.Finalizers).To(ContainElement(finalizerName), "finalizer should not be removed until the backup completes")
+
+			By("removing the StatefulSet, simulating it already being cleaned up, so deletion proceeds without a real pod to exec into")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, sts)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(HaveOccurred())
 
@@ -330,10 +341,11 @@ var _ = Describe("Instance Controller", func() {
 			Expect(updated.Status.Message).To(Equal("Waiting for the Firebird pod to be ready before backing up databases"))
 			Expect(updated.Finalizers).To(ContainElement(finalizerName), "finalizer should not be removed until the backup completes")
 
-			By("clearing status.databases so deletion can complete, then letting it finish")
-			updated.Status.Databases = nil
-			updated.Status.DatabaseCount = 0
-			Expect(k8sClient.Status().Update(ctx, updated)).To(Succeed())
+			By("removing the StatefulSet, simulating it already being cleaned up, so deletion proceeds without a real pod to exec into")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, sts)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
+
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, &kubebirdv1.Instance{})).To(HaveOccurred())

@@ -107,7 +107,7 @@ spec:
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("backing up both a.fdb and b.fdb into storage.backup before releasing the primary PVC")
-			verifyBackupFiles(orphanBackupPVCName, orphanInstanceName+"/a.fbk", orphanInstanceName+"/b.fbk")
+			verifyBackupFiles(orphanBackupPVCName, backupBaseDir+"/a.fbk", backupBaseDir+"/b.fbk")
 		})
 
 		It("should restore only b.fdb, create c.fdb fresh, and leave a.fbk untouched when recreated with a different database set", func() {
@@ -170,10 +170,10 @@ spec:
 			Expect(err).To(HaveOccurred())
 
 			By("leaving a.fbk in storage.backup untouched, orphaned rather than cleaned up")
-			verifyBackupFiles(orphanBackupPVCName, orphanInstanceName+"/a.fbk")
+			verifyBackupFiles(orphanBackupPVCName, backupBaseDir+"/a.fbk")
 
 			By("never writing a backup for c.fdb, since no deletion has backed it up yet")
-			verifyBackupFileMissing(orphanBackupPVCName, orphanInstanceName+"/c.fbk")
+			verifyBackupFileMissing(orphanBackupPVCName, backupBaseDir+"/c.fbk")
 
 			// Delete and wait for it to actually finish here, rather than
 			// leaving it to AfterAll's fire-and-forget cleanup: this is the
