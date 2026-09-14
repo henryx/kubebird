@@ -482,98 +482,98 @@ func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, inst
 	return true, nil
 }
 
-// backupDatabases exec's gbak inside the Firebird pod to back up every
-// database recorded in instance.Status.Databases into storage.backup's
-// base subdirectory (see instanceBackupDir), so their data survives even
-// after the primary/shadow PVCs are removed (see backupAndReleaseStorage).
-func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kubebirdv1.Instance, podName string) error {
-	password, err := r.sysdbaPassword(ctx, instance)
-	if err != nil {
-		return err
-	}
+// databaseBackupPodName returns the name of the short-lived helper Pod
+// backupDatabasesOffline creates to back up spec.databases and the
+// security database once the StatefulSet's own pod has stopped.
+func databaseBackupPodName(instance *kubebirdv1.Instance) string {
+	return instance.Name + "-database-backup"
+}
 
-	dir := instanceBackupDir()
-	if err := r.execInPod(ctx, instance.Namespace, podName, []string{"mkdir", "-p", dir}, ""); err != nil {
-		return fmt.Errorf("failed to create backup directory %q: %w", dir, err)
-	}
-
+// databaseBackupScript renders the shell script run by the helper Pod
+// createDatabaseBackupPod creates: a local (no host) "gbak -backup" for
+// every database in instance.Status.Databases, plus the security
+// database itself, each writing into storage.backup's base subdirectory
+// (see instanceBackupDir). No -user/-password is needed for any of it:
+// run as root, a local gbak backup of an already-existing database
+// (security database included) doesn't validate them against
+// anything — confirmed against the actual image, not just documentation.
+func databaseBackupScript(instance *kubebirdv1.Instance) string {
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	fmt.Fprintf(&b, "mkdir -p %q\n", instanceBackupDir())
 	for _, name := range instance.Status.Databases {
 		src := path.Join(primaryDataMountPath, name)
-		dst := path.Join(dir, backupFileName(name))
-		command := []string{binGbak, "-backup", flagVerify, flagUser, sysdbaUsername, flagPassword, password, src, dst}
-		if err := r.execInPod(ctx, instance.Namespace, podName, command, ""); err != nil {
-			return fmt.Errorf("failed to back up database %q: %w", name, err)
-		}
-		logf.FromContext(ctx).Info("Backed up database", "database", name, "path", dst)
+		dst := path.Join(instanceBackupDir(), backupFileName(name))
+		fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak, src, dst)
 	}
-	return nil
+	fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak, securityDatabasePath(instance), securityDatabaseBackupPath(instance))
+	return b.String()
 }
 
-// securityBackupPodName returns the name of the short-lived helper Pod
-// backupSecurityDatabaseOffline creates to back up the security database
-// once the StatefulSet's own pod has stopped.
-func securityBackupPodName(instance *kubebirdv1.Instance) string {
-	return instance.Name + "-security-backup"
-}
-
-// backupSecurityDatabaseOffline gbak-backs-up the instance's security
-// database into its dedicated backup subdirectory (see instanceBackupDir),
-// so that backupAndReleaseStorage deleting the primary PVC afterwards
-// (whenever storage.backup is configured) doesn't also discard whatever
-// users/roles were created directly in it. The security-database-init
-// initContainer restores this backup on a later recreate under the same
-// name (see securityDatabaseInitScript).
+// backupDatabasesOffline gbak-backs-up every database in
+// instance.Status.Databases, plus the instance's security database, into
+// storage.backup's base subdirectory (see instanceBackupDir), so their
+// data survives even after the primary/shadow PVCs are removed (see
+// backupAndReleaseStorage). The security-database-init initContainer and
+// restoreDatabaseIfBackedUp both restore these backups on a later
+// recreate under the same name.
 //
-// Unlike every other database handled in this file, this can't just exec
-// gbak inside the running firebird container: gbak backing up the
-// security database while the live server still has it open fails
-// outright with "Database already opened with engine instance,
-// incompatible with current" (confirmed against the actual image), and
-// routing it through the services manager instead fares no better
-// ("no permission for remote access to database") — the security
-// database is apparently held exclusively by the engine and reachable
-// only locally, unlike regular application databases, which support the
-// normal multi-attach gbak already relies on in backupDatabases above.
-// So backupAndReleaseStorage scales the StatefulSet to 0 replicas first,
-// stopping the pod and releasing that hold, before calling this — which
-// runs its own local gbak backup (no host given, so no live server is
+// Unlike a database that's still live, none of this can just exec gbak
+// inside the running firebird container: gbak backing up the security
+// database while the live server still has it open fails outright with
+// "Database already opened with engine instance, incompatible with
+// current" (confirmed against the actual image), and routing it through
+// the services manager instead fares no better ("no permission for
+// remote access to database") — the security database is apparently held
+// exclusively by the engine and reachable only locally. So
+// backupAndReleaseStorage scales the StatefulSet to 0 replicas first,
+// stopping the pod and releasing every database's live engine instance
+// (not just the security database's), before calling this — which runs
+// its own local gbak backups (no host given, so no live server is
 // involved at all) from a short-lived helper Pod that mounts the same
-// primary and backup PVCs instead of exec-ing into a running one. No
-// -user/-password is needed: a local gbak backup of an existing security
-// database, run as root, doesn't validate them against anything —
-// confirmed against the actual image, not just documentation — so the
-// helper Pod needs no access to the SYSDBA Secret at all.
-func (r *InstanceReconciler) backupSecurityDatabaseOffline(ctx context.Context, instance *kubebirdv1.Instance) error {
-	podName := securityBackupPodName(instance)
+// primary and backup PVCs instead of exec-ing into a running one. Doing
+// every database this same way, rather than only the security database,
+// means every backup in this run comes from the exact same quiesced,
+// fully-stopped snapshot instead of a live one gbak's own transaction
+// semantics merely made internally consistent.
+func (r *InstanceReconciler) backupDatabasesOffline(ctx context.Context, instance *kubebirdv1.Instance) error {
+	podName := databaseBackupPodName(instance)
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: instance.Namespace}, pod)
 	switch {
 	case apierrors.IsNotFound(err):
-		return r.createSecurityBackupPod(ctx, instance)
+		return r.createDatabaseBackupPod(ctx, instance)
 	case err != nil:
-		return fmt.Errorf("failed to get security backup Pod: %w", err)
+		return fmt.Errorf("failed to get database backup Pod: %w", err)
 	}
 
 	switch pod.Status.Phase {
 	case corev1.PodSucceeded:
-		logf.FromContext(ctx).Info("Backed up security database", "path", securityDatabaseBackupPath(instance))
+		logf.FromContext(ctx).Info("Backed up databases and the security database", "databases", instance.Status.Databases)
 		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete security backup Pod: %w", err)
+			return fmt.Errorf("failed to delete database backup Pod: %w", err)
 		}
 		return nil
 	case corev1.PodFailed:
-		return fmt.Errorf("security backup Pod %q failed: %s", podName, pod.Status.Reason)
+		// Deletes the failed Pod so the next reconcile recreates it fresh
+		// instead of getting permanently stuck re-observing the same
+		// failure forever.
+		reason := podFailureReason(pod)
+		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete failed database backup Pod: %w", err)
+		}
+		return fmt.Errorf("database backup Pod %q failed: %s", podName, reason)
 	default:
-		return fmt.Errorf("waiting for security backup Pod %q to complete", podName)
+		return fmt.Errorf("waiting for database backup Pod %q to complete", podName)
 	}
 }
 
-// createSecurityBackupPod creates the helper Pod backupSecurityDatabaseOffline
-// polls for, running a local (no host) "gbak -backup" of the security
-// database against the primary PVC, writing into the backup PVC — both
-// mounted the same way mutateStatefulSet mounts them onto the firebird
-// container itself, so securityDatabasePath/securityDatabaseBackupPath
-// resolve to the same in-container paths either way.
+// createDatabaseBackupPod creates the helper Pod backupDatabasesOffline
+// polls for, running databaseBackupScript against the primary PVC,
+// writing into the backup PVC — both mounted the same way
+// mutateStatefulSet mounts them onto the firebird container itself, so
+// the in-container paths databaseBackupScript builds resolve the same
+// way either way.
 //
 // The "pods" RBAC marker (instance_controller.go) grants list;watch too,
 // even though nothing here calls List or sets up a Watch: the manager's
@@ -582,10 +582,37 @@ func (r *InstanceReconciler) backupSecurityDatabaseOffline(ctx context.Context, 
 // for that whole type to populate its local cache — confirmed the hard
 // way, via "pods is forbidden" on List even with get;create;delete
 // already granted.
-func (r *InstanceReconciler) createSecurityBackupPod(ctx context.Context, instance *kubebirdv1.Instance) error {
+func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instance *kubebirdv1.Instance) error {
+	mounts := []corev1.VolumeMount{
+		{Name: primaryVolumeName, MountPath: primaryDataMountPath},
+		{Name: backupVolumeName, MountPath: backupDataMountPath},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name:         primaryVolumeName,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: primaryPVCName(instance)}},
+		},
+		{
+			Name:         backupVolumeName,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)}},
+		},
+	}
+	if instance.Spec.Storage.Shadow != nil {
+		// gbak -backup on a shadow: true database also needs its shadow
+		// file to be present, even though it doesn't back it up
+		// separately — confirmed against the actual image: without this
+		// mount, gbak fails with "No such file or directory" trying to
+		// open it.
+		mounts = append(mounts, corev1.VolumeMount{Name: shadowVolumeName, MountPath: shadowDataMountPath})
+		volumes = append(volumes, corev1.Volume{
+			Name:         shadowVolumeName,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: shadowPVCName(instance)}},
+		})
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      securityBackupPodName(instance),
+			Name:      databaseBackupPodName(instance),
 			Namespace: instance.Namespace,
 			Labels:    labelsForInstance(instance.Name),
 		},
@@ -599,32 +626,41 @@ func (r *InstanceReconciler) createSecurityBackupPod(ctx context.Context, instan
 						AllowPrivilegeEscalation: ptr.To(false),
 						SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Command: []string{binGbak, "-backup", flagVerify, securityDatabasePath(instance), securityDatabaseBackupPath(instance)},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: primaryVolumeName, MountPath: primaryDataMountPath},
-						{Name: backupVolumeName, MountPath: backupDataMountPath},
-					},
+					Command:      []string{"sh", "-c", databaseBackupScript(instance)},
+					VolumeMounts: mounts,
 				},
 			},
-			Volumes: []corev1.Volume{
-				{
-					Name:         primaryVolumeName,
-					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: primaryPVCName(instance)}},
-				},
-				{
-					Name:         backupVolumeName,
-					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)}},
-				},
-			},
+			Volumes: volumes,
 		},
 	}
 	if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set owner reference on security backup Pod: %w", err)
+		return fmt.Errorf("failed to set owner reference on database backup Pod: %w", err)
 	}
 	if err := r.Create(ctx, pod); err != nil {
-		return fmt.Errorf("failed to create security backup Pod: %w", err)
+		return fmt.Errorf("failed to create database backup Pod: %w", err)
 	}
-	return fmt.Errorf("waiting for security backup Pod %q to start", pod.Name)
+	return fmt.Errorf("waiting for database backup Pod %q to start", pod.Name)
+}
+
+// podFailureReason returns a human-readable reason pod's single container
+// failed, preferring its own terminated reason/message — where a command's
+// actual failure (e.g. gbak's stderr, surfaced via Terminated.Message when
+// the container runtime captures it) shows up — over the Pod-level
+// status.Reason, which is typically only set for pod-level failures like
+// eviction or scheduling, not a plain non-zero exit code.
+func podFailureReason(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+			if t.Message != "" {
+				return t.Message
+			}
+			return fmt.Sprintf("%s (exit code %d)", t.Reason, t.ExitCode)
+		}
+	}
+	if pod.Status.Reason != "" {
+		return pod.Status.Reason
+	}
+	return "unknown reason"
 }
 
 // backupBaseDirName is the fixed subdirectory of storage.backup that all

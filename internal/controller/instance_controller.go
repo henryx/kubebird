@@ -229,34 +229,30 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 
 // backupAndReleaseStorage runs a final backup of every database recorded
 // in instance.Status.Databases, plus the instance's security database
-// (see backupSecurityDatabaseOffline), into storage.backup, then deletes
-// the primary and shadow PVCs — but not the backup PVC itself — since
-// their data is now preserved in the backup volume.
+// (see backupDatabasesOffline), into storage.backup, then deletes the
+// primary and shadow PVCs — but not the backup PVC itself — since their
+// data is now preserved in the backup volume.
 //
-// Backing up spec.databases requires the StatefulSet's pod to still be
-// running, which Reconcile guarantees by calling this before removing the
-// finalizer (Kubernetes only garbage collects the owner-referenced
-// StatefulSet once the Instance itself is fully deleted). The security
-// database is different: gbak can't back it up while the live server
-// still has it open (confirmed against the actual image: "Database
-// already opened with engine instance, incompatible with current" over a
-// local connection, and remote/service-manager access to it is refused
-// outright regardless), so this scales the StatefulSet to 0 replicas
-// first — stopping the pod and releasing that hold — then runs a local
-// gbak backup from a short-lived helper Pod that mounts the same PVCs
-// instead (see backupSecurityDatabaseOffline). Unlike
-// instance.Status.Databases, the security database always exists by this
-// point regardless of spec.databases — the security-database-init
+// Every one of those backups runs the same way: gbak can't back up a
+// database that a live server still has open (confirmed against the
+// actual image: "Database already opened with engine instance,
+// incompatible with current" over a local connection, and
+// remote/service-manager access is refused outright regardless, at least
+// for the security database) — so this scales the StatefulSet to 0
+// replicas first, stopping the pod and releasing every database's live
+// engine instance, then runs local gbak backups from a short-lived helper
+// Pod that mounts the same PVCs instead (see backupDatabasesOffline).
+// Unlike instance.Status.Databases, the security database always exists
+// by this point regardless of spec.databases — the security-database-init
 // initContainer seeds one even for an Instance with none — so this always
 // runs, rather than only when instance.Status.Databases is non-empty.
 //
 // Each stage is driven by observable cluster state rather than a status
 // field, so it's naturally idempotent across the repeated reconciles this
 // needs (StatefulSet scale-down and pod termination both take real time):
-// spec.Replicas still non-zero means spec.databases hasn't been backed up
-// yet; spec.Replicas zero but status.Replicas still non-zero means the
-// pod hasn't fully stopped yet; both zero means it's safe to back up the
-// security database.
+// spec.Replicas still non-zero means the pod hasn't been asked to stop
+// yet; spec.Replicas zero but status.Replicas still non-zero means it
+// hasn't fully stopped yet; both zero means it's safe to back up.
 func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
 	sts := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, sts)
@@ -266,19 +262,7 @@ func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instan
 	case err != nil:
 		return fmt.Errorf("failed to get StatefulSet: %w", err)
 	case sts.Spec.Replicas == nil || *sts.Spec.Replicas != 0:
-		if sts.Status.ReadyReplicas == 0 {
-			if err := r.setDeletionMessage(ctx, instance, "Waiting for the Firebird pod to be ready before backing up databases"); err != nil {
-				return err
-			}
-			return fmt.Errorf("waiting for the Firebird pod to be ready before backing up databases")
-		}
-		if err := r.setDeletionMessage(ctx, instance, "Backing up databases into storage.backup"); err != nil {
-			return err
-		}
-		if err := r.backupDatabases(ctx, instance, instance.Name+"-0"); err != nil {
-			return err
-		}
-		if err := r.setDeletionMessage(ctx, instance, "Stopping the Firebird pod to back up the security database"); err != nil {
+		if err := r.setDeletionMessage(ctx, instance, "Stopping the Firebird pod to back up its databases"); err != nil {
 			return err
 		}
 		zero := int32(0)
@@ -286,17 +270,17 @@ func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instan
 		if err := r.Update(ctx, sts); err != nil {
 			return fmt.Errorf("failed to stop the Firebird pod: %w", err)
 		}
-		return fmt.Errorf("stopping the Firebird pod before backing up the security database")
+		return fmt.Errorf("stopping the Firebird pod before backing up its databases")
 	case sts.Status.Replicas != 0:
-		if err := r.setDeletionMessage(ctx, instance, "Stopping the Firebird pod to back up the security database"); err != nil {
+		if err := r.setDeletionMessage(ctx, instance, "Stopping the Firebird pod to back up its databases"); err != nil {
 			return err
 		}
-		return fmt.Errorf("waiting for the Firebird pod to stop before backing up the security database")
+		return fmt.Errorf("waiting for the Firebird pod to stop before backing up its databases")
 	default:
-		if err := r.setDeletionMessage(ctx, instance, "Backing up the security database"); err != nil {
+		if err := r.setDeletionMessage(ctx, instance, "Backing up databases into storage.backup"); err != nil {
 			return err
 		}
-		if err := r.backupSecurityDatabaseOffline(ctx, instance); err != nil {
+		if err := r.backupDatabasesOffline(ctx, instance); err != nil {
 			return err
 		}
 	}

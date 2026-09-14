@@ -364,7 +364,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("blocks deletion until the Firebird pod is ready, then releases the primary PVC but keeps the backup PVC", func() {
+		It("blocks deletion until the Firebird pod stops, then releases the primary PVC but keeps the backup PVC", func() {
 			By("the primary and backup PVCs existing after the first reconcile")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-primary", Namespace: resourceNamespace},
 				&corev1.PersistentVolumeClaim{})).To(Succeed())
@@ -376,7 +376,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 
-			By("reconciling once, which blocks on the StatefulSet pod not being ready to back up the security database")
+			By("reconciling once, which blocks on stopping the StatefulSet's pod to back up its databases")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
 			Expect(err).To(HaveOccurred())
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
@@ -416,7 +416,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
 		})
 
-		It("reports the specific operation blocking deletion while waiting for the pod", func() {
+		It("reports the specific operation blocking deletion while stopping the pod", func() {
 			By("faking a provisioned database in status, since envtest never gets a real pod ready")
 			resource := &kubebirdv1.Instance{}
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
@@ -427,7 +427,7 @@ var _ = Describe("Instance Controller", func() {
 			By("deleting the Instance")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 
-			By("reconciling once, which blocks on the StatefulSet pod not being ready to back up")
+			By("reconciling once, which blocks on stopping the StatefulSet's pod to back up its databases")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
 			Expect(err).To(HaveOccurred())
 
@@ -435,7 +435,7 @@ var _ = Describe("Instance Controller", func() {
 			updated := &kubebirdv1.Instance{}
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, updated)).To(Succeed())
 			Expect(updated.Status.Phase).To(Equal(phaseDeleting))
-			Expect(updated.Status.Message).To(Equal("Waiting for the Firebird pod to be ready before backing up databases"))
+			Expect(updated.Status.Message).To(Equal("Stopping the Firebird pod to back up its databases"))
 			Expect(updated.Finalizers).To(ContainElement(finalizerName), "finalizer should not be removed until the backup completes")
 
 			By("removing the StatefulSet, simulating it already being cleaned up, so deletion proceeds without a real pod to exec into")
@@ -445,6 +445,73 @@ var _ = Describe("Instance Controller", func() {
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, &kubebirdv1.Instance{})).To(HaveOccurred())
+
+			By("Cleanup the SYSDBA Secret")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
+
+		It("stops the pod, runs the database backup Pod, and releases storage once it succeeds", func() {
+			By("faking a provisioned database in status, since envtest never gets a real pod ready")
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(Succeed())
+			resource.Status.Databases = []string{testDatabaseName}
+			resource.Status.DatabaseCount = 1
+			Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
+
+			By("deleting the Instance")
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			By("reconciling once, which scales the StatefulSet to zero replicas")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).To(HaveOccurred())
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, sts)).To(Succeed())
+			Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+
+			By("faking the StatefulSet still reporting its old pod, since nothing else updates status.replicas in envtest")
+			sts.Status.Replicas = 1
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			By("reconciling again, which blocks until that pod actually stops")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).To(HaveOccurred())
+			updated := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Message).To(Equal("Stopping the Firebird pod to back up its databases"))
+
+			By("faking the StatefulSet reporting the pod has actually stopped")
+			sts.Status.Replicas = 0
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			By("reconciling again, which creates the database backup Pod")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).To(HaveOccurred())
+			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Message).To(Equal("Backing up databases into storage.backup"))
+			backupPodName := types.NamespacedName{Name: backupResourceName + "-database-backup", Namespace: resourceNamespace}
+			backupPod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, backupPodName, backupPod)).To(Succeed())
+			Expect(backupPod.Spec.Containers[0].Command).To(ContainElement(ContainSubstring("gbak")))
+			Expect(backupPod.Spec.Containers[0].Command).To(ContainElement(ContainSubstring(testDatabaseName)))
+			var mountsPrimary, mountsBackup bool
+			for _, m := range backupPod.Spec.Containers[0].VolumeMounts {
+				mountsPrimary = mountsPrimary || m.Name == "primary"
+				mountsBackup = mountsBackup || m.Name == "backup"
+			}
+			Expect(mountsPrimary).To(BeTrue(), "the backup Pod must mount the primary PVC")
+			Expect(mountsBackup).To(BeTrue(), "the backup Pod must mount the backup PVC")
+
+			By("faking the backup Pod succeeding, since envtest never actually runs it")
+			backupPod.Status.Phase = corev1.PodSucceeded
+			Expect(k8sClient.Status().Update(ctx, backupPod)).To(Succeed())
+
+			By("reconciling again, which deletes the backup Pod and releases storage")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, backupPodName, &corev1.Pod{})).To(HaveOccurred())
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, &kubebirdv1.Instance{})).To(HaveOccurred())
 
 			By("Cleanup the SYSDBA Secret")

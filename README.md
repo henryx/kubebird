@@ -17,10 +17,10 @@
   password whenever the Secret changes. The Secret is never removed when the `Instance` is deleted,
   so it (and its password) survive and are reused if an `Instance` with the same name is recreated.
 - Backs up every database with `gbak`, plus the security database itself (users/roles included) the
-  same way — briefly stopping the pod first, since `gbak` can't back up the security database while
-  the live server has it open — and releases the primary/shadow storage on deletion when a backup
-  volume is configured, then restores from those backups automatically if an `Instance` with the
-  same name is recreated — including across a Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since
+  same way — briefly stopping the pod first, since `gbak` can't back up a database while the live
+  server has it open — and releases the primary/shadow storage on deletion when a backup volume is
+  configured, then restores from those backups automatically if an `Instance` with the same name is
+  recreated — including across a Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since
   `gbak` restores are forward-compatible with backups taken by an older version.
 - Warns via `status.warning`/`status.message` about orphaned backups left behind when a recreated
   `Instance` no longer declares a database that has a backup on disk.
@@ -234,24 +234,20 @@ kubectl delete pvc,secret -l kubebird.github.io/instance=<name>
 ```
 
 If `storage.backup` is configured, deletion does one more thing first: before removing its
-finalizer, Kubebird backs up every database in `status.databases` into a fixed `base` subdirectory
-of `storage.backup` (`<mount>/base/<database>.fbk`, via `gbak -backup -verify` — `base` isn't named
-after the `Instance` since `storage.backup` is already a PVC dedicated to it), then backs up the
-security database itself the same way, into that same directory as `securityN.fbk`. The security
-database needs one extra step first: `gbak` can't back it up while the live server still has it
-open, so Kubebird briefly stops the pod (scaling the StatefulSet to 0 replicas) and runs the backup
-from a short-lived helper Pod that mounts the same volumes instead — invisible from the outside
-beyond a brief pause in `status.message` while it happens. Kubebird then deletes the primary and
-shadow PVCs itself; the backup PVC is the only one left behind. Backing up the security database
-happens unconditionally, even when `status.databases` is empty, since it always exists regardless
-of `spec.databases`; this requires the StatefulSet's pod to be ready first (for the `spec.databases`
-backup), so deletion waits for it if needed (reporting "Waiting for the Firebird pod to be ready
-before backing up databases" in `status.message` while it does) — the only case that skips waiting
-is the StatefulSet no longer existing at all (e.g. already garbage-collected some other way).
-`status.message` tracks each step as it happens — "Backing up databases into storage.backup", then
-"Stopping the Firebird pod to back up the security database", then "Backing up the security
-database", then "Releasing primary and shadow storage", then "Removing finalizer" — so
-`kubectl get instances` shows real deletion progress rather than a stale pre-deletion message.
+finalizer, Kubebird stops the pod (scaling the StatefulSet to 0 replicas) — `gbak` can't back up a
+database, security database included, while a live server still has it open — then runs a
+short-lived helper Pod that mounts the same PVCs and backs up every database in `status.databases`
+into a fixed `base` subdirectory of `storage.backup` (`<mount>/base/<database>.fbk`, via
+`gbak -backup -verify` — `base` isn't named after the `Instance` since `storage.backup` is already a
+PVC dedicated to it), then the security database itself the same way, into that same directory as
+`securityN.fbk`. Kubebird then deletes the primary and shadow PVCs itself; the backup PVC is the
+only one left behind. Backing up the security database happens unconditionally, even when
+`status.databases` is empty, since it always exists regardless of `spec.databases` — the only case
+that skips the whole backup is the StatefulSet no longer existing at all (e.g. already
+garbage-collected some other way). `status.message` tracks each step as it happens — "Stopping the
+Firebird pod to back up its databases", then "Backing up databases into storage.backup", then
+"Releasing primary and shadow storage", then "Removing finalizer" — so `kubectl get instances` shows
+real deletion progress rather than a stale pre-deletion message.
 
 Recreating an `Instance` with the same name closes the loop: since the backup PVC was left behind,
 its databases are restored from those `.fbk` files instead of being created empty — see the

@@ -501,6 +501,7 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  - pods
   verbs:
   - create
   - delete
