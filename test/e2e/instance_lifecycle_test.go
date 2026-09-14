@@ -378,7 +378,7 @@ spec:
 			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/instance.fbk", backupBaseDir+"/shadowed.fbk")
 
 			By("also backing up the security database itself, since the primary PVC carrying it is about to be released")
-			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/security3.fdb")
+			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/security3.fbk")
 		})
 
 		It("should restore databases from their backups when the Instance is recreated", func() {

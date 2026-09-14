@@ -16,10 +16,11 @@
 - Generates a SYSDBA credentials Secret (or uses one you supply) and restarts the pod to apply the
   password whenever the Secret changes. The Secret is never removed when the `Instance` is deleted,
   so it (and its password) survive and are reused if an `Instance` with the same name is recreated.
-- Backs up every database with `gbak`, plus the security database itself (users/roles included) via
-  a plain file copy, and releases the primary/shadow storage on deletion when a backup volume is
-  configured, then restores from those backups automatically if an `Instance` with the same name is
-  recreated — including across a Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since
+- Backs up every database with `gbak`, plus the security database itself (users/roles included) the
+  same way — briefly stopping the pod first, since `gbak` can't back up the security database while
+  the live server has it open — and releases the primary/shadow storage on deletion when a backup
+  volume is configured, then restores from those backups automatically if an `Instance` with the
+  same name is recreated — including across a Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since
   `gbak` restores are forward-compatible with backups taken by an older version.
 - Warns via `status.warning`/`status.message` about orphaned backups left behind when a recreated
   `Instance` no longer declares a database that has a backup on disk.
@@ -150,11 +151,11 @@ With this CR, Kubebird can:
 - Optionally define a `<instance-name>-backup` PVC (`storage.backup`), mounted into the pod at `/var/lib/firebird/backup`. Omit it if you don't need a dedicated backup volume. Like the primary/shadow PVCs, it isn't owned by the `Instance` — deleting the `Instance` leaves it (and its backup data) in place instead of garbage-collecting it. Setting it also changes what happens to the *other* storage on deletion — see "Deleting an Instance" below. It also feeds back into provisioning: for a database that isn't already on the primary PVC, if a backup for it exists at `<mount>/base/<database>.fbk` (e.g. because this `Instance`'s name was deleted-with-backup and is now being recreated), Kubebird restores it via `gbak -create -verify` instead of creating an empty database, recreating its shadow file too if `shadow: true`.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
-- Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart and a reused primary PVC (see above). A `security-database-init` init container seeds it there the first time, before the `firebird` container starts, from its own backup left behind in `storage.backup` by an earlier `Instance` of the same name (see "Deleting an Instance" below), if one exists there — otherwise from the image's own default; the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
+- Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart and a reused primary PVC (see above). A `security-database-init` init container seeds it there the first time, before the `firebird` container starts, from its own `gbak` backup left behind in `storage.backup` by an earlier `Instance` of the same name (see "Deleting an Instance" below), restored via a local `gbak -create -verify` run directly against the file (no server is listening yet at this point in the pod's startup), if one exists there — otherwise from the image's own default, seeded with a plain file copy since that source isn't a `gbak` archive; the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
 - Authentication is optional. If `authentication.sysdba.secretRef` is specified, that Secret must already exist — Kubebird uses it for the SYSDBA password as-is and fails reconciliation if it's missing, rather than creating it; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password if one doesn't already exist. Either way, the secret has `username` (always `SYSDBA`) and `password` keys, and Kubebird never deletes it, whether on its own or when the `Instance` is deleted — see "Deleting an Instance" below.
 - Label every object it creates (PVCs, Service, StatefulSet, the aliases ConfigMap, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets,configmaps -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 - Report the most recent error, if any, in `status.error` — surfaced without needing to check the operator's own logs, via the `MESSAGE` column below. It's cleared automatically once the `Instance` reconciles successfully again.
-- Warn, in `status.warning`, when a database that's provisioned or restored (i.e. `spec.databases` has a pending entry) leaves behind an orphaned backup: a `.fbk` file in `storage.backup`'s `base/` subdirectory whose database is no longer in `spec.databases` — typically because the `Instance` was recreated with a different database list, or a database was dropped after its backup was taken. Cleared automatically once no orphaned backup remains.
+- Warn, in `status.warning`, when a database that's provisioned or restored (i.e. `spec.databases` has a pending entry) leaves behind an orphaned backup: a `.fbk` file in `storage.backup`'s `base/` subdirectory whose database is no longer in `spec.databases` — typically because the `Instance` was recreated with a different database list, or a database was dropped after its backup was taken. The security database's own backup (`securityN.fbk`) is never reported this way, even though it sits in that same directory. Cleared automatically once no orphaned backup remains.
 - Surface `kubectl get instances` columns beyond the default `NAME`/`AGE`: `VERSION` (the Firebird version deployed, from `spec.version`), `STATUS` (`Provisioning`, `Ready`, or `Deleting`), `DATABASES` (the number of databases currently provisioned, i.e. `len(status.databases)`), and `MESSAGE` (the reconcile error if the last reconcile failed; otherwise `status.warning` if one is set; otherwise, while `Provisioning`/`Ready`, why it's currently in that phase; while `Deleting`, the specific operation deletion is currently performing, e.g. "Backing up databases into storage.backup" — see "Deleting an Instance" below).
 
 ### Object creation flow
@@ -235,18 +236,22 @@ kubectl delete pvc,secret -l kubebird.github.io/instance=<name>
 If `storage.backup` is configured, deletion does one more thing first: before removing its
 finalizer, Kubebird backs up every database in `status.databases` into a fixed `base` subdirectory
 of `storage.backup` (`<mount>/base/<database>.fbk`, via `gbak -backup -verify` — `base` isn't named
-after the `Instance` since `storage.backup` is already a PVC dedicated to it) then plain-copies the
-security database itself into that same directory as `securityN.fdb` (not a `gbak`
-archive: `gbak` needs to authenticate against a security database to run, and this is that very
-file), then deletes the primary and shadow PVCs itself; the backup PVC is the only one left behind.
-Backing up the security database happens unconditionally, even when `status.databases` is empty,
-since it always exists regardless of `spec.databases`; this requires the StatefulSet's pod to be
-ready, so deletion waits for it if needed (reporting "Waiting for the Firebird pod to be ready
+after the `Instance` since `storage.backup` is already a PVC dedicated to it), then backs up the
+security database itself the same way, into that same directory as `securityN.fbk`. The security
+database needs one extra step first: `gbak` can't back it up while the live server still has it
+open, so Kubebird briefly stops the pod (scaling the StatefulSet to 0 replicas) and runs the backup
+from a short-lived helper Pod that mounts the same volumes instead — invisible from the outside
+beyond a brief pause in `status.message` while it happens. Kubebird then deletes the primary and
+shadow PVCs itself; the backup PVC is the only one left behind. Backing up the security database
+happens unconditionally, even when `status.databases` is empty, since it always exists regardless
+of `spec.databases`; this requires the StatefulSet's pod to be ready first (for the `spec.databases`
+backup), so deletion waits for it if needed (reporting "Waiting for the Firebird pod to be ready
 before backing up databases" in `status.message` while it does) — the only case that skips waiting
 is the StatefulSet no longer existing at all (e.g. already garbage-collected some other way).
 `status.message` tracks each step as it happens — "Backing up databases into storage.backup", then
-"Releasing primary and shadow storage", then "Removing finalizer" — so `kubectl get instances` shows
-real deletion progress rather than a stale pre-deletion message.
+"Stopping the Firebird pod to back up the security database", then "Backing up the security
+database", then "Releasing primary and shadow storage", then "Removing finalizer" — so
+`kubectl get instances` shows real deletion progress rather than a stale pre-deletion message.
 
 Recreating an `Instance` with the same name closes the loop: since the backup PVC was left behind,
 its databases are restored from those `.fbk` files instead of being created empty — see the

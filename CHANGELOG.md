@@ -40,16 +40,19 @@
   alias in `databases.conf` and a new `FIREBIRD_CONF_SecurityDatabase` environment variable both
   point the live engine at this same relocated path.
 - When `storage.backup` is configured, deleting an `Instance` now also backs up the security
-  database itself (a plain file copy to `<mount>/base/securityN.fdb`, not a `gbak`
-  archive — `gbak` needs to authenticate against a security database to run, and this is that very
-  file) before releasing the primary PVC that carries it, and `security-database-init` restores
-  that backup in preference to the image's stock default when the `Instance` is recreated under
-  the same name — so users/roles created directly in the security database now survive a
-  delete/recreate cycle the same way application data in `spec.databases` already did. This backup
-  now runs unconditionally on deletion, even when `status.databases` is empty (the security
-  database always exists regardless of `spec.databases`), so deletion always waits for the
-  StatefulSet's pod to be ready before releasing storage — previously this wait, like the backup
-  itself, was skipped whenever no database had been provisioned.
+  database itself (via `gbak -backup -verify` to `<mount>/base/securityN.fbk`, the same way every
+  other database is backed up) before releasing the primary PVC that carries it, and
+  `security-database-init` restores that backup — via its own local `gbak -create -verify` — in
+  preference to the image's stock default when the `Instance` is recreated under the same name —
+  so users/roles created directly in the security database now survive a delete/recreate cycle the
+  same way application data in `spec.databases` already did. `gbak` can't back up the security
+  database while the live server still has it open, so this briefly stops the StatefulSet's pod
+  (scaling it to 0 replicas) and runs the backup from a short-lived helper Pod that mounts the same
+  primary and backup PVCs instead, deleting it again once the backup completes. This backup now
+  runs unconditionally on deletion, even when `status.databases` is empty (the security database
+  always exists regardless of `spec.databases`), so deletion always waits for the StatefulSet's pod
+  to be ready before backing up `spec.databases` — previously this wait, like the backup itself,
+  was skipped whenever no database had been provisioned.
 - Rotating the SYSDBA Secret's password now restarts the pod to apply it: the `StatefulSet`'s pod
   template carries a `kubebird.github.io/sysdba-password-hash` annotation hashing the Secret's
   current password, so a rotation changes the template and the `StatefulSet` controller's own

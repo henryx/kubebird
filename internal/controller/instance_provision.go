@@ -31,10 +31,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
 	utilexec "k8s.io/client-go/util/exec"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
@@ -56,6 +59,7 @@ const (
 
 	flagUser     = "-user"
 	flagPassword = "-password"
+	flagVerify   = "-verify"
 )
 
 // reconcileDatabases exec's isql inside the Firebird pod, once it is
@@ -270,15 +274,14 @@ func databaseCreateScript(db kubebirdv1.DatabaseSpec) string {
 	return b.String()
 }
 
-// securityDatabaseBackupPath returns where backupSecurityDatabase leaves
-// the instance's security database inside storage.backup's base
-// subdirectory (see instanceBackupDir), e.g.
-// "/var/lib/firebird/backup/base/security3.fdb" — a plain file, not a
-// gbak archive, so securityDatabaseInitScript can restore it with a plain
-// cp, without needing to authenticate against a security database that
-// doesn't exist yet (see backupSecurityDatabase).
+// securityDatabaseBackupPath returns where backupSecurityDatabaseOffline
+// leaves the instance's security database backup inside storage.backup's
+// base subdirectory (see instanceBackupDir), e.g.
+// "/var/lib/firebird/backup/base/security3.fbk" — a gbak archive, just
+// like every other database's backup (see backupFileName), restored by
+// securityDatabaseInitScript with its own local gbak restore.
 func securityDatabaseBackupPath(instance *kubebirdv1.Instance) string {
-	return path.Join(instanceBackupDir(), securityDatabaseFileName(instance))
+	return path.Join(instanceBackupDir(), backupFileName(securityDatabaseFileName(instance)))
 }
 
 // securityDatabaseInitScript renders the shell script run by the
@@ -292,15 +295,19 @@ func securityDatabaseBackupPath(instance *kubebirdv1.Instance) string {
 //     backupAndReleaseStorage left one behind at securityDatabaseBackupPath
 //     — e.g. this Instance is recreating one deleted earlier under the
 //     same name with storage.backup set (which releases the primary PVC,
-//     so the reused-PVC path above doesn't apply), restoring whatever
-//     users/roles it held instead of falling back to the image's stock
-//     ones;
+//     so the reused-PVC path above doesn't apply) — restored with a local
+//     "gbak -create" (no host given, so it runs against the image's own
+//     local engine directly rather than a network connection, which is
+//     the only option anyway: no firebird server is listening yet at this
+//     point in the Pod's startup), carrying over whatever users/roles it
+//     held instead of falling back to the image's stock ones. This local
+//     restore needs no -user/-password: there's no pre-existing security
+//     database yet for gbak to authenticate the connection against in the
+//     first place, so the engine accepts the local connection unchecked
+//     — confirmed against the actual image, not just documentation;
 //  2. otherwise, the image's own baked-in default
-//     (securityDatabaseImageDefaultPath).
-//
-// Either way this is a plain file copy, not gbak: gbak needs to
-// authenticate against a security database to run at all, and this is
-// that very file (see backupSecurityDatabase).
+//     (securityDatabaseImageDefaultPath) — a plain file copy, since it's
+//     a raw database file rather than a gbak archive.
 func securityDatabaseInitScript(instance *kubebirdv1.Instance) string {
 	if instance.Spec.Storage.Backup == nil {
 		return fmt.Sprintf(`set -e
@@ -313,12 +320,12 @@ fi
 	return fmt.Sprintf(`set -e
 if [ ! -f %[1]q ]; then
 	if [ -f %[3]q ]; then
-		cp %[3]q %[1]q
+		%[4]s -create -verify %[3]q %[1]q
 	else
 		cp %[2]q %[1]q
 	fi
 fi
-`, securityDatabasePath(instance), securityDatabaseImageDefaultPath(instance), securityDatabaseBackupPath(instance))
+`, securityDatabasePath(instance), securityDatabaseImageDefaultPath(instance), securityDatabaseBackupPath(instance), binGbak)
 }
 
 // execInPod runs command inside the firebird container of podName,
@@ -390,12 +397,17 @@ func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, pod
 // entry in spec.databases — e.g. because the Instance was recreated with a
 // different database list, or a database was dropped from spec.databases
 // after storage.backup was configured. Reports the database names those
-// orphaned backups belong to (reversing backupFileName), sorted.
+// orphaned backups belong to (reversing backupFileName), sorted. The
+// security database's own backup (securityDatabaseBackupPath) is excluded
+// even though it shares the same .fbk directory and naming scheme: it has
+// no corresponding spec.databases entry to match by design, so it would
+// otherwise always show up as orphaned.
 func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kubebirdv1.Instance, podName string) ([]string, error) {
 	desired := make(map[string]bool, len(instance.Spec.Databases))
 	for _, db := range instance.Spec.Databases {
 		desired[db.Name] = true
 	}
+	securityBackupName := path.Base(securityDatabaseBackupPath(instance))
 
 	dir := instanceBackupDir()
 	// Redirects stderr to /dev/null and always exits 0: the directory
@@ -409,7 +421,7 @@ func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kube
 
 	var orphaned []string
 	for name := range strings.FieldsSeq(output) {
-		if !strings.HasSuffix(name, ".fbk") {
+		if !strings.HasSuffix(name, ".fbk") || name == securityBackupName {
 			continue
 		}
 		if dbName := strings.TrimSuffix(name, ".fbk") + ".fdb"; !desired[dbName] {
@@ -453,7 +465,7 @@ func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, inst
 	}
 
 	dbPath := path.Join(primaryDataMountPath, db.Name)
-	restoreCommand := []string{binGbak, "-create", "-verify", flagUser, sysdbaUsername, flagPassword, password, backupPath, dbPath}
+	restoreCommand := []string{binGbak, "-create", flagVerify, flagUser, sysdbaUsername, flagPassword, password, backupPath, dbPath}
 	if err := r.execInPod(ctx, instance.Namespace, podName, restoreCommand, ""); err != nil {
 		return false, fmt.Errorf("gbak restore failed: %w", err)
 	}
@@ -488,7 +500,7 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 	for _, name := range instance.Status.Databases {
 		src := path.Join(primaryDataMountPath, name)
 		dst := path.Join(dir, backupFileName(name))
-		command := []string{binGbak, "-backup", "-verify", flagUser, sysdbaUsername, flagPassword, password, src, dst}
+		command := []string{binGbak, "-backup", flagVerify, flagUser, sysdbaUsername, flagPassword, password, src, dst}
 		if err := r.execInPod(ctx, instance.Namespace, podName, command, ""); err != nil {
 			return fmt.Errorf("failed to back up database %q: %w", name, err)
 		}
@@ -497,30 +509,122 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 	return nil
 }
 
-// backupSecurityDatabase copies the instance's security database into its
-// dedicated backup subdirectory (see instanceBackupDir), so that
-// backupAndReleaseStorage deleting the primary PVC afterwards (whenever
-// storage.backup is configured) doesn't also discard whatever
+// securityBackupPodName returns the name of the short-lived helper Pod
+// backupSecurityDatabaseOffline creates to back up the security database
+// once the StatefulSet's own pod has stopped.
+func securityBackupPodName(instance *kubebirdv1.Instance) string {
+	return instance.Name + "-security-backup"
+}
+
+// backupSecurityDatabaseOffline gbak-backs-up the instance's security
+// database into its dedicated backup subdirectory (see instanceBackupDir),
+// so that backupAndReleaseStorage deleting the primary PVC afterwards
+// (whenever storage.backup is configured) doesn't also discard whatever
 // users/roles were created directly in it. The security-database-init
-// initContainer restores this copy on a later recreate under the same
+// initContainer restores this backup on a later recreate under the same
 // name (see securityDatabaseInitScript).
 //
-// Unlike every other database handled in this file, this is a plain file
-// copy rather than a gbak backup: gbak needs to authenticate against a
-// security database to run at all, and this is that very file. The
-// firebird container still has it open live for the server's own
-// connections while this runs, so the copy isn't a transactionally
-// consistent snapshot the way gbak's is for the databases in
-// backupDatabases — accepted here given how rarely the security database
-// itself is written to (user/role management, not application traffic).
-func (r *InstanceReconciler) backupSecurityDatabase(ctx context.Context, instance *kubebirdv1.Instance, podName string) error {
-	src := securityDatabasePath(instance)
-	dst := securityDatabaseBackupPath(instance)
-	if err := r.execInPod(ctx, instance.Namespace, podName, []string{"cp", src, dst}, ""); err != nil {
-		return fmt.Errorf("failed to back up security database: %w", err)
+// Unlike every other database handled in this file, this can't just exec
+// gbak inside the running firebird container: gbak backing up the
+// security database while the live server still has it open fails
+// outright with "Database already opened with engine instance,
+// incompatible with current" (confirmed against the actual image), and
+// routing it through the services manager instead fares no better
+// ("no permission for remote access to database") — the security
+// database is apparently held exclusively by the engine and reachable
+// only locally, unlike regular application databases, which support the
+// normal multi-attach gbak already relies on in backupDatabases above.
+// So backupAndReleaseStorage scales the StatefulSet to 0 replicas first,
+// stopping the pod and releasing that hold, before calling this — which
+// runs its own local gbak backup (no host given, so no live server is
+// involved at all) from a short-lived helper Pod that mounts the same
+// primary and backup PVCs instead of exec-ing into a running one. No
+// -user/-password is needed: a local gbak backup of an existing security
+// database, run as root, doesn't validate them against anything —
+// confirmed against the actual image, not just documentation — so the
+// helper Pod needs no access to the SYSDBA Secret at all.
+func (r *InstanceReconciler) backupSecurityDatabaseOffline(ctx context.Context, instance *kubebirdv1.Instance) error {
+	podName := securityBackupPodName(instance)
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: instance.Namespace}, pod)
+	switch {
+	case apierrors.IsNotFound(err):
+		return r.createSecurityBackupPod(ctx, instance)
+	case err != nil:
+		return fmt.Errorf("failed to get security backup Pod: %w", err)
 	}
-	logf.FromContext(ctx).Info("Backed up security database", "path", dst)
-	return nil
+
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded:
+		logf.FromContext(ctx).Info("Backed up security database", "path", securityDatabaseBackupPath(instance))
+		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete security backup Pod: %w", err)
+		}
+		return nil
+	case corev1.PodFailed:
+		return fmt.Errorf("security backup Pod %q failed: %s", podName, pod.Status.Reason)
+	default:
+		return fmt.Errorf("waiting for security backup Pod %q to complete", podName)
+	}
+}
+
+// createSecurityBackupPod creates the helper Pod backupSecurityDatabaseOffline
+// polls for, running a local (no host) "gbak -backup" of the security
+// database against the primary PVC, writing into the backup PVC — both
+// mounted the same way mutateStatefulSet mounts them onto the firebird
+// container itself, so securityDatabasePath/securityDatabaseBackupPath
+// resolve to the same in-container paths either way.
+//
+// The "pods" RBAC marker (instance_controller.go) grants list;watch too,
+// even though nothing here calls List or sets up a Watch: the manager's
+// default client is a cached/informer-backed client, and the first Get or
+// Create against a GVK it hasn't seen before starts a List+Watch informer
+// for that whole type to populate its local cache — confirmed the hard
+// way, via "pods is forbidden" on List even with get;create;delete
+// already granted.
+func (r *InstanceReconciler) createSecurityBackupPod(ctx context.Context, instance *kubebirdv1.Instance) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      securityBackupPodName(instance),
+			Namespace: instance.Namespace,
+			Labels:    labelsForInstance(instance.Name),
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{
+				{
+					Name:  containerName,
+					Image: fmt.Sprintf("%s:%s", instance.Spec.Image, instance.Spec.Version),
+					SecurityContext: &corev1.SecurityContext{
+						AllowPrivilegeEscalation: ptr.To(false),
+						SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
+					Command: []string{binGbak, "-backup", flagVerify, securityDatabasePath(instance), securityDatabaseBackupPath(instance)},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: primaryVolumeName, MountPath: primaryDataMountPath},
+						{Name: backupVolumeName, MountPath: backupDataMountPath},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name:         primaryVolumeName,
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: primaryPVCName(instance)}},
+				},
+				{
+					Name:         backupVolumeName,
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)}},
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on security backup Pod: %w", err)
+	}
+	if err := r.Create(ctx, pod); err != nil {
+		return fmt.Errorf("failed to create security backup Pod: %w", err)
+	}
+	return fmt.Errorf("waiting for security backup Pod %q to start", pod.Name)
 }
 
 // backupBaseDirName is the fixed subdirectory of storage.backup that all
