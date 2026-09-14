@@ -336,12 +336,6 @@ spec:
                   spec.databases has been created, or "Deleting" while owned
                   resources are being garbage collected.
                 type: string
-              sysdbaPasswordHash:
-                description: |-
-                  sysdbaPasswordHash is a hash of the SYSDBA password Kubebird last
-                  applied to the live server, used to detect when the referenced
-                  Secret's password has been rotated.
-                type: string
               warning:
                 description: |-
                   warning is a non-fatal notice from the most recent reconcile that
@@ -696,7 +690,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        image: quay.io/kubebird/operator:latest
+        image: quay.io/kubebird/operator:dev
         livenessProbe:
           httpGet:
             path: /healthz

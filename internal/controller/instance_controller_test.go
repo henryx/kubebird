@@ -38,6 +38,11 @@ const resourceNamespace = "default"
 
 const testDatabaseName = "instance.fdb"
 
+const (
+	testImage   = "firebirdsql/firebird"
+	testVersion = "3.0.14"
+)
+
 var _ = Describe("Instance Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
@@ -49,7 +54,7 @@ var _ = Describe("Instance Controller", func() {
 			Namespace: resourceNamespace,
 		}
 		instance := &kubebirdv1.Instance{}
-		secretName := types.NamespacedName{Name: "test-sysdba", Namespace: resourceNamespace}
+		secretName := types.NamespacedName{Name: resourceName + "-sysdba", Namespace: resourceNamespace}
 		aliasesConfigMapNameNN := types.NamespacedName{Name: resourceName + "-aliases", Namespace: resourceNamespace}
 		var controllerReconciler *InstanceReconciler
 
@@ -68,19 +73,14 @@ var _ = Describe("Instance Controller", func() {
 						Namespace: resourceNamespace,
 					},
 					Spec: kubebirdv1.InstanceSpec{
-						Image:   "firebirdsql/firebird",
-						Version: "3.0.14",
+						Image:   testImage,
+						Version: testVersion,
 						Databases: []kubebirdv1.DatabaseSpec{
 							{Name: testDatabaseName},
 						},
 						Storage: kubebirdv1.StorageSpec{
 							Primary: kubebirdv1.StorageVolumeSpec{
 								Size: apiresource.MustParse("3Gi"),
-							},
-						},
-						Authentication: kubebirdv1.AuthenticationSpec{
-							Sysdba: kubebirdv1.SysdbaAuthSpec{
-								SecretRef: "test-sysdba",
 							},
 						},
 					},
@@ -123,6 +123,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(secret.Data).To(HaveKey("password"))
 			Expect(secret.Data["password"]).NotTo(BeEmpty())
 			Expect(secret.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+			Expect(secret.OwnerReferences).To(BeEmpty(), "the SYSDBA Secret must not be owned by the Instance, so it survives deletion")
 
 			By("registering a database alias in the aliases ConfigMap")
 			cm := &corev1.ConfigMap{}
@@ -151,7 +152,7 @@ var _ = Describe("Instance Controller", func() {
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
-			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testImage + ":" + testVersion))
 			Expect(sts.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
 
 			By("annotating the pod template with a hash of the SYSDBA Secret's current password")
@@ -161,7 +162,7 @@ var _ = Describe("Instance Controller", func() {
 			By("running the security-database-init initContainer before it, to seed the primary PVC's security database")
 			Expect(sts.Spec.Template.Spec.InitContainers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("security-database-init"))
-			Expect(sts.Spec.Template.Spec.InitContainers[0].Image).To(Equal("firebirdsql/firebird:3.0.14"))
+			Expect(sts.Spec.Template.Spec.InitContainers[0].Image).To(Equal(testImage + ":" + testVersion))
 
 			By("mounting the primary PVC by name rather than via a volumeClaimTemplate")
 			Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
@@ -223,12 +224,111 @@ var _ = Describe("Instance Controller", func() {
 			Expect(sts.Spec.Template.Annotations["kubebird.github.io/sysdba-password-hash"]).
 				NotTo(Equal(hashBefore))
 		})
+
+		It("fails to reconcile when spec.authentication.sysdba.secretRef names a Secret that doesn't exist", func() {
+			By("reconciling the shared test-resource Instance created in BeforeEach, so the outer AfterEach cleanup finds its Secret")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating an Instance referencing a SYSDBA Secret that was never created")
+			missingTypeNamespacedName := types.NamespacedName{Name: "test-missing-secretref", Namespace: resourceNamespace}
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      missingTypeNamespacedName.Name,
+					Namespace: resourceNamespace,
+				},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:   testImage,
+					Version: testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{
+						{Name: testDatabaseName},
+					},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Authentication: kubebirdv1.AuthenticationSpec{
+						Sysdba: kubebirdv1.SysdbaAuthSpec{SecretRef: "does-not-exist-sysdba"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			By("reconciling and expecting an error, since the referenced Secret doesn't exist")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: missingTypeNamespacedName})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("does-not-exist-sysdba"))
+
+			By("not auto-creating a Secret with that name")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "does-not-exist-sysdba", Namespace: resourceNamespace},
+				&corev1.Secret{})).To(HaveOccurred())
+
+			By("cleaning up the Instance")
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: missingTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("uses a pre-existing Secret unmodified when spec.authentication.sysdba.secretRef points to it, and doesn't delete it when the Instance is deleted", func() {
+			By("reconciling the shared test-resource Instance created in BeforeEach, so the outer AfterEach cleanup finds its Secret")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("pre-creating a SYSDBA Secret with a fixed password before the Instance exists")
+			presetSecretName := types.NamespacedName{Name: "test-preexisting-sysdba", Namespace: resourceNamespace}
+			preset := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: presetSecretName.Name, Namespace: resourceNamespace},
+				StringData: map[string]string{"username": "SYSDBA", "password": "a-preset-password"},
+			}
+			Expect(k8sClient.Create(ctx, preset)).To(Succeed())
+
+			By("creating an Instance referencing that Secret")
+			presetTypeNamespacedName := types.NamespacedName{Name: "test-preexisting-secretref", Namespace: resourceNamespace}
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      presetTypeNamespacedName.Name,
+					Namespace: resourceNamespace,
+				},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:   testImage,
+					Version: testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{
+						{Name: testDatabaseName},
+					},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Authentication: kubebirdv1.AuthenticationSpec{
+						Sysdba: kubebirdv1.SysdbaAuthSpec{SecretRef: presetSecretName.Name},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			By("reconciling without error, using the pre-existing Secret as-is")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: presetTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("leaving the pre-existing Secret's password untouched")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, presetSecretName, secret)).To(Succeed())
+			Expect(string(secret.Data["password"])).To(Equal("a-preset-password"))
+
+			By("deleting the Instance")
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: presetTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, presetTypeNamespacedName, &kubebirdv1.Instance{})).To(HaveOccurred())
+
+			By("not deleting the Secret, since it's never owned by the Instance")
+			Expect(k8sClient.Get(ctx, presetSecretName, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
 	})
 
 	Context("When deleting an Instance with storage.backup configured", func() {
 		const (
 			backupResourceName = "test-backup-resource"
-			backupSecretName   = "test-backup-sysdba"
+			backupSecretName   = backupResourceName + "-sysdba"
 		)
 
 		ctx := context.Background()
@@ -247,17 +347,14 @@ var _ = Describe("Instance Controller", func() {
 					Namespace: resourceNamespace,
 				},
 				Spec: kubebirdv1.InstanceSpec{
-					Image:   "firebirdsql/firebird",
-					Version: "3.0.14",
+					Image:   testImage,
+					Version: testVersion,
 					Databases: []kubebirdv1.DatabaseSpec{
 						{Name: testDatabaseName},
 					},
 					Storage: kubebirdv1.StorageSpec{
 						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
 						Backup:  &kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
-					},
-					Authentication: kubebirdv1.AuthenticationSpec{
-						Sysdba: kubebirdv1.SysdbaAuthSpec{SecretRef: backupSecretName},
 					},
 				},
 			}

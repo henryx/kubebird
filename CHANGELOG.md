@@ -57,6 +57,16 @@
   way it already does for a brand-new `Instance` — rather than Kubebird pushing the change to the
   live server itself.
 
+### Changed
+
+- The SYSDBA Secret is no longer owner-referenced to the `Instance`, so it now survives deleting
+  the `Instance` (like the primary/backup/shadow PVCs) instead of being garbage-collected along
+  with it; recreating an `Instance` under the same name reuses that same Secret and its password
+  rather than generating a new one. When `spec.authentication.sysdba.secretRef` is set, that Secret
+  must already exist — reconciliation now fails with an error if it's missing instead of
+  auto-creating it; the default `<instance-name>-sysdba` Secret is still created automatically
+  when it doesn't already exist.
+
 ### Fixed
 
 - Reusing a primary PVC left behind by an earlier `Instance` of the same name (PVCs are never

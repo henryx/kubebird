@@ -54,8 +54,9 @@ const (
 func instanceLifecycleSpecs() {
 	// sysdbaPasswordBeforeDelete carries the SYSDBA password captured just
 	// before deletion into the recreate/restore spec below, to prove the
-	// regenerated Secret's password actually differs and that SYSDBA
-	// authenticates with the new one, not the old one.
+	// SYSDBA Secret (never owner-referenced, so it survives deleting the
+	// Instance) keeps the same password across the delete/recreate and
+	// that SYSDBA authenticates with it against the restored database.
 	var sysdbaPasswordBeforeDelete string
 
 	Context("Instance", Ordered, func() {
@@ -325,8 +326,8 @@ spec:
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
-		It("should garbage collect the Secret, ConfigMap, Service and StatefulSet on deletion", func() {
-			By("recording the SYSDBA password before deletion, to later prove it isn't reused")
+		It("should garbage collect the ConfigMap, Service and StatefulSet on deletion, but keep the SYSDBA Secret", func() {
+			By("recording the SYSDBA password before deletion, to later prove the surviving Secret keeps it")
 			passwordBeforeDelete, err := getSecretField(instanceSecretName, "password")
 			Expect(err).NotTo(HaveOccurred())
 			sysdbaPasswordBeforeDelete = passwordBeforeDelete
@@ -338,7 +339,6 @@ spec:
 
 			By("garbage collecting every object it owned")
 			owned := [][2]string{
-				{"secret", instanceSecretName},
 				{"configmap", instanceAliasesCMName},
 				{"service", instanceName},
 				{"statefulset", instanceName},
@@ -351,6 +351,11 @@ spec:
 					g.Expect(err).To(HaveOccurred(), fmt.Sprintf("%s/%s should have been garbage collected", kind, name))
 				}, 2*time.Minute, 2*time.Second).Should(Succeed())
 			}
+
+			By("keeping the SYSDBA Secret, since it's never owned by the Instance")
+			cmd = exec.Command("kubectl", "get", "secret", instanceSecretName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
 
 			By("releasing the primary and shadow PVCs, since storage.backup was configured")
 			Eventually(func(g Gomega) {
@@ -437,12 +442,12 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("generating a new SYSDBA password rather than reusing the one from before deletion")
+			By("reusing the surviving Secret's password rather than generating a new one")
 			newPassword, err := getSecretField(instanceSecretName, "password")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(newPassword).NotTo(Equal(sysdbaPasswordBeforeDelete))
+			Expect(newPassword).To(Equal(sysdbaPasswordBeforeDelete))
 
-			By("authenticating as SYSDBA against the restored database with the freshly-generated password")
+			By("authenticating as SYSDBA against the restored database with that same password")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "exec", "-i", instancePod(), "-n", namespace, "-c", firebirdContainer,
 					"--", "isql", "-user", "SYSDBA", "-password", newPassword,

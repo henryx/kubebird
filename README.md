@@ -14,7 +14,8 @@
 - Registers a Firebird alias per database automatically, so clients can connect by alias instead of
   in-pod filesystem path.
 - Generates a SYSDBA credentials Secret (or uses one you supply) and restarts the pod to apply the
-  password whenever the Secret changes.
+  password whenever the Secret changes. The Secret is never removed when the `Instance` is deleted,
+  so it (and its password) survive and are reused if an `Instance` with the same name is recreated.
 - Backs up every database with `gbak`, plus the security database itself (users/roles included) via
   a plain file copy, and releases the primary/shadow storage on deletion when a backup volume is
   configured, then restores from those backups automatically if an `Instance` with the same name is
@@ -139,7 +140,7 @@ spec:
       size: 3Gi
   authentication:
     sysdba:
-      secretRef: ""
+      secretRef: "" # if empty, possword is generated randomically
 ```
 
 With this CR, Kubebird can:
@@ -150,7 +151,7 @@ With this CR, Kubebird can:
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
 - Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart and a reused primary PVC (see above). A `security-database-init` init container seeds it there the first time, before the `firebird` container starts, from its own backup left behind in `storage.backup` by an earlier `Instance` of the same name (see "Deleting an Instance" below), if one exists there — otherwise from the image's own default; the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
-- Authentication is optional. If `authentication.sysdba.secretRef` is specified, Kubebird uses that Secret for the SYSDBA password; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password. Either way, the secret has `username` (always `SYSDBA`) and `password` keys.
+- Authentication is optional. If `authentication.sysdba.secretRef` is specified, that Secret must already exist — Kubebird uses it for the SYSDBA password as-is and fails reconciliation if it's missing, rather than creating it; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password if one doesn't already exist. Either way, the secret has `username` (always `SYSDBA`) and `password` keys, and Kubebird never deletes it, whether on its own or when the `Instance` is deleted — see "Deleting an Instance" below.
 - Label every object it creates (PVCs, Service, StatefulSet, the aliases ConfigMap, and the SYSDBA secret) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets,configmaps -l kubebird.github.io/instance=<name>` finds everything for one `Instance`.
 - Report the most recent error, if any, in `status.error` — surfaced without needing to check the operator's own logs, via the `MESSAGE` column below. It's cleared automatically once the `Instance` reconciles successfully again.
 - Warn, in `status.warning`, when a database that's provisioned or restored (i.e. `spec.databases` has a pending entry) leaves behind an orphaned backup: a `.fbk` file in `storage.backup`'s `base/` subdirectory whose database is no longer in `spec.databases` — typically because the `Instance` was recreated with a different database list, or a database was dropped after its backup was taken. Cleared automatically once no orphaned backup remains.
@@ -159,8 +160,8 @@ With this CR, Kubebird can:
 ### Object creation flow
 
 When an `Instance` is created, Kubebird creates the objects below in order (steps 1-7); every one
-except the primary/backup/shadow PVCs is owned by the `Instance` and removed automatically when the
-`Instance` is deleted (see "Deleting an Instance" below). Kubernetes then creates the Pod from the
+except the primary/backup/shadow PVCs and the SYSDBA Secret is owned by the `Instance` and removed
+automatically when the `Instance` is deleted (see "Deleting an Instance" below). Kubernetes then creates the Pod from the
 `StatefulSet`'s template, and once the Pod becomes ready Kubebird creates the requested databases
 inside it (steps 8-9):
 
@@ -190,9 +191,9 @@ flowchart TD
     Kubebird -->|"9: creates the databases"| Pod
 
     classDef owned fill:#e6ecff,stroke:#3355ff,color:#000
-    class Secret,CM,Service,STS owned
+    class CM,Service,STS owned
     classDef unowned fill:#fff4e6,stroke:#cc8800,color:#000
-    class PVCPrimary,PVCBackup,PVCShadow unowned
+    class Secret,PVCPrimary,PVCBackup,PVCShadow unowned
 ```
 
 The dotted arrows show how the `StatefulSet` uses the other objects (the SYSDBA password from the
@@ -220,15 +221,15 @@ Kubebird also reacts to updates on an existing `Instance`:
   short disruption to every connection to the `Instance` while the pod restarts.
 
 Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
-it (the Secret, aliases ConfigMap, Service and StatefulSet are all owned by the `Instance`); the
+it (the aliases ConfigMap, Service and StatefulSet are all owned by the `Instance`); the
 operator itself just logs the deletion, reports `status.phase: Deleting`, and updates
 `status.message` with the specific operation it's currently performing (e.g. "Deleting Instance",
 or one of the backup-related steps below), while that garbage collection runs. The
-primary/backup/shadow PVCs are **not** removed with it — Kubebird deliberately
-never sets an owner reference on them, so an `Instance`'s data survives its deletion. Delete the PVCs
-yourself once you're sure you no longer need the data:
+primary/backup/shadow PVCs and the SYSDBA Secret are **not** removed with it — Kubebird deliberately
+never sets an owner reference on them, so an `Instance`'s data and its SYSDBA credentials both
+survive its deletion. Delete the PVCs and Secret yourself once you're sure you no longer need them:
 ```bash
-kubectl delete pvc -l kubebird.github.io/instance=<name>
+kubectl delete pvc,secret -l kubebird.github.io/instance=<name>
 ```
 
 If `storage.backup` is configured, deletion does one more thing first: before removing its
@@ -251,8 +252,10 @@ Recreating an `Instance` with the same name closes the loop: since the backup PV
 its databases are restored from those `.fbk` files instead of being created empty — see the
 `storage.backup` bullet above — and the security database is restored from its own backup by the
 `security-database-init` init container, carrying over whatever users/roles were created directly
-in it (SYSDBA's own password, meanwhile, always comes from the freshly-generated Secret, not the
-restored security database — see "Rotating the SYSDBA secret's password" above). If the recreated
+in it (SYSDBA's own password, meanwhile, always comes from the Secret rather than the restored
+security database — and since the Secret itself also survives the deletion, as described above, it's
+the same password as before the delete/recreate, unless you rotate it yourself; see "Rotating the
+SYSDBA secret's password" above). If the recreated
 `Instance` declares a different `spec.databases` list than the one that was backed up, any `.fbk`
 file with no matching entry is left unrestored and reported in `status.warning` (and thus in the
 `MESSAGE` column) instead of being silently ignored. This also works if the recreated `Instance`

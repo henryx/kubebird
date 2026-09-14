@@ -47,9 +47,9 @@ const (
 // must restore cleanly under the new version's gbak and server, carrying
 // user data across the major-version upgrade, the recreated StatefulSet
 // must run the new image tag, and SYSDBA must authenticate against the
-// upgraded server with the freshly-generated password (the Secret is
-// itself garbage collected and recreated on delete/recreate, so it isn't
-// the same password as before).
+// upgraded server with the SYSDBA Secret's password (the Secret is never
+// owner-referenced, so it survives the delete/recreate and keeps the same
+// password throughout).
 //
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, after instanceTableRestoreSpecs, and before that Describe's
@@ -156,7 +156,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(schema).To(ContainSubstring("PRE_UPGRADE"))
 
-			By("authenticating as SYSDBA against the upgraded server with the freshly-generated password")
+			By("authenticating as SYSDBA against the upgraded server with the Secret's (unchanged) password")
 			_, err = versionUpgradeRunIsql(versionUpgradeSecretName, "QUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
 		})

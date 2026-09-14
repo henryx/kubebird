@@ -196,9 +196,15 @@ func (r *InstanceReconciler) deletePVC(ctx context.Context, instance *kubebirdv1
 }
 
 // reconcileSysdbaSecret ensures the Secret backing spec.authentication.sysdba
-// exists, creating it with a freshly generated random password when it does
-// not. An existing Secret, whether created by a previous reconcile or
-// supplied by the user ahead of time, is left untouched.
+// exists. When spec.authentication.sysdba.secretRef is set, that Secret must
+// already exist (it's the user's responsibility to have created it) and
+// reconciliation fails if it doesn't; when unset, the default
+// "<instance-name>-sysdba" Secret is created with a freshly generated random
+// password if missing. An existing Secret, whether created by a previous
+// reconcile or supplied by the user ahead of time, is left untouched. The
+// Secret is deliberately never owner-referenced to the Instance, so it
+// survives deleting the Instance rather than being garbage collected along
+// with it.
 func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance *kubebirdv1.Instance) error {
 	secretRef := sysdbaSecretRefName(instance)
 	nsName := types.NamespacedName{Name: secretRef, Namespace: instance.Namespace}
@@ -207,6 +213,10 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to get SYSDBA Secret %q: %w", secretRef, err)
+	}
+
+	if instance.Spec.Authentication.Sysdba.SecretRef != "" {
+		return fmt.Errorf("SYSDBA Secret %q specified in spec.authentication.sysdba.secretRef not found", secretRef)
 	}
 
 	password, err := generateRandomPassword()
@@ -224,9 +234,6 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 			sysdbaSecretUsernameKey: sysdbaUsername,
 			sysdbaSecretPasswordKey: password,
 		},
-	}
-	if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set owner reference on SYSDBA Secret: %w", err)
 	}
 
 	if err := r.Create(ctx, secret); err != nil {

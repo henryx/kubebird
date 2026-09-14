@@ -211,19 +211,19 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(BeEmpty())
 
-			// The Secret is garbage collected and regenerated on
-			// delete/recreate, so this is a different password than the
-			// one used to create the marker user — proving the image's
-			// entrypoint re-applies FIREBIRD_ROOT_PASSWORD to the reused
-			// security database rather than the init container needing
-			// to do anything beyond leaving the file in place.
-			newPassword, err := getSecretField(securityDBSecretName, "password")
+			// The Secret is never owner-referenced, so it survives the
+			// delete/recreate with the same password — the image's
+			// entrypoint still re-applies FIREBIRD_ROOT_PASSWORD from it to
+			// the reused security database on every container start, so
+			// SYSDBA authenticating below proves that still works
+			// regardless of the marker user also being present.
+			password, err := getSecretField(securityDBSecretName, "password")
 			Expect(err).NotTo(HaveOccurred())
 
-			By("authenticating with the new Secret's password against the running server")
+			By("authenticating with the SYSDBA Secret's password against the running server")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "exec", "-i", securityDBPodName, "-n", namespace, "-c", firebirdContainer,
-					"--", "isql", "-user", "SYSDBA", "-password", newPassword, securityDBAppDBPath)
+					"--", "isql", "-user", "SYSDBA", "-password", password, securityDBAppDBPath)
 				cmd.Stdin = strings.NewReader("QUIT;\n")
 				_, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
