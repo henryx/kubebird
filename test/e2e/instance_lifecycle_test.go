@@ -63,7 +63,7 @@ func instanceLifecycleSpecs() {
 		AfterAll(func() {
 			By("deleting the e2e Instance, if it still exists")
 			cmd := exec.Command("kubectl", "delete", "instance", instanceName,
-				"-n", namespace, "--ignore-not-found", "--wait=false")
+				"-n", namespace, "--ignore-not-found", "--timeout=2m")
 			_, _ = utils.Run(cmd)
 		})
 
@@ -357,7 +357,7 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("releasing the primary and shadow PVCs, since storage.backup was configured")
+			By("releasing the primary and shadow PVCs, after backing them up since storage.backup was configured")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
 				_, err := utils.Run(cmd)

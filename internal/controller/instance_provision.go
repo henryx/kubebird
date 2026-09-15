@@ -143,13 +143,13 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 
 	for _, db := range pending {
-		// The primary PVC isn't owner-referenced, so it can survive an
-		// Instance's deletion and be reused by a later Instance with the
-		// same name (see reconcilePVC) — in which case this database's
-		// file may already exist on it. CREATE DATABASE would fail (or,
-		// via the Go driver, silently overwrite it) against an existing
-		// file, so check first and just register it if it's already
-		// there instead of trying to recreate it.
+		// A previous reconcile may have already run CREATE DATABASE
+		// against the primary PVC and then failed before recording it in
+		// status.databases (e.g. a crash between the exec and the
+		// Status().Update below). CREATE DATABASE would fail (or, via the
+		// Go driver, silently overwrite it) against an existing file, so
+		// check first and just register it if it's already there instead
+		// of trying to recreate it.
 		exists, err := r.databaseFileExists(ctx, instance.Namespace, podName, path.Join(primaryDataMountPath, db.Name))
 		if err != nil {
 			return fmt.Errorf("failed to check whether database %q already exists: %w", db.Name, err)
@@ -287,15 +287,17 @@ func securityDatabaseBackupPath(instance *kubebirdv1.Instance) string {
 // securityDatabaseInitScript renders the shell script run by the
 // security-database-init initContainer (see mutateStatefulSet) before the
 // firebird container starts, if the security database isn't already
-// present on the primary PVC — e.g. because it's a reused PVC from an
-// earlier Instance with the same name (see reconcilePVC). It's seeded
+// present on the primary PVC — the normal case is a brand-new PVC, since
+// releasePrimaryAndShadowStorage always deletes the primary PVC on
+// Instance deletion, so a freshly created or recreated Instance always
+// needs seeding; the check only ever finds one already there across a
+// plain pod restart within the same Instance's lifetime. It's seeded
 // from, in preference order:
 //
 //  1. its own backup, if storage.backup is configured and
-//     backupAndReleaseStorage left one behind at securityDatabaseBackupPath
-//     — e.g. this Instance is recreating one deleted earlier under the
-//     same name with storage.backup set (which releases the primary PVC,
-//     so the reused-PVC path above doesn't apply) — restored with a local
+//     backupDatabases left one behind at securityDatabaseBackupPath — e.g.
+//     this Instance is recreating one deleted earlier under the same name
+//     with storage.backup set — restored with a local
 //     "gbak -create" (no host given, so it runs against the image's own
 //     local engine directly rather than a network connection, which is
 //     the only option anyway: no firebird server is listening yet at this
@@ -451,9 +453,9 @@ func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, 
 // restoreDatabaseIfBackedUp restores db from its backup file in
 // storage.backup's base subdirectory (instanceBackupDir), if one exists
 // there — e.g. because an earlier Instance with this same name was
-// deleted with storage.backup configured (see backupAndReleaseStorage),
-// and this Instance is recreating it. Reports whether a backup was found
-// and restored.
+// deleted with storage.backup configured (see backupDatabases), and this
+// Instance is recreating it. Reports whether a backup was found and
+// restored.
 func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, instance *kubebirdv1.Instance, podName, password string, db kubebirdv1.DatabaseSpec) (bool, error) {
 	backupPath := path.Join(instanceBackupDir(), backupFileName(db.Name))
 	exists, err := r.databaseFileExists(ctx, instance.Namespace, podName, backupPath)
@@ -514,9 +516,9 @@ func databaseBackupScript(instance *kubebirdv1.Instance) string {
 // instance.Status.Databases, plus the instance's security database, into
 // storage.backup's base subdirectory (see instanceBackupDir), so their
 // data survives even after the primary/shadow PVCs are removed (see
-// backupAndReleaseStorage). The security-database-init initContainer and
-// restoreDatabaseIfBackedUp both restore these backups on a later
-// recreate under the same name.
+// releasePrimaryAndShadowStorage, always called on deletion). The
+// security-database-init initContainer and restoreDatabaseIfBackedUp both
+// restore these backups on a later recreate under the same name.
 //
 // Unlike a database that's still live, none of this can just exec gbak
 // inside the running firebird container: gbak backing up the security
@@ -526,7 +528,7 @@ func databaseBackupScript(instance *kubebirdv1.Instance) string {
 // the services manager instead fares no better ("no permission for
 // remote access to database") — the security database is apparently held
 // exclusively by the engine and reachable only locally. So
-// backupAndReleaseStorage scales the StatefulSet to 0 replicas first,
+// backupDatabases scales the StatefulSet to 0 replicas first,
 // stopping the pod and releasing every database's live engine instance
 // (not just the security database's), before calling this — which runs
 // its own local gbak backups (no host given, so no live server is

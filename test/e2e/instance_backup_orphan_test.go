@@ -41,7 +41,7 @@ import (
 // file of its own.
 //
 // It must be called from inside the "Manager" Ordered Describe in
-// e2e_test.go, after instancePVCReuseSpecs, and before that Describe's
+// e2e_test.go, after instanceLifecycleSpecs, and before that Describe's
 // AfterAll tears down the manager.
 func instanceBackupOrphanSpecs() {
 	const (
@@ -76,7 +76,7 @@ spec:
 		AfterAll(func() {
 			By("deleting the e2e-backup-orphan Instance, if it still exists")
 			cmd := exec.Command("kubectl", "delete", "instance", orphanInstanceName,
-				"-n", namespace, "--ignore-not-found", "--wait=false")
+				"-n", namespace, "--ignore-not-found", "--timeout=2m")
 			_, _ = utils.Run(cmd)
 		})
 
@@ -178,7 +178,7 @@ spec:
 			// Delete and wait for it to actually finish here, rather than
 			// leaving it to AfterAll's fire-and-forget cleanup: this is the
 			// last Context in the suite, so nothing else runs afterward to
-			// give backupAndReleaseStorage time to back up b.fdb/c.fdb and
+			// give backupDatabases time to back up b.fdb/c.fdb and
 			// remove the finalizer before the manager is undeployed.
 			By("deleting the Instance and waiting for its backup-then-finalizer-removal to finish")
 			cmd = exec.Command("kubectl", "delete", "instance", orphanInstanceName, "-n", namespace)

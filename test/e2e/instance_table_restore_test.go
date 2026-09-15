@@ -73,7 +73,7 @@ spec:
 		AfterAll(func() {
 			By("deleting the e2e-table-restore Instance, if it still exists")
 			cmd := exec.Command("kubectl", "delete", "instance", tableRestoreInstanceName,
-				"-n", namespace, "--ignore-not-found", "--wait=false")
+				"-n", namespace, "--ignore-not-found", "--timeout=2m")
 			_, _ = utils.Run(cmd)
 		})
 

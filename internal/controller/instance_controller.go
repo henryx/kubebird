@@ -175,11 +175,13 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 
 // reconcileDeletion logs an Instance's deletion, reports status.phase as
 // Deleting and status.message with the specific operation currently
-// underway (see setDeletionMessage), backs up its databases and releases
-// the primary/shadow PVCs when storage.backup is configured (see
-// backupAndReleaseStorage), and removes the finalizer so the API server
-// can complete the deletion; the objects Kubebird created are removed by
-// Kubernetes' garbage collection of their owner references.
+// underway (see setDeletionMessage), backs up its databases when
+// storage.backup is configured (see backupDatabases), always releases the
+// primary/shadow PVCs regardless of storage.backup (see
+// releasePrimaryAndShadowStorage — without a backup that data is simply
+// gone), and removes the finalizer so the API server can complete the
+// deletion; the objects Kubebird created are removed by Kubernetes' garbage
+// collection of their owner references.
 func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if !controllerutil.ContainsFinalizer(instance, finalizerName) {
 		return nil
@@ -195,9 +197,13 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 	}
 
 	if instance.Spec.Storage.Backup != nil {
-		if err := r.backupAndReleaseStorage(ctx, instance); err != nil {
+		if err := r.backupDatabases(ctx, instance); err != nil {
 			return err
 		}
+	}
+
+	if err := r.releasePrimaryAndShadowStorage(ctx, instance); err != nil {
+		return err
 	}
 
 	if err := r.setDeletionMessage(ctx, instance, "Removing finalizer"); err != nil {
@@ -212,7 +218,7 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 
 // setDeletionMessage records the operation reconcileDeletion is currently
 // performing in status.message, so `kubectl get instances` reflects
-// deletion progress (e.g. while backupAndReleaseStorage waits on the pod)
+// deletion progress (e.g. while backupDatabases waits on the pod)
 // instead of showing a stale pre-deletion message. Skips the write when
 // the message hasn't changed. Unlike setError, this never touches
 // status.error: deletion isn't a reconcile failure.
@@ -227,11 +233,12 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 	return nil
 }
 
-// backupAndReleaseStorage runs a final backup of every database recorded
-// in instance.Status.Databases, plus the instance's security database
-// (see backupDatabasesOffline), into storage.backup, then deletes the
-// primary and shadow PVCs — but not the backup PVC itself — since their
-// data is now preserved in the backup volume.
+// backupDatabases runs a final backup of every database recorded in
+// instance.Status.Databases, plus the instance's security database (see
+// backupDatabasesOffline), into storage.backup. Only called when
+// storage.backup is set — releasePrimaryAndShadowStorage deletes the
+// primary/shadow PVCs regardless, so without a backup that data is simply
+// lost.
 //
 // Every one of those backups runs the same way: gbak can't back up a
 // database that a live server still has open (confirmed against the
@@ -245,7 +252,8 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 // Unlike instance.Status.Databases, the security database always exists
 // by this point regardless of spec.databases — the security-database-init
 // initContainer seeds one even for an Instance with none — so this always
-// runs, rather than only when instance.Status.Databases is non-empty.
+// backs it up too, rather than only when instance.Status.Databases is
+// non-empty.
 //
 // Each stage is driven by observable cluster state rather than a status
 // field, so it's naturally idempotent across the repeated reconciles this
@@ -253,12 +261,13 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 // spec.Replicas still non-zero means the pod hasn't been asked to stop
 // yet; spec.Replicas zero but status.Replicas still non-zero means it
 // hasn't fully stopped yet; both zero means it's safe to back up.
-func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
+func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kubebirdv1.Instance) error {
 	sts := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, sts)
 	switch {
 	case apierrors.IsNotFound(err):
 		logf.FromContext(ctx).Info("Skipping final backup: StatefulSet no longer exists", "name", instance.Name)
+		return nil
 	case err != nil:
 		return fmt.Errorf("failed to get StatefulSet: %w", err)
 	case sts.Spec.Replicas == nil || *sts.Spec.Replicas != 0:
@@ -284,7 +293,17 @@ func (r *InstanceReconciler) backupAndReleaseStorage(ctx context.Context, instan
 			return err
 		}
 	}
+	return nil
+}
 
+// releasePrimaryAndShadowStorage deletes the primary and (if configured)
+// shadow PVCs on every Instance deletion — regardless of whether
+// storage.backup is set — but never the backup PVC itself. When
+// storage.backup is set, backupDatabases has already preserved this data
+// in the backup volume; when it isn't, the data is simply gone, and a
+// later Instance recreated under the same name starts fresh rather than
+// reusing it.
+func (r *InstanceReconciler) releasePrimaryAndShadowStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if err := r.setDeletionMessage(ctx, instance, "Releasing primary and shadow storage"); err != nil {
 		return err
 	}

@@ -79,7 +79,7 @@ spec:
 		AfterAll(func() {
 			By("deleting the e2e-version-upgrade Instance, if it still exists")
 			cmd := exec.Command("kubectl", "delete", "instance", versionUpgradeInstanceName,
-				"-n", namespace, "--ignore-not-found", "--wait=false")
+				"-n", namespace, "--ignore-not-found", "--timeout=2m")
 			_, _ = utils.Run(cmd)
 		})
 

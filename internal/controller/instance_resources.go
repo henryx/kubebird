@@ -146,8 +146,10 @@ func (r *InstanceReconciler) reconcilePVCs(ctx context.Context, instance *kubebi
 // doesn't. Like a StatefulSet's own volumeClaimTemplates, size and
 // storage class are only applied at creation time: an existing PVC is
 // left untouched. Unlike a StatefulSet's own PVCs, it isn't
-// owner-referenced to the Instance, so its data survives the Instance
-// being deleted (see reconcileDeletion).
+// owner-referenced to the Instance, so it isn't garbage collected along
+// with it — but only the backup PVC actually survives an Instance
+// deletion this way: the primary and shadow PVCs are explicitly deleted
+// by releasePrimaryAndShadowStorage regardless (see reconcileDeletion).
 func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebirdv1.Instance, name string, vol kubebirdv1.StorageVolumeSpec) error {
 	nsName := types.NamespacedName{Name: name, Namespace: instance.Namespace}
 	if err := r.Get(ctx, nsName, &corev1.PersistentVolumeClaim{}); err == nil {
@@ -181,8 +183,9 @@ func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebir
 }
 
 // deletePVC deletes the PVC named name, ignoring an already-missing one.
-// Used by backupAndReleaseStorage to release the primary/shadow PVCs once
-// storage.backup holds a final backup of their databases.
+// Used by releasePrimaryAndShadowStorage to release the primary/shadow
+// PVCs on every Instance deletion, regardless of whether storage.backup
+// holds a final backup of their databases.
 func (r *InstanceReconciler) deletePVC(ctx context.Context, instance *kubebirdv1.Instance, name string) error {
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace}}
 	if err := r.Delete(ctx, pvc); err != nil {
@@ -393,9 +396,9 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 	initVolumeMounts := []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}}
 	if instance.Spec.Storage.Backup != nil {
 		// Lets securityDatabaseInitScript restore a security database
-		// backup left behind by an earlier Instance's
-		// backupAndReleaseStorage under the same name, instead of always
-		// falling back to the image's stock default.
+		// backup left behind by an earlier Instance's backupDatabases
+		// under the same name, instead of always falling back to the
+		// image's stock default.
 		initVolumeMounts = append(initVolumeMounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
 	}
 	sts.Spec.Template.Spec.InitContainers = []corev1.Container{

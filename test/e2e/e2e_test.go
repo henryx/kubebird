@@ -284,12 +284,6 @@ var _ = Describe("Manager", Ordered, func() {
 		// cleanup on deletion.
 		instanceLifecycleSpecs()
 
-		// instancePVCReuseSpecs (test/e2e/instance_test.go) exercises
-		// reusing a primary PVC left behind by an earlier Instance of the
-		// same name: the database file on it must be registered, not
-		// recreated.
-		instancePVCReuseSpecs()
-
 		// instanceBackupOrphanSpecs (test/e2e/instance_test.go) exercises
 		// deleting and recreating an Instance under the same name with a
 		// changed spec.databases: a database dropped from the new
@@ -317,13 +311,13 @@ var _ = Describe("Manager", Ordered, func() {
 		instanceVersionUpgradeSpecs()
 
 		// instanceSecurityDatabaseSpecs
-		// (test/e2e/instance_security_database_test.go) exercises
-		// the security-database-init init container's "leave it
-		// alone" path: a user created directly in the security
-		// database survives deleting and recreating an Instance
-		// without storage.backup configured, since the primary PVC
-		// (carrying the security database with it) is unowned and
-		// survives deletion.
+		// (test/e2e/instance_security_database_test.go) exercises the
+		// security-database-init init container's backup/restore path for
+		// the security database's own content: a user created directly in
+		// the security database (not the SYSDBA account synced from the
+		// Secret) survives deleting and recreating an Instance with
+		// storage.backup configured, restored via gbak from the backup
+		// taken before the primary PVC was released.
 		instanceSecurityDatabaseSpecs()
 	})
 })

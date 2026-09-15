@@ -56,8 +56,8 @@ func getSecretField(secretName, key string) (string, error) {
 
 // verifyBackupFiles spins up a throwaway Pod mounting pvcName to confirm
 // each of files actually exists on it, then removes the pod. Used to prove
-// backupAndReleaseStorage's gbak backup actually ran, rather than just
-// checking the backup PVC survived.
+// backupDatabases's gbak backup actually ran, rather than just checking
+// the backup PVC survived.
 func verifyBackupFiles(pvcName string, files ...string) {
 	checks := make([]string, len(files))
 	for i, f := range files {
