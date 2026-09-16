@@ -316,8 +316,8 @@ var _ = Describe("Manager", Ordered, func() {
 		// the security database's own content: a user created directly in
 		// the security database (not the SYSDBA account synced from the
 		// Secret) survives deleting and recreating an Instance with
-		// storage.backup configured, restored via gbak from the backup
-		// taken before the primary PVC was released.
+		// a local backup volume configured, restored via gbak
+		// from the backup taken before the primary PVC was released.
 		instanceSecurityDatabaseSpecs()
 	})
 })

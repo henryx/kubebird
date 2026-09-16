@@ -100,9 +100,9 @@ exit 1`, firebirdBinaryPath, securityDBPath, sql)
 // own content, as opposed to just the SYSDBA password: a Firebird user
 // created directly in the security database (not the SYSDBA account synced
 // from the Secret via FIREBIRD_ROOT_PASSWORD) survives deleting and
-// recreating an Instance under the same name with storage.backup
-// configured — releasePrimaryAndShadowStorage always deletes the primary
-// PVC on deletion now (see internal/controller/instance_controller.go), so
+// recreating an Instance under the same name with a local backup volume
+// configured — releasePrimaryAndShadowStorage always deletes
+// the primary PVC on deletion now (see instance_controller.go), so
 // there's no more "the PVC just happens to survive" path; this proves the
 // gbak backup taken by backupDatabases and the gbak restore run by
 // securityDatabaseInitScript actually carry over arbitrary security
@@ -129,11 +129,15 @@ spec:
   storage:
     primary:
       size: 1Gi
-    backup:
-      size: 1Gi
+  backup:
+    enabled: true
+    type:
+      - local:
+          storage:
+            size: 1Gi
 `, securityDBInstanceName, namespace, securityDBVersion, securityDBDatabaseName)
 
-	Context("Instance security database content survives a delete/recreate via storage.backup", Ordered, func() {
+	Context("Instance security database content survives a delete/recreate via a local backup volume", Ordered, func() {
 		AfterAll(func() {
 			By("deleting the e2e-security-db Instance, waiting for its finalizer-driven backup and PVC release to finish")
 			cmd := exec.Command("kubectl", "delete", "instance", securityDBInstanceName,

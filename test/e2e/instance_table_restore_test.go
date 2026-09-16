@@ -65,8 +65,12 @@ spec:
   storage:
     primary:
       size: 1Gi
-    backup:
-      size: 1Gi
+  backup:
+    enabled: true
+    type:
+      - local:
+          storage:
+            size: 1Gi
 `, tableRestoreInstanceName, namespace, tableRestoreDatabaseName)
 
 	Context("Instance table restore across repeated delete/recreate", Ordered, func() {

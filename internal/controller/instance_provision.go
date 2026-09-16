@@ -117,19 +117,19 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 
 	// Only worth checking when something in spec.databases is actually
 	// being created/restored: that's the event (an Instance recreated, or
-	// a database dropped and storage.backup left behind) this warning
+	// a database dropped after spec.backup left its backup behind) this warning
 	// exists to surface, and skipping it otherwise keeps a steady-state
 	// reconcile (pending and removed both empty, returned above) from
 	// paying for an extra exec into the pod.
 	warning := ""
-	if len(pending) > 0 && instance.Spec.Storage.Backup != nil {
+	if len(pending) > 0 && backupVolumeSpec(instance) != nil {
 		orphaned, err := r.orphanedBackups(ctx, instance, podName)
 		if err != nil {
 			return fmt.Errorf("failed to check for orphaned backups: %w", err)
 		}
 		if len(orphaned) > 0 {
 			warning = fmt.Sprintf(
-				"storage.backup has a backup for %s, but it's no longer in spec.databases, so it wasn't restored",
+				"the backup volume has a backup for %s, but it's no longer in spec.databases, so it wasn't restored",
 				strings.Join(orphaned, ", "))
 		}
 	}
@@ -159,7 +159,7 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 			continue
 		}
 
-		if instance.Spec.Storage.Backup != nil {
+		if backupVolumeSpec(instance) != nil {
 			restored, err := r.restoreDatabaseIfBackedUp(ctx, instance, podName, password, db)
 			if err != nil {
 				return fmt.Errorf("failed to restore database %q from backup: %w", db.Name, err)
@@ -275,8 +275,8 @@ func databaseCreateScript(db kubebirdv1.DatabaseSpec) string {
 }
 
 // securityDatabaseBackupPath returns where backupSecurityDatabaseOffline
-// leaves the instance's security database backup inside storage.backup's
-// base subdirectory (see instanceBackupDir), e.g.
+// leaves the instance's security database backup inside the backup
+// volume's base subdirectory (see instanceBackupDir), e.g.
 // "/var/lib/firebird/backup/base/security3.fbk" — a gbak archive, just
 // like every other database's backup (see backupFileName), restored by
 // securityDatabaseInitScript with its own local gbak restore.
@@ -294,10 +294,10 @@ func securityDatabaseBackupPath(instance *kubebirdv1.Instance) string {
 // plain pod restart within the same Instance's lifetime. It's seeded
 // from, in preference order:
 //
-//  1. its own backup, if storage.backup is configured and
+//  1. its own backup, if a backup volume exists (backupVolumeSpec) and
 //     backupDatabases left one behind at securityDatabaseBackupPath — e.g.
 //     this Instance is recreating one deleted earlier under the same name
-//     with storage.backup set — restored with a local
+//     with a backup volume — restored with a local
 //     "gbak -create" (no host given, so it runs against the image's own
 //     local engine directly rather than a network connection, which is
 //     the only option anyway: no firebird server is listening yet at this
@@ -311,7 +311,7 @@ func securityDatabaseBackupPath(instance *kubebirdv1.Instance) string {
 //     (securityDatabaseImageDefaultPath) — a plain file copy, since it's
 //     a raw database file rather than a gbak archive.
 func securityDatabaseInitScript(instance *kubebirdv1.Instance) string {
-	if instance.Spec.Storage.Backup == nil {
+	if backupVolumeSpec(instance) == nil {
 		return fmt.Sprintf(`set -e
 if [ ! -f %[1]q ]; then
 	cp %[2]q %[1]q
@@ -398,7 +398,7 @@ func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, pod
 // instance's backup directory (see instanceBackupDir) without a matching
 // entry in spec.databases — e.g. because the Instance was recreated with a
 // different database list, or a database was dropped from spec.databases
-// after storage.backup was configured. Reports the database names those
+// after spec.backup was enabled. Reports the database names those
 // orphaned backups belong to (reversing backupFileName), sorted. The
 // security database's own backup (securityDatabaseBackupPath) is excluded
 // even though it shares the same .fbk directory and naming scheme: it has
@@ -450,11 +450,11 @@ func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, 
 	return false, err
 }
 
-// restoreDatabaseIfBackedUp restores db from its backup file in
-// storage.backup's base subdirectory (instanceBackupDir), if one exists
+// restoreDatabaseIfBackedUp restores db from its backup file in the
+// backup volume's base subdirectory (instanceBackupDir), if one exists
 // there — e.g. because an earlier Instance with this same name was
-// deleted with storage.backup configured (see backupDatabases), and this
-// Instance is recreating it. Reports whether a backup was found and
+// deleted with a backup volume configured (see backupDatabases), and
+// this Instance is recreating it. Reports whether a backup was found and
 // restored.
 func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, instance *kubebirdv1.Instance, podName, password string, db kubebirdv1.DatabaseSpec) (bool, error) {
 	backupPath := path.Join(instanceBackupDir(), backupFileName(db.Name))
@@ -494,7 +494,7 @@ func databaseBackupPodName(instance *kubebirdv1.Instance) string {
 // databaseBackupScript renders the shell script run by the helper Pod
 // createDatabaseBackupPod creates: a local (no host) "gbak -backup" for
 // every database in instance.Status.Databases, plus the security
-// database itself, each writing into storage.backup's base subdirectory
+// database itself, each writing into the backup volume's base subdirectory
 // (see instanceBackupDir). No -user/-password is needed for any of it:
 // run as root, a local gbak backup of an already-existing database
 // (security database included) doesn't validate them against
@@ -514,7 +514,7 @@ func databaseBackupScript(instance *kubebirdv1.Instance) string {
 
 // backupDatabasesOffline gbak-backs-up every database in
 // instance.Status.Databases, plus the instance's security database, into
-// storage.backup's base subdirectory (see instanceBackupDir), so their
+// the backup volume's base subdirectory (see instanceBackupDir), so their
 // data survives even after the primary/shadow PVCs are removed (see
 // releasePrimaryAndShadowStorage, always called on deletion). The
 // security-database-init initContainer and restoreDatabaseIfBackedUp both
@@ -665,16 +665,17 @@ func podFailureReason(pod *corev1.Pod) string {
 	return "unknown reason"
 }
 
-// backupBaseDirName is the fixed subdirectory of storage.backup that all
-// of an instance's own backups live under, e.g.
+// backupBaseDirName is the fixed subdirectory of the backup volume that
+// all of an instance's own backups live under, e.g.
 // "/var/lib/firebird/backup/base" (see instanceBackupDir). It doesn't need
-// to be named after the Instance itself: storage.backup is already a PVC
-// dedicated to this Instance (named "<instance-name>-backup"), so a fixed
-// name avoids stuttering the Instance's name into the path a second time.
+// to be named after the Instance itself: the backup volume is already a
+// PVC dedicated to this Instance (named "<instance-name>-backup"), so a
+// fixed name avoids stuttering the Instance's name into the path a second
+// time.
 const backupBaseDirName = "base"
 
-// instanceBackupDir returns storage.backup's dedicated subdirectory for an
-// instance's own backups, e.g. "/var/lib/firebird/backup/base" (see
+// instanceBackupDir returns the backup volume's dedicated subdirectory for
+// an instance's own backups, e.g. "/var/lib/firebird/backup/base" (see
 // backupBaseDirName).
 func instanceBackupDir() string {
 	return path.Join(backupDataMountPath, backupBaseDirName)

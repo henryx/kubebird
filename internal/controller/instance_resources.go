@@ -123,14 +123,34 @@ func backupPVCName(instance *kubebirdv1.Instance) string {
 	return instance.Name + "-" + backupVolumeName
 }
 
+// backupVolumeSpec returns the storage configuration for the instance's
+// backup PVC, when spec.backup.enabled is true and spec.backup.type
+// includes a "local" entry (the only currently implemented destination),
+// or nil otherwise. The CRD's own validation only guarantees
+// spec.backup.type is non-empty when enabled is true, not that one of its
+// entries is "local" — a future non-local-only backup.type would leave
+// this nil despite enabled being true. The first local entry found is
+// used.
+func backupVolumeSpec(instance *kubebirdv1.Instance) *kubebirdv1.StorageVolumeSpec {
+	if !instance.Spec.Backup.Enabled {
+		return nil
+	}
+	for _, t := range instance.Spec.Backup.Type {
+		if t.Local != nil {
+			return &t.Local.Storage
+		}
+	}
+	return nil
+}
+
 // reconcilePVCs ensures the PVCs backing instance.Spec.Storage exist,
 // creating any that are missing.
 func (r *InstanceReconciler) reconcilePVCs(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if err := r.reconcilePVC(ctx, instance, primaryPVCName(instance), instance.Spec.Storage.Primary); err != nil {
 		return fmt.Errorf("failed to reconcile primary PVC: %w", err)
 	}
-	if instance.Spec.Storage.Backup != nil {
-		if err := r.reconcilePVC(ctx, instance, backupPVCName(instance), *instance.Spec.Storage.Backup); err != nil {
+	if vol := backupVolumeSpec(instance); vol != nil {
+		if err := r.reconcilePVC(ctx, instance, backupPVCName(instance), *vol); err != nil {
 			return fmt.Errorf("failed to reconcile backup PVC: %w", err)
 		}
 	}
@@ -184,7 +204,7 @@ func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebir
 
 // deletePVC deletes the PVC named name, ignoring an already-missing one.
 // Used by releasePrimaryAndShadowStorage to release the primary/shadow
-// PVCs on every Instance deletion, regardless of whether storage.backup
+// PVCs on every Instance deletion, regardless of whether a backup volume
 // holds a final backup of their databases.
 func (r *InstanceReconciler) deletePVC(ctx context.Context, instance *kubebirdv1.Instance, name string) error {
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace}}
@@ -394,7 +414,7 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 		},
 	}
 	initVolumeMounts := []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}}
-	if instance.Spec.Storage.Backup != nil {
+	if backupVolumeSpec(instance) != nil {
 		// Lets securityDatabaseInitScript restore a security database
 		// backup left behind by an earlier Instance's backupDatabases
 		// under the same name, instead of always falling back to the
@@ -429,7 +449,7 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 			},
 		},
 	}
-	if instance.Spec.Storage.Backup != nil {
+	if backupVolumeSpec(instance) != nil {
 		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: backupVolumeName,
 			VolumeSource: corev1.VolumeSource{
@@ -459,7 +479,7 @@ func volumeMounts(instance *kubebirdv1.Instance) []corev1.VolumeMount {
 			ReadOnly:  true,
 		},
 	}
-	if instance.Spec.Storage.Backup != nil {
+	if backupVolumeSpec(instance) != nil {
 		mounts = append(mounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
 	}
 	if instance.Spec.Storage.Shadow != nil {

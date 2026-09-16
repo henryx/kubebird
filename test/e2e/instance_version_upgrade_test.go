@@ -70,8 +70,12 @@ spec:
   storage:
     primary:
       size: 1Gi
-    backup:
-      size: 1Gi
+  backup:
+    enabled: true
+    type:
+      - local:
+          storage:
+            size: 1Gi
 `, versionUpgradeInstanceName, namespace, version, versionUpgradeDatabaseName)
 	}
 

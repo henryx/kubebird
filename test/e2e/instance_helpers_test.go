@@ -33,7 +33,7 @@ import (
 
 const firebirdContainer = "firebird"
 
-// backupBaseDir is storage.backup's fixed subdirectory for an instance's
+// backupBaseDir is the backup volume's fixed subdirectory for an instance's
 // own backups (see instanceBackupDir in internal/controller), replacing
 // what a per-instance-name subdirectory would say — the backup PVC name
 // itself already identifies the instance.

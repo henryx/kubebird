@@ -4,39 +4,44 @@
 
 ### Added
 
-- `storage.backup`: an optional PVC (`<instance-name>-backup`), mounted into the pod at
-  `/var/lib/firebird/backup`, for staging backups. Like the primary/shadow PVCs, it is never
-  owner-referenced to the `Instance`.
+- `spec.backup`: configures backing up the instance's databases. `spec.backup.enabled` turns on the
+  ability to back up, but by itself creates nothing — a dedicated PVC (`<instance-name>-backup`),
+  mounted into the pod at `/var/lib/firebird/backup` and sized via `spec.backup.type[].local.storage`,
+  is only actually created when `spec.backup.type` also has a `local` entry (the only backup
+  destination currently implemented; `type` is a list so others can be added later without a
+  breaking change). The CRD rejects `spec.backup.enabled: true` with an empty `spec.backup.type`.
+  Like the primary/shadow PVCs, the backup PVC is never owner-referenced to the `Instance`.
 - Deleting an `Instance` now always deletes its primary PVC, and its shadow PVC if `storage.shadow`
-  was set, regardless of whether `storage.backup` is configured — a behavior change from always
-  leaving all storage in place. Without `storage.backup`, this permanently destroys the `Instance`'s
-  data; only the backup PVC (when configured) still survives deletion untouched.
-- When `storage.backup` is configured, deletion backs up every database in `status.databases` into
-  a fixed `base` subdirectory of the backup volume (`<mount>/base/<database>.fbk`, via
-  `gbak -backup -verify`) before releasing the primary/shadow PVCs. `base` doesn't need to be named
-  after the `Instance`: `storage.backup` is already a PVC dedicated to that `Instance` (named
-  `<instance-name>-backup`), so a fixed subdirectory name avoids stuttering the name into the path a
-  second time. `gbak` can't back up a database that a live server still has open, so this first
-  stops the pod (scaling the StatefulSet to 0 replicas) and runs every backup — including the
-  security database's, see below — from a short-lived helper Pod that mounts the same primary,
-  backup, and (when configured) shadow PVCs instead, deleting the Pod again once it succeeds.
-  Without `storage.backup`, the primary/shadow PVCs are released immediately, with no pod restart.
-- Recreating an `Instance` closes that loop, but only when `storage.backup` was configured before
-  deletion: for a database not already on the (now fresh) primary PVC, `storage.backup` is checked
-  for a matching `base/<database>.fbk` backup, and if one is there it's restored via
+  was set, regardless of `spec.backup` — a behavior change from always leaving all storage in
+  place. Without a local backup volume configured, this permanently destroys the `Instance`'s data.
+- Whenever a local backup volume exists, deletion backs up every database in `status.databases`
+  into a fixed `base` subdirectory of the backup volume (`<mount>/base/<database>.fbk`, via
+  `gbak -backup -verify`) before releasing the primary/shadow PVCs, and always leaves the backup
+  PVC in place afterward — there's no way to opt out of retaining it once it exists. `base` doesn't
+  need to be named after the `Instance`: the backup volume is already a PVC dedicated to that
+  `Instance` (named `<instance-name>-backup`), so a fixed subdirectory name avoids stuttering the
+  name into the path a second time. `gbak` can't back up a database that a live server still has
+  open, so this first stops the pod (scaling the StatefulSet to 0 replicas) and runs every backup —
+  including the security database's, see below — from a short-lived helper Pod that mounts the same
+  primary, backup, and (when configured) shadow PVCs instead, deleting the Pod again once it
+  succeeds. Without a local backup volume, there's no backup PVC to consider, and the primary/shadow
+  PVCs are released immediately with no pod restart.
+- Recreating an `Instance` closes that loop, but only when a local backup volume was configured
+  before deletion: for a database not already on the (now fresh) primary PVC, the backup volume is
+  checked for a matching `base/<database>.fbk` backup, and if one is there it's restored via
   `gbak -create -verify` (recreating the shadow file too, for a `shadow: true` database) instead of
-  creating an empty database — so an `Instance` deleted with `storage.backup` configured can be
-  fully recreated from its own backup PVC. This also covers upgrading between Firebird major
-  versions: recreating with a different `spec.version` restores the backup taken by the old
-  version's `gbak` using the new version's own `gbak` and server, verified end-to-end (backup,
-  delete, recreate with a bumped `spec.version`, then confirm a table created before deletion is
-  still there). Without `storage.backup`, a recreated `Instance` starts fresh instead.
+  creating an empty database — so an `Instance` deleted with a backup volume can be fully recreated
+  from its own backup PVC. This also covers upgrading between Firebird major versions: recreating
+  with a different `spec.version` restores the backup taken by the old version's `gbak` using the
+  new version's own `gbak` and server, verified end-to-end (backup, delete, recreate with a bumped
+  `spec.version`, then confirm a table created before deletion is still there). Without a backup
+  volume, a recreated `Instance` starts fresh instead.
 - `status.message` now tracks deletion progress instead of showing a stale pre-deletion value:
-  `"Deleting Instance"`, then (when `storage.backup` is set) `"Stopping the Firebird pod to back up
-  its databases"` while it does that, `"Backing up databases into storage.backup"` while the helper
-  Pod runs, and `"Releasing primary and shadow storage"`, then `"Removing finalizer"`.
+  `"Deleting Instance"`, then (when backing up) `"Stopping the Firebird pod to back up its
+  databases"` while it does that, `"Backing up databases into the backup volume"` while the helper
+  Pod runs, `"Releasing primary and shadow storage"`, then `"Removing finalizer"`.
 - `status.warning`: a non-fatal notice, surfaced through `status.message`/the `MESSAGE` printer
-  column, that `storage.backup` holds a `.fbk` for a database no longer in `spec.databases` — e.g.
+  column, that the backup volume holds a `.fbk` for a database no longer in `spec.databases` — e.g.
   because the `Instance` was recreated with a different database list, or a database was dropped
   after its backup was taken — so it was left unrestored instead of silently ignored. Cleared once
   no orphaned backup remains.
@@ -47,16 +52,15 @@
   time, before the `firebird` container starts; the `security.db` alias in `databases.conf` and a
   new `FIREBIRD_CONF_SecurityDatabase` environment variable both point the live engine at this same
   relocated path.
-- When `storage.backup` is configured, deleting an `Instance` now also backs up the security
+- Whenever a local backup volume exists, deleting an `Instance` now also backs up the security
   database itself (into `<mount>/base/securityN.fbk`, via the same offline `gbak -backup -verify`
   described above) before releasing the primary PVC that carries it, and `security-database-init`
   restores that backup — via its own local `gbak -create -verify` — in preference to the image's
   stock default when the `Instance` is recreated under the same name — so users/roles created
   directly in the security database now survive a delete/recreate cycle the same way application
-  data in `spec.databases` already did (both only when `storage.backup` is set — see above). This
-  backup runs unconditionally on deletion whenever `storage.backup` is set, even when
-  `status.databases` is empty, since the security database always exists regardless of
-  `spec.databases`.
+  data in `spec.databases` already did (both only with a backup volume configured — see above).
+  This backup runs unconditionally whenever it runs at all, even when `status.databases` is empty,
+  since the security database always exists regardless of `spec.databases`.
 - Rotating the SYSDBA Secret's password now restarts the pod to apply it: the `StatefulSet`'s pod
   template carries a `kubebird.github.io/sysdba-password-hash` annotation hashing the Secret's
   current password, so a rotation changes the template and the `StatefulSet` controller's own

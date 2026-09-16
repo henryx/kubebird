@@ -31,7 +31,7 @@ import (
 	"github.com/henryx/kubebird/test/utils"
 )
 
-// instanceBackupOrphanSpecs exercises what happens to storage.backup's
+// instanceBackupOrphanSpecs exercises what happens to the backup volume's
 // per-database .fbk files when an Instance is deleted with two databases,
 // then recreated under the same name with a different database set: the
 // database dropped from spec.databases (a.fdb) is never restored and its
@@ -67,8 +67,12 @@ spec:
 %s  storage:
     primary:
       size: 1Gi
-    backup:
-      size: 1Gi
+  backup:
+    enabled: true
+    type:
+      - local:
+          storage:
+            size: 1Gi
 `, orphanInstanceName, namespace, dbEntries.String())
 	}
 
@@ -106,7 +110,7 @@ spec:
 				g.Expect(err).To(HaveOccurred(), "Instance should have been deleted")
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
-			By("backing up both a.fdb and b.fdb into storage.backup before releasing the primary PVC")
+			By("backing up both a.fdb and b.fdb into the backup volume before releasing the primary PVC")
 			verifyBackupFiles(orphanBackupPVCName, backupBaseDir+"/a.fbk", backupBaseDir+"/b.fbk")
 		})
 
@@ -169,7 +173,7 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).To(HaveOccurred())
 
-			By("leaving a.fbk in storage.backup untouched, orphaned rather than cleaned up")
+			By("leaving a.fbk in the backup volume untouched, orphaned rather than cleaned up")
 			verifyBackupFiles(orphanBackupPVCName, backupBaseDir+"/a.fbk")
 
 			By("never writing a backup for c.fdb, since no deletion has backed it up yet")

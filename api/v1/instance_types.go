@@ -25,6 +25,7 @@ import (
 
 // InstanceSpec defines the desired state of Instance
 // +kubebuilder:validation:XValidation:rule="!self.databases.exists(d, d.shadow) || has(self.storage.shadow)",message="storage.shadow is required when any database has shadow enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.backup) || !self.backup.enabled || size(self.backup.type) > 0",message="backup.type must contain at least one entry when backup.enabled is true"
 type InstanceSpec struct {
 	// image is the container image used to run the Firebird instance.
 	// +kubebuilder:validation:Required
@@ -54,6 +55,10 @@ type InstanceSpec struct {
 	// authentication configures credentials for the instance.
 	// +optional
 	Authentication AuthenticationSpec `json:"authentication,omitzero"`
+
+	// backup configures backing up the instance's databases.
+	// +optional
+	Backup BackupSpec `json:"backup,omitzero"`
 }
 
 // DatabaseSpec defines a single database to create on the instance.
@@ -113,18 +118,49 @@ type StorageSpec struct {
 	// +kubebuilder:validation:Required
 	Primary StorageVolumeSpec `json:"primary"`
 
-	// backup is the volume mounted into the instance for staging backups.
-	// Optional; when omitted, no backup volume is created or mounted. When
-	// set, deleting the Instance backs up every database into this volume
-	// (via gbak) before removing the primary and shadow PVCs; the backup
-	// PVC itself is never removed.
-	// +optional
-	Backup *StorageVolumeSpec `json:"backup,omitempty"`
-
 	// shadow is the volume storing shadow databases. Required if any
 	// database in spec.databases has shadow set to true.
 	// +optional
 	Shadow *StorageVolumeSpec `json:"shadow,omitempty"`
+}
+
+// BackupSpec configures backing up the instance's databases.
+type BackupSpec struct {
+	// enabled turns on backing up the instance's databases. It only makes
+	// the ability available; a destination still has to be configured in
+	// type for anything to actually happen — e.g. a dedicated PVC is only
+	// created and mounted into the instance when type has a "local"
+	// entry. When false (the default), backing up is off entirely.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// type lists the backup destinations to configure. Only a "local"
+	// destination (a dedicated PVC) is currently implemented; required to
+	// be non-empty when enabled is true.
+	// +optional
+	// +listType=atomic
+	Type []BackupTypeSpec `json:"type,omitempty"`
+}
+
+// BackupTypeSpec selects one backup destination for the instance.
+type BackupTypeSpec struct {
+	// local backs up to a dedicated PVC mounted into the instance at
+	// /var/lib/firebird/backup.
+	// +optional
+	Local *LocalBackupSpec `json:"local,omitempty"`
+}
+
+// LocalBackupSpec configures the dedicated PVC used to stage backups.
+// Whenever this is configured, deleting the Instance backs up every
+// database (plus the security database) into the PVC via gbak before the
+// primary and shadow volumes are removed, and leaves the PVC itself in
+// place so a later Instance recreated under the same name can restore
+// from it.
+type LocalBackupSpec struct {
+	// storage configures the backup PVC.
+	// +kubebuilder:validation:Required
+	Storage StorageVolumeSpec `json:"storage"`
 }
 
 // StorageVolumeSpec configures a single persistent volume.
@@ -211,11 +247,11 @@ type InstanceStatus struct {
 	Message string `json:"message,omitempty"`
 
 	// warning is a non-fatal notice from the most recent reconcile that
-	// touched spec.databases, e.g. that storage.backup holds a backup for
-	// a database no longer in spec.databases (so it was left unrestored)
-	// because the Instance was recreated, or had that database removed,
-	// since the backup was taken. Cleared the next time spec.databases
-	// changes and the condition no longer applies.
+	// touched spec.databases, e.g. that the backup volume holds a backup
+	// for a database no longer in spec.databases (so it was left
+	// unrestored) because the Instance was recreated, or had that
+	// database removed, since the backup was taken. Cleared the next time
+	// spec.databases changes and the condition no longer applies.
 	// +optional
 	Warning string `json:"warning,omitempty"`
 }

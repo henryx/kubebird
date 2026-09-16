@@ -325,7 +325,7 @@ var _ = Describe("Instance Controller", func() {
 		})
 	})
 
-	Context("When deleting an Instance with storage.backup configured", func() {
+	Context("When deleting an Instance with a local backup volume configured", func() {
 		const (
 			backupResourceName = "test-backup-resource"
 			backupSecretName   = backupResourceName + "-sysdba"
@@ -354,7 +354,12 @@ var _ = Describe("Instance Controller", func() {
 					},
 					Storage: kubebirdv1.StorageSpec{
 						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
-						Backup:  &kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{
+						Enabled: true,
+						Type: []kubebirdv1.BackupTypeSpec{
+							{Local: &kubebirdv1.LocalBackupSpec{Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")}}},
+						},
 					},
 				},
 			}
@@ -391,7 +396,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, resource)).To(HaveOccurred())
 
-			By("requesting deletion of the primary PVC, after backing it up since storage.backup was configured")
+			By("requesting deletion of the primary PVC, after backing it up since a local backup volume was configured")
 			primaryPVC := &corev1.PersistentVolumeClaim{}
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: backupResourceName + "-primary", Namespace: resourceNamespace}, primaryPVC)
 			if err == nil {
@@ -490,7 +495,7 @@ var _ = Describe("Instance Controller", func() {
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: backupTypeNamespacedName})
 			Expect(err).To(HaveOccurred())
 			Expect(k8sClient.Get(ctx, backupTypeNamespacedName, updated)).To(Succeed())
-			Expect(updated.Status.Message).To(Equal("Backing up databases into storage.backup"))
+			Expect(updated.Status.Message).To(Equal("Backing up databases into the backup volume"))
 			backupPodName := types.NamespacedName{Name: backupResourceName + "-database-backup", Namespace: resourceNamespace}
 			backupPod := &corev1.Pod{}
 			Expect(k8sClient.Get(ctx, backupPodName, backupPod)).To(Succeed())
@@ -521,7 +526,7 @@ var _ = Describe("Instance Controller", func() {
 		})
 	})
 
-	Context("When deleting an Instance without storage.backup configured", func() {
+	Context("When deleting an Instance without backup enabled", func() {
 		const (
 			noBackupResourceName = "test-no-backup-resource"
 			noBackupSecretName   = noBackupResourceName + "-sysdba"
@@ -574,7 +579,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, noBackupTypeNamespacedName, resource)).To(HaveOccurred())
 
-			By("requesting deletion of the primary PVC even though storage.backup was never configured")
+			By("requesting deletion of the primary PVC even though backup was never enabled")
 			primaryPVC := &corev1.PersistentVolumeClaim{}
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: noBackupResourceName + "-primary", Namespace: resourceNamespace}, primaryPVC)
 			if err == nil {
@@ -591,6 +596,70 @@ var _ = Describe("Instance Controller", func() {
 			By("Cleanup the SYSDBA Secret")
 			secret := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
+	})
+
+	Context("When backup is enabled but spec.backup.type has no local entry", func() {
+		const (
+			noLocalResourceName = "test-backup-no-local-resource"
+			noLocalSecretName   = noLocalResourceName + "-sysdba"
+		)
+
+		ctx := context.Background()
+		noLocalTypeNamespacedName := types.NamespacedName{Name: noLocalResourceName, Namespace: resourceNamespace}
+		var controllerReconciler *InstanceReconciler
+
+		BeforeEach(func() {
+			controllerReconciler = &InstanceReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      noLocalResourceName,
+					Namespace: resourceNamespace,
+				},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:   testImage,
+					Version: testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{
+						{Name: testDatabaseName},
+					},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{
+						Enabled: true,
+						Type:    []kubebirdv1.BackupTypeSpec{{}},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: noLocalTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("never creates a backup PVC, and deletes cleanly in a single reconcile with nothing to back up into", func() {
+			By("enabled being true not by itself creating a backup PVC, since spec.backup.type has no local entry")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noLocalResourceName + "-backup", Namespace: resourceNamespace},
+				&corev1.PersistentVolumeClaim{})).To(HaveOccurred())
+
+			By("deleting the Instance before any database was ever provisioned")
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, noLocalTypeNamespacedName, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			By("reconciling once, which completes deletion immediately since there is no backup volume to back up into or release")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: noLocalTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, noLocalTypeNamespacedName, resource)).To(HaveOccurred())
+
+			By("Cleanup the SYSDBA Secret")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noLocalSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
 		})
 	})

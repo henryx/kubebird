@@ -111,10 +111,14 @@ spec:
   storage:
     primary:
       size: 1Gi
-    backup:
-      size: 1Gi
     shadow:
       size: 1Gi
+  backup:
+    enabled: true
+    type:
+      - local:
+          storage:
+            size: 1Gi
 `, instanceName, namespace, instanceAliasName)
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(manifest)
@@ -357,7 +361,7 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("releasing the primary and shadow PVCs, after backing them up since storage.backup was configured")
+			By("releasing the primary and shadow PVCs, after backing them up since a local backup volume was configured")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
 				_, err := utils.Run(cmd)
@@ -400,10 +404,14 @@ spec:
   storage:
     primary:
       size: 1Gi
-    backup:
-      size: 1Gi
     shadow:
       size: 1Gi
+  backup:
+    enabled: true
+    type:
+      - local:
+          storage:
+            size: 1Gi
 `, instanceName, namespace, instanceAliasName)
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(manifest)

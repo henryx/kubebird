@@ -67,6 +67,57 @@ spec:
                         type: string
                     type: object
                 type: object
+              backup:
+                description: backup configures backing up the instance's databases.
+                properties:
+                  enabled:
+                    default: false
+                    description: |-
+                      enabled turns on backing up the instance's databases. It only makes
+                      the ability available; a destination still has to be configured in
+                      type for anything to actually happen — e.g. a dedicated PVC is only
+                      created and mounted into the instance when type has a "local"
+                      entry. When false (the default), backing up is off entirely.
+                    type: boolean
+                  type:
+                    description: |-
+                      type lists the backup destinations to configure. Only a "local"
+                      destination (a dedicated PVC) is currently implemented; required to
+                      be non-empty when enabled is true.
+                    items:
+                      description: BackupTypeSpec selects one backup destination for
+                        the instance.
+                      properties:
+                        local:
+                          description: |-
+                            local backs up to a dedicated PVC mounted into the instance at
+                            /var/lib/firebird/backup.
+                          properties:
+                            storage:
+                              description: storage configures the backup PVC.
+                              properties:
+                                class:
+                                  description: |-
+                                    class is the StorageClass name to use. If empty, the cluster's
+                                    default StorageClass is used.
+                                  type: string
+                                size:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  description: size is the requested volume size.
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                              required:
+                              - size
+                              type: object
+                          required:
+                          - storage
+                          type: object
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
               databases:
                 description: databases is the list of databases to create on the instance.
                 items:
@@ -142,29 +193,6 @@ spec:
                 description: storage configures the persistent volumes backing the
                   instance.
                 properties:
-                  backup:
-                    description: |-
-                      backup is the volume mounted into the instance for staging backups.
-                      Optional; when omitted, no backup volume is created or mounted. When
-                      set, deleting the Instance backs up every database into this volume
-                      (via gbak) before removing the primary and shadow PVCs; the backup
-                      PVC itself is never removed.
-                    properties:
-                      class:
-                        description: |-
-                          class is the StorageClass name to use. If empty, the cluster's
-                          default StorageClass is used.
-                        type: string
-                      size:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        description: size is the requested volume size.
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                    required:
-                    - size
-                    type: object
                   primary:
                     description: primary is the volume storing the instance's primary
                       databases.
@@ -221,6 +249,10 @@ spec:
             x-kubernetes-validations:
             - message: storage.shadow is required when any database has shadow enabled
               rule: '!self.databases.exists(d, d.shadow) || has(self.storage.shadow)'
+            - message: backup.type must contain at least one entry when backup.enabled
+                is true
+              rule: '!has(self.backup) || !self.backup.enabled || size(self.backup.type)
+                > 0'
           status:
             description: status defines the observed state of Instance
             properties:
@@ -331,11 +363,11 @@ spec:
               warning:
                 description: |-
                   warning is a non-fatal notice from the most recent reconcile that
-                  touched spec.databases, e.g. that storage.backup holds a backup for
-                  a database no longer in spec.databases (so it was left unrestored)
-                  because the Instance was recreated, or had that database removed,
-                  since the backup was taken. Cleared the next time spec.databases
-                  changes and the condition no longer applies.
+                  touched spec.databases, e.g. that the backup volume holds a backup
+                  for a database no longer in spec.databases (so it was left
+                  unrestored) because the Instance was recreated, or had that
+                  database removed, since the backup was taken. Cleared the next time
+                  spec.databases changes and the condition no longer applies.
                 type: string
             type: object
         required:

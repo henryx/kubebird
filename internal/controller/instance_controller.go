@@ -175,13 +175,17 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 
 // reconcileDeletion logs an Instance's deletion, reports status.phase as
 // Deleting and status.message with the specific operation currently
-// underway (see setDeletionMessage), backs up its databases when
-// storage.backup is configured (see backupDatabases), always releases the
-// primary/shadow PVCs regardless of storage.backup (see
-// releasePrimaryAndShadowStorage — without a backup that data is simply
-// gone), and removes the finalizer so the API server can complete the
-// deletion; the objects Kubebird created are removed by Kubernetes' garbage
-// collection of their owner references.
+// underway (see setDeletionMessage), backs up its databases when a backup
+// volume exists (backupVolumeSpec, i.e. spec.backup.enabled is true and
+// spec.backup.type has a "local" entry) — see backupDatabases — always
+// releases the primary/shadow PVCs regardless of spec.backup (see
+// releasePrimaryAndShadowStorage — without a backup volume that data is
+// simply gone), and removes the finalizer so the API server can complete
+// the deletion; the objects Kubebird created are removed by Kubernetes'
+// garbage collection of their owner references. The backup volume itself,
+// when it exists, is never touched here: backupDatabases always leaves it
+// in place for a later Instance recreated under the same name to restore
+// from.
 func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if !controllerutil.ContainsFinalizer(instance, finalizerName) {
 		return nil
@@ -196,7 +200,7 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 		return err
 	}
 
-	if instance.Spec.Storage.Backup != nil {
+	if backupVolumeSpec(instance) != nil {
 		if err := r.backupDatabases(ctx, instance); err != nil {
 			return err
 		}
@@ -235,10 +239,10 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 
 // backupDatabases runs a final backup of every database recorded in
 // instance.Status.Databases, plus the instance's security database (see
-// backupDatabasesOffline), into storage.backup. Only called when
-// storage.backup is set — releasePrimaryAndShadowStorage deletes the
-// primary/shadow PVCs regardless, so without a backup that data is simply
-// lost.
+// backupDatabasesOffline), into the backup volume. Only called when a
+// backup volume exists (backupVolumeSpec) — releasePrimaryAndShadowStorage
+// deletes the primary/shadow PVCs regardless, so without a backup volume
+// that data is simply lost.
 //
 // Every one of those backups runs the same way: gbak can't back up a
 // database that a live server still has open (confirmed against the
@@ -286,7 +290,7 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 		}
 		return fmt.Errorf("waiting for the Firebird pod to stop before backing up its databases")
 	default:
-		if err := r.setDeletionMessage(ctx, instance, "Backing up databases into storage.backup"); err != nil {
+		if err := r.setDeletionMessage(ctx, instance, "Backing up databases into the backup volume"); err != nil {
 			return err
 		}
 		if err := r.backupDatabasesOffline(ctx, instance); err != nil {
@@ -297,12 +301,11 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 }
 
 // releasePrimaryAndShadowStorage deletes the primary and (if configured)
-// shadow PVCs on every Instance deletion — regardless of whether
-// storage.backup is set — but never the backup PVC itself. When
-// storage.backup is set, backupDatabases has already preserved this data
-// in the backup volume; when it isn't, the data is simply gone, and a
-// later Instance recreated under the same name starts fresh rather than
-// reusing it.
+// shadow PVCs on every Instance deletion — regardless of spec.backup —
+// but never the backup PVC itself: when a backup volume exists,
+// backupDatabases has already preserved this data there, and it's always
+// left in place for a later Instance recreated under the same name to
+// restore from; without a backup volume, the data is simply gone.
 func (r *InstanceReconciler) releasePrimaryAndShadowStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if err := r.setDeletionMessage(ctx, instance, "Releasing primary and shadow storage"); err != nil {
 		return err
