@@ -15,7 +15,12 @@
 - Deleting an `Instance` now always deletes its primary PVC, and its shadow PVC if `storage.shadow`
   was set, regardless of `spec.backup` — a behavior change from always leaving all storage in
   place. Without a local backup volume configured, this permanently destroys the `Instance`'s data.
-- Whenever a local backup volume exists, deletion backs up every database in `status.databases`
+- `spec.backup.backupOnDelete` (defaults to `true`) controls whether deletion runs that final backup
+  at all: set to `false`, deletion skips straight to releasing the primary/shadow storage, leaving
+  an already-existing backup PVC as-is (whatever an earlier backup left in it) rather than adding a
+  fresh one. Has no effect without a local backup volume configured, since there's nothing to back
+  up into either way.
+- Whenever a local backup volume exists and `spec.backup.backupOnDelete` is `true`, deletion backs up every database in `status.databases`
   into a fixed `base` subdirectory of the backup volume (`<mount>/base/<database>.fbk`, via
   `gbak -backup -verify`) before releasing the primary/shadow PVCs, and always leaves the backup
   PVC in place afterward — there's no way to opt out of retaining it once it exists. `base` doesn't

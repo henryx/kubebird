@@ -78,23 +78,26 @@ spec:
               backup:
                 description: backup configures backing up the instance's databases.
                 properties:
-                  enabled:
-                    default: false
+                  backupOnDelete:
+                    default: true
                     description: |-
-                      enabled turns on backing up the instance's databases. It only makes
-                      the ability available; a destination still has to be configured in
-                      type for anything to actually happen — e.g. a dedicated PVC is only
-                      created and mounted into the instance when type has a "local"
-                      entry. When false (the default), backing up is off entirely.
+                      backupOnDelete controls whether deleting the Instance runs one last
+                      backup into destinations before releasing the primary/shadow
+                      storage. Only takes effect when a local backup volume exists (see
+                      destinations); has no effect otherwise. Defaults to true; a pointer
+                      so an explicit false is distinguishable from an omitted field once
+                      serialized (a plain bool would otherwise be indistinguishable from
+                      its own zero value and get overwritten back to the default by CRD
+                      defaulting on every submission).
                     type: boolean
-                  type:
+                  destinations:
                     description: |-
-                      type lists the backup destinations to configure. Only a "local"
-                      destination (a dedicated PVC) is currently implemented; required to
-                      be non-empty when enabled is true.
+                      destinations lists the backup destinations to configure. Only a
+                      "local" destination (a dedicated PVC) is currently implemented;
+                      required to be non-empty when enabled is true.
                     items:
-                      description: BackupTypeSpec selects one backup destination for
-                        the instance.
+                      description: BackupDestinationSpec selects one backup destination
+                        for the instance.
                       properties:
                         local:
                           description: |-
@@ -125,6 +128,22 @@ spec:
                       type: object
                     type: array
                     x-kubernetes-list-type: atomic
+                  enabled:
+                    default: false
+                    description: |-
+                      enabled turns on backing up the instance's databases. It only makes
+                      the ability available; a destination still has to be configured in
+                      destinations for anything to actually happen — e.g. a dedicated PVC
+                      is only created and mounted into the instance when destinations has
+                      a "local" entry. When false (the default), backing up is off
+                      entirely.
+                    type: boolean
+                  image:
+                    description: |-
+                      image is the container image (including tag) used to run the
+                      short-lived Pod that backs up the instance's databases on deletion.
+                      Defaults to "<spec.image>:<spec.version>" if not specified.
+                    type: string
                 type: object
               databases:
                 description: databases is the list of databases to create on the instance.
@@ -257,9 +276,9 @@ spec:
             x-kubernetes-validations:
             - message: storage.shadow is required when any database has shadow enabled
               rule: '!self.databases.exists(d, d.shadow) || has(self.storage.shadow)'
-            - message: backup.type must contain at least one entry when backup.enabled
+            - message: backup.destinations must contain at least one entry when backup.enabled
                 is true
-              rule: '!has(self.backup) || !self.backup.enabled || size(self.backup.type)
+              rule: '!has(self.backup) || !self.backup.enabled || size(self.backup.destinations)
                 > 0'
           status:
             description: status defines the observed state of Instance

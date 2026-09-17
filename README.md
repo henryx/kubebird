@@ -19,13 +19,15 @@
   password whenever the Secret changes. The Secret is never removed when the `Instance` is deleted,
   so it (and its password) survive and are reused if an `Instance` with the same name is recreated.
 - When a local backup volume is configured (`spec.backup.enabled` with a `local` entry in
-  `spec.backup.destinations`), backs up every database with `gbak`, plus the security database itself
-  (users/roles included) the same way, before releasing the primary/shadow storage on deletion —
-  briefly stopping the pod first, since `gbak` can't back up a database while the live server has
-  it open — then restores from those backups automatically if an `Instance` with the same name is
-  recreated — including across a Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since
-  `gbak` restores are forward-compatible with backups taken by an older version. Without a backup
-  volume, a recreated `Instance` starts fresh instead.
+  `spec.backup.destinations`) and `spec.backup.backupOnDelete` is `true` (the default), backs up
+  every database with `gbak`, plus the security database itself (users/roles included) the same way,
+  before releasing the primary/shadow storage on deletion — briefly stopping the pod first, since
+  `gbak` can't back up a database while the live server has it open — then restores from those
+  backups automatically if an `Instance` with the same name is recreated — including across a
+  Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since `gbak` restores are forward-compatible
+  with backups taken by an older version. Setting `spec.backup.backupOnDelete` to `false` skips that
+  final backup while still releasing the primary/shadow storage. Without a backup volume, a
+  recreated `Instance` starts fresh instead.
 - Warns via `status.warning`/`status.message` about orphaned backups left behind when a recreated
   `Instance` no longer declares a database that has a backup on disk.
 - Surfaces `VERSION`, `STATUS`, `DATABASES`, and `MESSAGE` printer columns on `kubectl get instances`
@@ -146,6 +148,7 @@ spec:
   backup: # backup section
     enabled: true # enable or disable backup
     image: firebirdsql/firebird:3.0.14 # uses a specific image (default is the same image used for instance)
+    backupOnDelete: true # if enabled, execute a last backup in configured destinations when CR is deleted. default is true 
     destinations:
       - local: # use a dedicated PVC
           storage:
@@ -157,7 +160,7 @@ With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in. The `firebird` container sets `allowPrivilegeEscalation: false` and a `RuntimeDefault` seccomp profile, satisfying the `baseline` Pod Security Standard; it does **not** run as non-root or drop capabilities, since the `firebirdsql/firebird` image's entrypoint needs root's full DAC override (e.g. to manage files owned by its own `firebird` user) whenever `FIREBIRD_ROOT_PASSWORD` is set, which Kubebird always does — so `Instance` pods can't satisfy the stricter `restricted` standard, and the namespace they run in must enforce `baseline` or looser.
 - Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`), named `<instance-name>-primary`, with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else. This PVC isn't owned by the `Instance` (so it isn't garbage-collected alongside it), but Kubebird always deletes it itself when the `Instance` is deleted — see "Deleting an Instance" below.
-- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (the only backup destination currently implemented). See "Backup and restore" below for what Kubebird does with it.
+- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (the only backup destination currently implemented). `backup.backupOnDelete` (defaults to `true`) controls whether deleting the `Instance` runs one last backup into it first; setting it to `false` skips that final backup, but never affects whether the PVC itself is created or retained. See "Backup and restore" below for what Kubebird does with it.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
 - Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart. A `security-database-init` init container seeds it there — on every fresh primary PVC, since Kubebird always deletes the previous one on `Instance` deletion — before the `firebird` container starts, either restoring it from a backup or seeding the image's own default (see "Backup and restore" below); the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
@@ -263,24 +266,27 @@ it survives every deletion of the `Instance` for its contents to be restored fro
 that performs the deletion-time backup below; if unset, it defaults to the same `image:version` the
 `Instance` itself runs.
 
-**On deletion**, whenever a local backup volume exists, Kubebird backs up every database before
-releasing the primary/shadow storage (see "Deleting an Instance" above): it first stops the pod
-(scaling the StatefulSet to 0 replicas), since `gbak` can't back up a database — the security
-database included — while a live server still has it open, then runs the short-lived helper Pod,
-mounting the same PVCs, which runs `gbak -backup -verify` for every database in
-`status.databases` into a fixed `base` subdirectory of the backup volume
+**On deletion**, whenever a local backup volume exists *and* `backup.backupOnDelete` is `true` (the
+default), Kubebird backs up every database before releasing the primary/shadow storage (see
+"Deleting an Instance" above): it first stops the pod (scaling the StatefulSet to 0 replicas), since
+`gbak` can't back up a database — the security database included — while a live server still has it
+open, then runs the short-lived helper Pod, mounting the same PVCs, which runs `gbak -backup -verify`
+for every database in `status.databases` into a fixed `base` subdirectory of the backup volume
 (`<mount>/base/<database>.fbk` — not named after the `Instance`, since the backup volume is already
 a PVC dedicated to it), then the security database itself the same way, into that same directory as
 `securityN.fbk`. Backing up the security database happens unconditionally, even when
 `status.databases` is empty, since it always exists regardless of `spec.databases` — the only case
-that skips the backup step entirely is the StatefulSet no longer existing at all (e.g. already
-garbage-collected some other way), in which case Kubebird just releases the storage directly.
-`status.message` tracks each step as it happens — "Stopping the Firebird pod to back up its
-databases", then "Backing up databases into the backup volume", then, always, "Releasing primary and
-shadow storage", then "Removing finalizer" — so `kubectl get instances` shows real deletion progress
-rather than a stale pre-deletion message. Without a local backup volume, none of this runs: the
-primary and shadow PVCs are released immediately, and the `Instance`'s data (security database
-included) is gone for good.
+that skips the backup step entirely (besides `backup.backupOnDelete` being `false`) is the
+StatefulSet no longer existing at all (e.g. already garbage-collected some other way), in which case
+Kubebird just releases the storage directly. `status.message` tracks each step as it happens —
+"Stopping the Firebird pod to back up its databases", then "Backing up databases into the backup
+volume", then, always, "Releasing primary and shadow storage", then "Removing finalizer" — so
+`kubectl get instances` shows real deletion progress rather than a stale pre-deletion message.
+Setting `backup.backupOnDelete` to `false` skips only that final backup — the primary/shadow PVCs are
+still released immediately regardless, so an already-existing backup PVC keeps whatever was in it
+from an earlier backup, but nothing taken at delete time. Without a local backup volume, none of this
+runs at all: the primary and shadow PVCs are released immediately, and the `Instance`'s data (security
+database included) is gone for good.
 
 **On (re)creation**, an `Instance` with the same name only restores its data if a local backup
 volume was configured before deletion: since the backup PVC was left behind, a database not already

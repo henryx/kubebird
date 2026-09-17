@@ -148,6 +148,18 @@ type BackupSpec struct {
 	// Defaults to "<spec.image>:<spec.version>" if not specified.
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// backupOnDelete controls whether deleting the Instance runs one last
+	// backup into destinations before releasing the primary/shadow
+	// storage. Only takes effect when a local backup volume exists (see
+	// destinations); has no effect otherwise. Defaults to true; a pointer
+	// so an explicit false is distinguishable from an omitted field once
+	// serialized (a plain bool would otherwise be indistinguishable from
+	// its own zero value and get overwritten back to the default by CRD
+	// defaulting on every submission).
+	// +kubebuilder:default=true
+	// +optional
+	BackupOnDelete *bool `json:"backupOnDelete,omitempty"`
 }
 
 // BackupDestinationSpec selects one backup destination for the instance.

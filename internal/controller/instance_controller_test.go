@@ -27,6 +27,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -522,6 +523,108 @@ var _ = Describe("Instance Controller", func() {
 			By("Cleanup the SYSDBA Secret")
 			secret := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backupSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
+	})
+
+	Context("When deleting an Instance with a local backup volume configured but backupOnDelete disabled", func() {
+		const (
+			noBackupOnDeleteResourceName = "test-no-backup-on-delete-resource"
+			noBackupOnDeleteSecretName   = noBackupOnDeleteResourceName + "-sysdba"
+		)
+
+		ctx := context.Background()
+		noBackupOnDeleteNamespacedName := types.NamespacedName{Name: noBackupOnDeleteResourceName, Namespace: resourceNamespace}
+		var controllerReconciler *InstanceReconciler
+
+		BeforeEach(func() {
+			controllerReconciler = &InstanceReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      noBackupOnDeleteResourceName,
+					Namespace: resourceNamespace,
+				},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:   testImage,
+					Version: testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{
+						{Name: testDatabaseName},
+					},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{
+						Enabled:        true,
+						BackupOnDelete: ptr.To(false),
+						Destinations: []kubebirdv1.BackupDestinationSpec{
+							{Local: &kubebirdv1.LocalBackupSpec{Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")}}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: noBackupOnDeleteNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("releases the primary PVC in a single reconcile, without stopping the pod to back anything up first", func() {
+			By("the primary and backup PVCs existing after the first reconcile")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupOnDeleteResourceName + "-primary", Namespace: resourceNamespace},
+				&corev1.PersistentVolumeClaim{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupOnDeleteResourceName + "-backup", Namespace: resourceNamespace},
+				&corev1.PersistentVolumeClaim{})).To(Succeed())
+
+			By("faking a provisioned database in status, since envtest never gets a real pod ready")
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, noBackupOnDeleteNamespacedName, resource)).To(Succeed())
+			resource.Status.Databases = []string{testDatabaseName}
+			resource.Status.DatabaseCount = 1
+			Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
+
+			By("deleting the Instance")
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			By("reconciling once, which completes deletion immediately since backupOnDelete is false")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: noBackupOnDeleteNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, noBackupOnDeleteNamespacedName, resource)).To(HaveOccurred())
+
+			By("never scaling the StatefulSet down to back anything up")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, noBackupOnDeleteNamespacedName, sts)).To(Succeed())
+			Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
+
+			By("never creating a database backup Pod")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupOnDeleteResourceName + "-database-backup", Namespace: resourceNamespace},
+				&corev1.Pod{})).To(HaveOccurred())
+
+			By("requesting deletion of the primary PVC despite backupOnDelete being false")
+			primaryPVC := &corev1.PersistentVolumeClaim{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: noBackupOnDeleteResourceName + "-primary", Namespace: resourceNamespace}, primaryPVC)
+			if err == nil {
+				// The StorageObjectInUseProtection admission plugin adds a
+				// finalizer that only the (unrunning, in envtest)
+				// pvc-protection controller removes, so the object may
+				// still exist with a DeletionTimestamp rather than being
+				// fully gone.
+				Expect(primaryPVC.DeletionTimestamp).NotTo(BeNil())
+			} else {
+				Expect(errors.IsNotFound(err)).To(BeTrue())
+			}
+
+			By("not requesting deletion of the backup PVC itself")
+			backupPVC := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupOnDeleteResourceName + "-backup", Namespace: resourceNamespace}, backupPVC)).To(Succeed())
+			Expect(backupPVC.DeletionTimestamp).To(BeNil())
+
+			By("Cleanup the SYSDBA Secret")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noBackupOnDeleteSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
 		})
 	})

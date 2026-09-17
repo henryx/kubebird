@@ -143,6 +143,13 @@ func backupVolumeSpec(instance *kubebirdv1.Instance) *kubebirdv1.StorageVolumeSp
 	return nil
 }
 
+// backupOnDelete reports whether deleting the instance should run one last
+// backup into the backup volume, from spec.backup.backupOnDelete. Unset
+// defaults to true, matching the CRD's own default.
+func backupOnDelete(instance *kubebirdv1.Instance) bool {
+	return instance.Spec.Backup.BackupOnDelete == nil || *instance.Spec.Backup.BackupOnDelete
+}
+
 // reconcilePVCs ensures the PVCs backing instance.Spec.Storage exist,
 // creating any that are missing.
 func (r *InstanceReconciler) reconcilePVCs(ctx context.Context, instance *kubebirdv1.Instance) error {

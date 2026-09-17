@@ -177,8 +177,9 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 // Deleting and status.message with the specific operation currently
 // underway (see setDeletionMessage), backs up its databases when a backup
 // volume exists (backupVolumeSpec, i.e. spec.backup.enabled is true and
-// spec.backup.destinations has a "local" entry) — see backupDatabases — always
-// releases the primary/shadow PVCs regardless of spec.backup (see
+// spec.backup.destinations has a "local" entry) and spec.backup.backupOnDelete
+// is true (the default) — see backupDatabases — always releases the
+// primary/shadow PVCs regardless of spec.backup (see
 // releasePrimaryAndShadowStorage — without a backup volume that data is
 // simply gone), and removes the finalizer so the API server can complete
 // the deletion; the objects Kubebird created are removed by Kubernetes'
@@ -200,7 +201,7 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 		return err
 	}
 
-	if backupVolumeSpec(instance) != nil {
+	if backupVolumeSpec(instance) != nil && backupOnDelete(instance) {
 		if err := r.backupDatabases(ctx, instance); err != nil {
 			return err
 		}
@@ -240,9 +241,10 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 // backupDatabases runs a final backup of every database recorded in
 // instance.Status.Databases, plus the instance's security database (see
 // backupDatabasesOffline), into the backup volume. Only called when a
-// backup volume exists (backupVolumeSpec) — releasePrimaryAndShadowStorage
-// deletes the primary/shadow PVCs regardless, so without a backup volume
-// that data is simply lost.
+// backup volume exists (backupVolumeSpec) and spec.backup.backupOnDelete is
+// true — releasePrimaryAndShadowStorage deletes the primary/shadow PVCs
+// regardless, so without a backup volume, or with backupOnDelete set to
+// false, that data is simply lost.
 //
 // Every one of those backups runs the same way: gbak can't back up a
 // database that a live server still has open (confirmed against the
@@ -302,10 +304,12 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 
 // releasePrimaryAndShadowStorage deletes the primary and (if configured)
 // shadow PVCs on every Instance deletion — regardless of spec.backup —
-// but never the backup PVC itself: when a backup volume exists,
-// backupDatabases has already preserved this data there, and it's always
-// left in place for a later Instance recreated under the same name to
-// restore from; without a backup volume, the data is simply gone.
+// but never the backup PVC itself: when a backup volume exists and
+// spec.backup.backupOnDelete is true, backupDatabases has already
+// preserved this data there, and it's always left in place for a later
+// Instance recreated under the same name to restore from; without a
+// backup volume, or with backupOnDelete set to false, the data is simply
+// gone.
 func (r *InstanceReconciler) releasePrimaryAndShadowStorage(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if err := r.setDeletionMessage(ctx, instance, "Releasing primary and shadow storage"); err != nil {
 		return err

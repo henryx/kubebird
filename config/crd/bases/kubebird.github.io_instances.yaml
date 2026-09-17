@@ -70,6 +70,18 @@ spec:
               backup:
                 description: backup configures backing up the instance's databases.
                 properties:
+                  backupOnDelete:
+                    default: true
+                    description: |-
+                      backupOnDelete controls whether deleting the Instance runs one last
+                      backup into destinations before releasing the primary/shadow
+                      storage. Only takes effect when a local backup volume exists (see
+                      destinations); has no effect otherwise. Defaults to true; a pointer
+                      so an explicit false is distinguishable from an omitted field once
+                      serialized (a plain bool would otherwise be indistinguishable from
+                      its own zero value and get overwritten back to the default by CRD
+                      defaulting on every submission).
+                    type: boolean
                   destinations:
                     description: |-
                       destinations lists the backup destinations to configure. Only a
