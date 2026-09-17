@@ -141,6 +141,12 @@ type BackupSpec struct {
 	// +optional
 	// +listType=atomic
 	Type []BackupTypeSpec `json:"type,omitempty"`
+
+	// image is the container image (including tag) used to run the
+	// short-lived Pod that backs up the instance's databases on deletion.
+	// Defaults to "<spec.image>:<spec.version>" if not specified.
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // BackupTypeSpec selects one backup destination for the instance.

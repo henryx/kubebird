@@ -79,6 +79,12 @@ spec:
                       created and mounted into the instance when type has a "local"
                       entry. When false (the default), backing up is off entirely.
                     type: boolean
+                  image:
+                    description: |-
+                      image is the container image (including tag) used to run the
+                      short-lived Pod that backs up the instance's databases on deletion.
+                      Defaults to "<spec.image>:<spec.version>" if not specified.
+                    type: string
                   type:
                     description: |-
                       type lists the backup destinations to configure. Only a "local"

@@ -61,6 +61,10 @@
   data in `spec.databases` already did (both only with a backup volume configured — see above).
   This backup runs unconditionally whenever it runs at all, even when `status.databases` is empty,
   since the security database always exists regardless of `spec.databases`.
+- `spec.backup.image`: optionally overrides the image (including tag) used to run the short-lived
+  helper Pod that backs up an `Instance`'s databases on deletion. Defaults to
+  `<spec.image>:<spec.version>` — the same image the `firebird` container and the
+  `security-database-init` init container run — when left unset.
 - Rotating the SYSDBA Secret's password now restarts the pod to apply it: the `StatefulSet`'s pod
   template carries a `kubebird.github.io/sysdba-password-hash` annotation hashing the Secret's
   current password, so a rotation changes the template and the `StatefulSet` controller's own

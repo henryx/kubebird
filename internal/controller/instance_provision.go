@@ -491,6 +491,16 @@ func databaseBackupPodName(instance *kubebirdv1.Instance) string {
 	return instance.Name + "-database-backup"
 }
 
+// backupImage returns the container image used by createDatabaseBackupPod,
+// preferring spec.backup.image and falling back to
+// "<spec.image>:<spec.version>" when it's unset.
+func backupImage(instance *kubebirdv1.Instance) string {
+	if instance.Spec.Backup.Image != "" {
+		return instance.Spec.Backup.Image
+	}
+	return fmt.Sprintf("%s:%s", instance.Spec.Image, instance.Spec.Version)
+}
+
 // databaseBackupScript renders the shell script run by the helper Pod
 // createDatabaseBackupPod creates: a local (no host) "gbak -backup" for
 // every database in instance.Status.Databases, plus the security
@@ -623,7 +633,7 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 			Containers: []corev1.Container{
 				{
 					Name:  containerName,
-					Image: fmt.Sprintf("%s:%s", instance.Spec.Image, instance.Spec.Version),
+					Image: backupImage(instance),
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: ptr.To(false),
 						SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
