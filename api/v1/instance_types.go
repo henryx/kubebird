@@ -25,7 +25,7 @@ import (
 
 // InstanceSpec defines the desired state of Instance
 // +kubebuilder:validation:XValidation:rule="!self.databases.exists(d, d.shadow) || has(self.storage.shadow)",message="storage.shadow is required when any database has shadow enabled"
-// +kubebuilder:validation:XValidation:rule="!has(self.backup) || !self.backup.enabled || size(self.backup.type) > 0",message="backup.type must contain at least one entry when backup.enabled is true"
+// +kubebuilder:validation:XValidation:rule="!has(self.backup) || !self.backup.enabled || size(self.backup.destinations) > 0",message="backup.destinations must contain at least one entry when backup.enabled is true"
 type InstanceSpec struct {
 	// image is the container image used to run the Firebird instance.
 	// +kubebuilder:validation:Required
@@ -128,19 +128,20 @@ type StorageSpec struct {
 type BackupSpec struct {
 	// enabled turns on backing up the instance's databases. It only makes
 	// the ability available; a destination still has to be configured in
-	// type for anything to actually happen — e.g. a dedicated PVC is only
-	// created and mounted into the instance when type has a "local"
-	// entry. When false (the default), backing up is off entirely.
+	// destinations for anything to actually happen — e.g. a dedicated PVC
+	// is only created and mounted into the instance when destinations has
+	// a "local" entry. When false (the default), backing up is off
+	// entirely.
 	// +kubebuilder:default=false
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// type lists the backup destinations to configure. Only a "local"
-	// destination (a dedicated PVC) is currently implemented; required to
-	// be non-empty when enabled is true.
+	// destinations lists the backup destinations to configure. Only a
+	// "local" destination (a dedicated PVC) is currently implemented;
+	// required to be non-empty when enabled is true.
 	// +optional
 	// +listType=atomic
-	Type []BackupTypeSpec `json:"type,omitempty"`
+	Destinations []BackupDestinationSpec `json:"destinations,omitempty"`
 
 	// image is the container image (including tag) used to run the
 	// short-lived Pod that backs up the instance's databases on deletion.
@@ -149,8 +150,8 @@ type BackupSpec struct {
 	Image string `json:"image,omitempty"`
 }
 
-// BackupTypeSpec selects one backup destination for the instance.
-type BackupTypeSpec struct {
+// BackupDestinationSpec selects one backup destination for the instance.
+type BackupDestinationSpec struct {
 	// local backs up to a dedicated PVC mounted into the instance at
 	// /var/lib/firebird/backup.
 	// +optional

@@ -115,7 +115,7 @@ spec:
       size: 1Gi
   backup:
     enabled: true
-    type:
+    destinations:
       - local:
           storage:
             size: 1Gi
@@ -408,7 +408,7 @@ spec:
       size: 1Gi
   backup:
     enabled: true
-    type:
+    destinations:
       - local:
           storage:
             size: 1Gi

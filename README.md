@@ -9,7 +9,7 @@
   resource, exposed via a `ClusterIP` (or other) `Service`.
 - Manages dedicated primary, backup, and shadow PVCs. The primary and shadow PVCs are always
   deleted along with the `Instance`; the backup volume — created when `spec.backup.enabled` is set
-  *and* `spec.backup.type` has a `local` entry — always survives deletion instead, so its data can
+  *and* `spec.backup.destinations` has a `local` entry — always survives deletion instead, so its data can
   be restored later.
 - Provisions and drops databases declared in `spec.databases` (including page size, charset,
   collation, and shadow files) as the list changes, without requiring a pod restart.
@@ -19,7 +19,7 @@
   password whenever the Secret changes. The Secret is never removed when the `Instance` is deleted,
   so it (and its password) survive and are reused if an `Instance` with the same name is recreated.
 - When a local backup volume is configured (`spec.backup.enabled` with a `local` entry in
-  `spec.backup.type`), backs up every database with `gbak`, plus the security database itself
+  `spec.backup.destinations`), backs up every database with `gbak`, plus the security database itself
   (users/roles included) the same way, before releasing the primary/shadow storage on deletion —
   briefly stopping the pod first, since `gbak` can't back up a database while the live server has
   it open — then restores from those backups automatically if an `Instance` with the same name is
@@ -142,11 +142,11 @@ spec:
       size: 3Gi
   authentication:
     sysdba:
-      secretRef: "" # if empty, possword is generated randomically
+      secretRef: "" # if empty, password is generated randomically
   backup: # backup section
     enabled: true # enable or disable backup
     image: firebirdsql/firebird:3.0.14 # uses a specific image (default is the same image used for instance)
-    type:
+    destinations:
       - local: # use a dedicated PVC
           storage:
             class: ""
@@ -157,7 +157,7 @@ With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in. The `firebird` container sets `allowPrivilegeEscalation: false` and a `RuntimeDefault` seccomp profile, satisfying the `baseline` Pod Security Standard; it does **not** run as non-root or drop capabilities, since the `firebirdsql/firebird` image's entrypoint needs root's full DAC override (e.g. to manage files owned by its own `firebird` user) whenever `FIREBIRD_ROOT_PASSWORD` is set, which Kubebird always does — so `Instance` pods can't satisfy the stricter `restricted` standard, and the namespace they run in must enforce `baseline` or looser.
 - Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`), named `<instance-name>-primary`, with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else. This PVC isn't owned by the `Instance` (so it isn't garbage-collected alongside it), but Kubebird always deletes it itself when the `Instance` is deleted — see "Deleting an Instance" below.
-- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.type[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.type` has a `local` entry (the only backup destination currently implemented). See "Backup and restore" below for what Kubebird does with it.
+- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (the only backup destination currently implemented). See "Backup and restore" below for what Kubebird does with it.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
 - Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart. A `security-database-init` init container seeds it there — on every fresh primary PVC, since Kubebird always deletes the previous one on `Instance` deletion — before the `firebird` container starts, either restoring it from a backup or seeding the image's own default (see "Backup and restore" below); the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
@@ -210,7 +210,7 @@ The dotted arrows show how the `StatefulSet` uses the other objects (the SYSDBA 
 secret, database aliases from the ConfigMap, traffic routing from the Service, primary/backup/shadow
 data from the PVCs, referenced by name) rather than a separate creation step; the Pod, by contrast,
 is created directly by Kubernetes from the `StatefulSet`'s template. The backup `PVC` only exists
-when `backup.enabled` is set on the `Instance` *and* `backup.type` includes a `local` entry
+when `backup.enabled` is set on the `Instance` *and* `backup.destinations` includes a `local` entry
 (the only backup destination currently implemented) — `backup.enabled` alone just turns on the
 ability to back up, it doesn't by itself create anything (see "Backup and restore" below). The
 shadow `PVC` only exists when
@@ -253,7 +253,7 @@ kubectl delete pvc,secret -l kubebird.github.io/instance=<name>
 
 ### Backup and restore
 
-A local backup volume exists only when `backup.enabled` is `true` *and* `backup.type` has a `local`
+A local backup volume exists only when `backup.enabled` is `true` *and* `backup.destinations` has a `local`
 entry (the only backup destination currently implemented) — `backup.enabled` alone just turns on
 the ability to back up, it doesn't create anything by itself. When configured, Kubebird provisions
 the `<instance-name>-backup` PVC described above and, like the primary/shadow PVCs, never

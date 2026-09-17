@@ -6,10 +6,11 @@
 
 - `spec.backup`: configures backing up the instance's databases. `spec.backup.enabled` turns on the
   ability to back up, but by itself creates nothing — a dedicated PVC (`<instance-name>-backup`),
-  mounted into the pod at `/var/lib/firebird/backup` and sized via `spec.backup.type[].local.storage`,
-  is only actually created when `spec.backup.type` also has a `local` entry (the only backup
-  destination currently implemented; `type` is a list so others can be added later without a
-  breaking change). The CRD rejects `spec.backup.enabled: true` with an empty `spec.backup.type`.
+  mounted into the pod at `/var/lib/firebird/backup` and sized via
+  `spec.backup.destinations[].local.storage`, is only actually created when
+  `spec.backup.destinations` also has a `local` entry (the only backup destination currently
+  implemented; `destinations` is a list so others can be added later without a breaking change).
+  The CRD rejects `spec.backup.enabled: true` with an empty `spec.backup.destinations`.
   Like the primary/shadow PVCs, the backup PVC is never owner-referenced to the `Instance`.
 - Deleting an `Instance` now always deletes its primary PVC, and its shadow PVC if `storage.shadow`
   was set, regardless of `spec.backup` — a behavior change from always leaving all storage in

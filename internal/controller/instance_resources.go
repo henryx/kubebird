@@ -124,18 +124,18 @@ func backupPVCName(instance *kubebirdv1.Instance) string {
 }
 
 // backupVolumeSpec returns the storage configuration for the instance's
-// backup PVC, when spec.backup.enabled is true and spec.backup.type
+// backup PVC, when spec.backup.enabled is true and spec.backup.destinations
 // includes a "local" entry (the only currently implemented destination),
 // or nil otherwise. The CRD's own validation only guarantees
-// spec.backup.type is non-empty when enabled is true, not that one of its
-// entries is "local" — a future non-local-only backup.type would leave
-// this nil despite enabled being true. The first local entry found is
-// used.
+// spec.backup.destinations is non-empty when enabled is true, not that one
+// of its entries is "local" — a future non-local-only backup.destinations
+// would leave this nil despite enabled being true. The first local entry
+// found is used.
 func backupVolumeSpec(instance *kubebirdv1.Instance) *kubebirdv1.StorageVolumeSpec {
 	if !instance.Spec.Backup.Enabled {
 		return nil
 	}
-	for _, t := range instance.Spec.Backup.Type {
+	for _, t := range instance.Spec.Backup.Destinations {
 		if t.Local != nil {
 			return &t.Local.Storage
 		}

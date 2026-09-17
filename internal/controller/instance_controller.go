@@ -177,7 +177,7 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 // Deleting and status.message with the specific operation currently
 // underway (see setDeletionMessage), backs up its databases when a backup
 // volume exists (backupVolumeSpec, i.e. spec.backup.enabled is true and
-// spec.backup.type has a "local" entry) — see backupDatabases — always
+// spec.backup.destinations has a "local" entry) — see backupDatabases — always
 // releases the primary/shadow PVCs regardless of spec.backup (see
 // releasePrimaryAndShadowStorage — without a backup volume that data is
 // simply gone), and removes the finalizer so the API server can complete

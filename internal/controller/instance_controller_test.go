@@ -357,7 +357,7 @@ var _ = Describe("Instance Controller", func() {
 					},
 					Backup: kubebirdv1.BackupSpec{
 						Enabled: true,
-						Type: []kubebirdv1.BackupTypeSpec{
+						Destinations: []kubebirdv1.BackupDestinationSpec{
 							{Local: &kubebirdv1.LocalBackupSpec{Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")}}},
 						},
 					},
@@ -600,7 +600,7 @@ var _ = Describe("Instance Controller", func() {
 		})
 	})
 
-	Context("When backup is enabled but spec.backup.type has no local entry", func() {
+	Context("When backup is enabled but spec.backup.destinations has no local entry", func() {
 		const (
 			noLocalResourceName = "test-backup-no-local-resource"
 			noLocalSecretName   = noLocalResourceName + "-sysdba"
@@ -631,8 +631,8 @@ var _ = Describe("Instance Controller", func() {
 						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
 					},
 					Backup: kubebirdv1.BackupSpec{
-						Enabled: true,
-						Type:    []kubebirdv1.BackupTypeSpec{{}},
+						Enabled:      true,
+						Destinations: []kubebirdv1.BackupDestinationSpec{{}},
 					},
 				},
 			}
@@ -643,7 +643,7 @@ var _ = Describe("Instance Controller", func() {
 		})
 
 		It("never creates a backup PVC, and deletes cleanly in a single reconcile with nothing to back up into", func() {
-			By("enabled being true not by itself creating a backup PVC, since spec.backup.type has no local entry")
+			By("enabled being true not by itself creating a backup PVC, since spec.backup.destinations has no local entry")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noLocalResourceName + "-backup", Namespace: resourceNamespace},
 				&corev1.PersistentVolumeClaim{})).To(HaveOccurred())
 
