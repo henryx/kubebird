@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -87,6 +88,7 @@ type InstanceReconciler struct {
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups=batch,namespace=kubebird-system,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives the cluster state for an Instance towards the desired
 // state: a Secret-backed StatefulSet running Firebird, a Service exposing
@@ -116,61 +118,85 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	reconcileErr := r.reconcileInstance(ctx, instance)
+	result, reconcileErr := r.reconcileInstance(ctx, instance)
 	if err := r.setError(ctx, instance, reconcileErr); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, reconcileErr
+	return result, reconcileErr
 }
 
 // reconcileInstance drives the cluster state for a non-deleted Instance
-// towards its desired state.
-func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *kubebirdv1.Instance) error {
+// towards its desired state. Once the StatefulSet's pod is ready, it also
+// reconciles a CronJob per enabled spec.backup.retention frequency
+// (reconcileScheduledBackups) — Kubernetes' own CronJob controller drives
+// each one's actual schedule from there, not Reconcile itself — and
+// periodically sweeps for backups those CronJobs have produced but not
+// yet compressed (compressScheduledBackups), requeuing accordingly.
+func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *kubebirdv1.Instance) (ctrl.Result, error) {
 	if err := r.reconcileSysdbaSecret(ctx, instance); err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: aliasesConfigMapName(instance), Namespace: instance.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
 		return r.mutateAliasesConfigMap(cm, instance)
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile aliases ConfigMap: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile aliases ConfigMap: %w", err)
 	}
 
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		return r.mutateService(svc, instance)
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile Service: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile Service: %w", err)
 	}
 
 	if err := r.reconcilePVCs(ctx, instance); err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: instance.Name, Namespace: instance.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sts, func() error {
 		return r.mutateStatefulSet(ctx, sts, instance)
 	}); err != nil {
-		return fmt.Errorf("failed to reconcile StatefulSet: %w", err)
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile StatefulSet: %w", err)
 	}
 
 	if err := r.reconcileDatabases(ctx, instance, sts); err != nil {
-		return err
+		return ctrl.Result{}, err
+	}
+
+	var result ctrl.Result
+	if sts.Status.ReadyReplicas > 0 {
+		if err := r.reconcileScheduledBackups(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		if backupVolumeSpec(instance) != nil && anyRetentionEnabled(instance) {
+			if err := r.compressScheduledBackups(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			result.RequeueAfter = scheduledBackupCompressionPollInterval
+		}
 	}
 
 	if sts.Status.ReadyReplicas > 0 && len(instance.Status.Databases) >= len(instance.Spec.Databases) {
 		if err := r.setPhase(ctx, instance, phaseReady); err != nil {
-			return err
+			return ctrl.Result{}, err
 		}
-		return r.setAvailable(ctx, instance, metav1.ConditionTrue,
-			"StatefulSetReady", "Firebird instance is ready")
+		if err := r.setAvailable(ctx, instance, metav1.ConditionTrue,
+			"StatefulSetReady", "Firebird instance is ready"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return result, nil
 	}
 	if err := r.setPhase(ctx, instance, phaseProvisioning); err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
-	return r.setAvailable(ctx, instance, metav1.ConditionFalse,
-		"StatefulSetNotReady", "Waiting for the Firebird StatefulSet to become ready")
+	if err := r.setAvailable(ctx, instance, metav1.ConditionFalse,
+		"StatefulSetNotReady", "Waiting for the Firebird StatefulSet to become ready"); err != nil {
+		return ctrl.Result{}, err
+	}
+	return result, nil
 }
 
 // reconcileDeletion logs an Instance's deletion, reports status.phase as
@@ -421,6 +447,7 @@ func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&batchv1.CronJob{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.findInstancesForSecret)).
 		Named("instance").
 		Complete(r)

@@ -160,6 +160,59 @@ type BackupSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	BackupOnDelete *bool `json:"backupOnDelete,omitempty"`
+
+	// retention configures recurring scheduled backups, one frequency at
+	// a time; see RetentionSpec. Only takes effect when a local backup
+	// volume exists (see destinations); has no effect otherwise,
+	// matching backupOnDelete. Defaults to every frequency disabled.
+	// +optional
+	Retention RetentionSpec `json:"retention,omitzero"`
+}
+
+// RetentionSpec configures recurring scheduled backups of the instance's
+// databases, one field per frequency. Each field is both the switch (0,
+// the default, disables that frequency entirely) and the number of most
+// recent backups to keep for it: every due run takes a full, gzip
+// compressed nbackup of each database plus the security database into
+// "<frequency>/<database>-<n>.nbk.gz" on the backup volume, where <n>
+// rotates over 1..the field's own value, overwriting the oldest backup
+// once that many have been taken instead of growing the volume without
+// bound. Unlike backupOnDelete's gbak backup, which needs the instance
+// stopped first, these run against the instance's own live server via
+// nbackup's guarded online backup, so the instance is never restarted or
+// made unavailable for them.
+type RetentionSpec struct {
+	// hour keeps the last n backups taken on the hour, every hour.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Hour int32 `json:"hour,omitempty"`
+
+	// day keeps the last n backups taken at 00:00 UTC every day.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Day int32 `json:"day,omitempty"`
+
+	// week keeps the last n backups taken at 00:00 UTC every Sunday.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Week int32 `json:"week,omitempty"`
+
+	// month keeps the last n backups taken at 00:00 UTC on the first day
+	// of every month.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Month int32 `json:"month,omitempty"`
+
+	// year keeps the last n backups taken at 00:00 UTC on the first of
+	// January.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Year int32 `json:"year,omitempty"`
 }
 
 // BackupDestinationSpec selects one backup destination for the instance.

@@ -144,6 +144,51 @@ spec:
                       short-lived Pod that backs up the instance's databases on deletion.
                       Defaults to "<spec.image>:<spec.version>" if not specified.
                     type: string
+                  retention:
+                    description: |-
+                      retention configures recurring scheduled backups, one frequency at
+                      a time; see RetentionSpec. Only takes effect when a local backup
+                      volume exists (see destinations); has no effect otherwise,
+                      matching backupOnDelete. Defaults to every frequency disabled.
+                    properties:
+                      day:
+                        default: 0
+                        description: day keeps the last n backups taken at 00:00 UTC
+                          every day.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      hour:
+                        default: 0
+                        description: hour keeps the last n backups taken on the hour,
+                          every hour.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      month:
+                        default: 0
+                        description: |-
+                          month keeps the last n backups taken at 00:00 UTC on the first day
+                          of every month.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      week:
+                        default: 0
+                        description: week keeps the last n backups taken at 00:00
+                          UTC every Sunday.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      year:
+                        default: 0
+                        description: |-
+                          year keeps the last n backups taken at 00:00 UTC on the first of
+                          January.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    type: object
                 type: object
               databases:
                 description: databases is the list of databases to create on the instance.
@@ -578,6 +623,18 @@ rules:
   - apps
   resources:
   - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
   verbs:
   - create
   - delete

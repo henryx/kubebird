@@ -112,7 +112,7 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 		return err
 	}
 
-	podName := instance.Name + "-0"
+	podName := firebirdPodName(instance)
 	sysdbaCommand := []string{binIsql, flagUser, sysdbaUsername, flagPassword, password}
 
 	// Only worth checking when something in spec.databases is actually

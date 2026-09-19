@@ -77,6 +77,37 @@
   rolling update recreates the pod, letting the image's entrypoint apply the new password the same
   way it already does for a brand-new `Instance` — rather than Kubebird pushing the change to the
   live server itself.
+- `spec.backup.retention`: recurring scheduled backups, independent of `backupOnDelete` and running
+  for as long as the `Instance` exists rather than only at deletion. Its five fields (`hour`,
+  `day`, `week`, `month`, `year`) are each both the switch for that frequency (`0`, the default,
+  disables it) and how many of its backups to keep. Has no effect without a local backup volume
+  configured, same as `backupOnDelete`.
+- Each enabled frequency gets its own native `batch/v1` `CronJob` (`<name>-backup-<frequency>`), on
+  a fixed schedule matching its name (hourly on the hour, daily at 00:00 UTC, weekly at 00:00 UTC
+  on Sunday, monthly at 00:00 UTC on the 1st, yearly at 00:00 UTC on January 1st) — removed again if
+  that frequency's count is later set back to `0`. Kubernetes' own CronJob controller drives each
+  one's actual run schedule; Kubebird doesn't track or poll individual runs itself.
+- Each run backs up every database in `status.databases`, plus the security database, using the
+  same physically-consistent, guarded-lock backup `nbackup` performs — but reached through the
+  Services API (`fbsvcmgr ... -action_nbak`) against the instance's own already-running server,
+  since `nbackup` itself only operates on a database local to wherever it runs. Per the Services
+  API's own conventions, both the source database and the backup file are resolved on the server,
+  so the backup lands directly in the backup volume already mounted into the live `firebird`
+  container — the CronJob's Job template itself needs no PVCs mounted, just network access to the
+  instance's `Service` and the SYSDBA credentials from the Secret. Unlike `backupOnDelete`'s `gbak`
+  backup, this never stops the pod. Each backup is written as `<frequency>/<database>-<n>.nbk`,
+  where `<n>` is computed by the run itself, from wall-clock time alone (e.g. whole hours since the
+  Unix epoch, modulo the configured count, for the hourly frequency) rather than anything Kubebird
+  tracks — so no state needs to survive between one CronJob-spawned Job and the next. `<n>` rotates
+  over `1..<the frequency's configured count>`, overwriting the oldest backup once that many exist
+  instead of the volume growing without bound.
+- Every enabled frequency's own backup directory is periodically checked (every 5 minutes) for a
+  `.nbk` file not yet gzip-compressed, and compressed in place (`exec`'d into the live pod, since
+  neither `nbackup` nor `fbsvcmgr` can compress their own output) to
+  `<frequency>/<database>-<n>.nbk.gz` — independently of any specific run's own lifecycle, since
+  Kubebird doesn't otherwise observe a CronJob-spawned Job's completion.
+- New RBAC marker (`get;list;watch;create;update;patch;delete` on `batch`'s `cronjobs`) for the
+  scheduled-backup CronJobs above.
 
 ### Changed
 

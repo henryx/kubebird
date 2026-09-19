@@ -22,11 +22,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -764,6 +766,164 @@ var _ = Describe("Instance Controller", func() {
 			secret := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: noLocalSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
+	})
+
+	Context("When spec.backup.retention has a frequency enabled", func() {
+		const (
+			retentionResourceName = "test-retention-resource"
+			retentionSecretName   = retentionResourceName + "-sysdba"
+		)
+
+		ctx := context.Background()
+		retentionTypeNamespacedName := types.NamespacedName{Name: retentionResourceName, Namespace: resourceNamespace}
+		var controllerReconciler *InstanceReconciler
+
+		BeforeEach(func() {
+			clientSet, err := kubernetes.NewForConfig(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			controllerReconciler = &InstanceReconciler{
+				Client:     k8sClient,
+				Scheme:     k8sClient.Scheme(),
+				RestConfig: cfg,
+				ClientSet:  clientSet,
+			}
+
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      retentionResourceName,
+					Namespace: resourceNamespace,
+				},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:   testImage,
+					Version: testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{
+						{Name: testDatabaseName},
+					},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{
+						Enabled: true,
+						Destinations: []kubebirdv1.BackupDestinationSpec{
+							{Local: &kubebirdv1.LocalBackupSpec{Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")}}},
+						},
+						// Skips the delete-time backup/pod-stop dance
+						// (covered by the earlier backup Contexts) so
+						// this Context's AfterEach can clean up in a
+						// single reconcile; orthogonal to what's under
+						// test here.
+						BackupOnDelete: ptr.To(false),
+						Retention:      kubebirdv1.RetentionSpec{Hour: 2},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: retentionTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("faking the StatefulSet pod as ready and the database as already provisioned, since envtest never runs a real pod")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, retentionTypeNamespacedName, sts)).To(Succeed())
+			sts.Status.Replicas = 1
+			sts.Status.ReadyReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, retentionTypeNamespacedName, resource)).To(Succeed())
+			resource.Status.Databases = []string{testDatabaseName}
+			resource.Status.DatabaseCount = 1
+			Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, retentionTypeNamespacedName, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			// envtest never runs real garbage collection, so the
+			// StatefulSet's owner reference alone wouldn't remove it (or
+			// the ReadyReplicas/Replicas this Context's BeforeEach fakes
+			// on it) once the Instance is gone; deleting it explicitly
+			// keeps that faked status from leaking into the next It's
+			// fresh Instance of the same name. Likewise for the hourly
+			// backup CronJob an It may have created.
+			sts := &appsv1.StatefulSet{}
+			if err := k8sClient.Get(ctx, retentionTypeNamespacedName, sts); err == nil {
+				Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
+			}
+			cronJobName := types.NamespacedName{Name: retentionResourceName + "-backup-hour", Namespace: resourceNamespace}
+			if err := k8sClient.Get(ctx, cronJobName, &batchv1.CronJob{}); err == nil {
+				Expect(k8sClient.Delete(ctx, &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{
+					Name: cronJobName.Name, Namespace: cronJobName.Namespace}})).To(Succeed())
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: retentionTypeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, retentionTypeNamespacedName, &kubebirdv1.Instance{})).To(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: retentionSecretName, Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+		})
+
+		It("builds an hourly CronJob that backs up over the network via fbsvcmgr, mounting no PVCs", func() {
+			// Calls mutateScheduledBackupCronJob directly rather than
+			// going through Reconcile/reconcileScheduledBackups: the
+			// latter first execs "mkdir -p" into the instance's own live
+			// pod (see reconcileScheduledBackupCronJob) before creating a
+			// frequency's CronJob for the first time, which envtest can't
+			// satisfy since it never runs a real StatefulSet pod to exec
+			// into. This still exercises the actual production code that
+			// builds the CronJob, just not the exec-dependent step
+			// around it — that round-trip needs a real cluster (e2e)
+			// instead.
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, retentionTypeNamespacedName, resource)).To(Succeed())
+
+			var hour backupFrequency
+			for _, freq := range backupFrequencies {
+				if freq.name == backupFrequencyHour {
+					hour = freq
+				}
+			}
+
+			cronJob := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{
+				Name:      retentionResourceName + "-backup-hour",
+				Namespace: resourceNamespace,
+			}}
+			Expect(controllerReconciler.mutateScheduledBackupCronJob(cronJob, resource, hour, 1)).To(Succeed())
+			Expect(cronJob.OwnerReferences).NotTo(BeEmpty())
+			Expect(cronJob.Spec.Schedule).To(Equal("0 * * * *"))
+			Expect(cronJob.Spec.ConcurrencyPolicy).To(Equal(batchv1.ForbidConcurrent))
+
+			command := cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Command
+			Expect(command).To(ContainElement(ContainSubstring("fbsvcmgr")))
+			Expect(command).To(ContainElement(ContainSubstring("-action_nbak")))
+			Expect(command).To(ContainElement(ContainSubstring(retentionResourceName + "/3050:service_mgr")))
+			Expect(command).To(ContainElement(ContainSubstring(testDatabaseName[:len(testDatabaseName)-len(".fdb")] + "-$SEQ.nbk")))
+			Expect(command).To(ContainElement(ContainSubstring("security3-$SEQ.nbk")))
+			Expect(command).NotTo(ContainElement(ContainSubstring("gzip")),
+				"compression runs separately, exec'd into the live pod once a run's backup file appears")
+
+			Expect(cronJob.Spec.JobTemplate.Spec.Template.Spec.Volumes).To(BeEmpty(),
+				"the CronJob's Job reaches the instance's own server over the network, so it needs no PVCs mounted")
+
+			var hasPasswordEnv bool
+			for _, e := range cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Env {
+				hasPasswordEnv = hasPasswordEnv || e.Name == "SYSDBA_PASSWORD"
+			}
+			Expect(hasPasswordEnv).To(BeTrue())
+		})
+
+		It("fails clearly, without creating a CronJob, when the Firebird pod isn't reachable to prepare its backup directory", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: retentionTypeNamespacedName})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to create backup directory"))
+
+			cronJobName := types.NamespacedName{Name: retentionResourceName + "-backup-hour", Namespace: resourceNamespace}
+			Expect(k8sClient.Get(ctx, cronJobName, &batchv1.CronJob{})).To(HaveOccurred(),
+				"no CronJob should be created before its backup directory is prepared")
 		})
 	})
 })
