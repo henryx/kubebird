@@ -902,7 +902,8 @@ var _ = Describe("Instance Controller", func() {
 			Expect(command).To(ContainElement(ContainSubstring("-action_nbak")))
 			Expect(command).To(ContainElement(ContainSubstring(retentionResourceName + "/3050:service_mgr")))
 			Expect(command).To(ContainElement(ContainSubstring(testDatabaseName[:len(testDatabaseName)-len(".fdb")] + "-$SEQ.nbk")))
-			Expect(command).To(ContainElement(ContainSubstring("security3-$SEQ.nbk")))
+			Expect(command).NotTo(ContainElement(ContainSubstring("security3-$SEQ.nbk")),
+				"the security database can't be nbackup'd while the server has it open, neither locally nor remotely, so it's deliberately excluded")
 			Expect(command).NotTo(ContainElement(ContainSubstring("gzip")),
 				"compression runs separately, exec'd into the live pod once a run's backup file appears")
 

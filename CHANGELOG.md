@@ -87,15 +87,18 @@
   on Sunday, monthly at 00:00 UTC on the 1st, yearly at 00:00 UTC on January 1st) — removed again if
   that frequency's count is later set back to `0`. Kubernetes' own CronJob controller drives each
   one's actual run schedule; Kubebird doesn't track or poll individual runs itself.
-- Each run backs up every database in `status.databases`, plus the security database, using the
-  same physically-consistent, guarded-lock backup `nbackup` performs — but reached through the
-  Services API (`fbsvcmgr ... -action_nbak`) against the instance's own already-running server,
-  since `nbackup` itself only operates on a database local to wherever it runs. Per the Services
-  API's own conventions, both the source database and the backup file are resolved on the server,
-  so the backup lands directly in the backup volume already mounted into the live `firebird`
-  container — the CronJob's Job template itself needs no PVCs mounted, just network access to the
-  instance's `Service` and the SYSDBA credentials from the Secret. Unlike `backupOnDelete`'s `gbak`
-  backup, this never stops the pod. Each backup is written as `<frequency>/<database>-<n>.nbk`,
+- Each run backs up every database in `status.databases`, using the same physically-consistent,
+  guarded-lock backup `nbackup` performs — but reached through the Services API
+  (`fbsvcmgr ... -action_nbak`) against the instance's own already-running server, since `nbackup`
+  itself only operates on a database local to wherever it runs. Per the Services API's own
+  conventions, both the source database and the backup file are resolved on the server, so the
+  backup lands directly in the backup volume already mounted into the live `firebird` container —
+  the CronJob's Job template itself needs no PVCs mounted, just network access to the instance's
+  `Service` and the SYSDBA credentials from the Secret. Unlike `backupOnDelete`'s `gbak` backup,
+  this never stops the pod. The security database is deliberately excluded: unlike `spec.databases`,
+  it can't be `nbackup`'d while the server has it open, neither locally nor remotely through the
+  Services API, so it stays covered only by the `backupOnDelete` backup taken on deletion. Each
+  backup is written as `<frequency>/<database>-<n>.nbk`,
   where `<n>` is computed by the run itself, from wall-clock time alone (e.g. whole hours since the
   Unix epoch, modulo the configured count, for the hourly frequency) rather than anything Kubebird
   tracks — so no state needs to survive between one CronJob-spawned Job and the next. `<n>` rotates

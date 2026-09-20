@@ -332,18 +332,30 @@ func scheduledBackupDir(frequency string) string {
 
 // scheduledBackupScript renders the shell script each of a frequency's
 // CronJob-spawned Jobs runs: a full (level 0) backup of every database in
-// instance.Status.Databases, plus the security database, via fbsvcmgr's
-// -action_nbak against the instance's own live server
-// (backupServiceConnection). Per the Services API's own conventions for
-// nbak (confirmed against the official nbackup documentation's remote
-// examples), both -dbname and -nbk_file are resolved by the server
-// itself, not by the Job — so each backup lands directly in the backup
-// volume as already mounted into the live firebird container, without
-// the Job needing to mount the primary/backup PVCs itself, or the pod
-// ever stopping (unlike backupDatabasesOffline's gbak-based delete-time
-// backup, which can't run while a live server has the database open at
-// all). The Job's own container therefore needs nothing but network
-// access to the instance's Service and the SYSDBA credentials.
+// instance.Status.Databases via fbsvcmgr's -action_nbak against the
+// instance's own live server (backupServiceConnection). Per the Services
+// API's own conventions for nbak (confirmed against the official nbackup
+// documentation's remote examples), both -dbname and -nbk_file are
+// resolved by the server itself, not by the Job — so each backup lands
+// directly in the backup volume as already mounted into the live firebird
+// container, without the Job needing to mount the primary/backup PVCs
+// itself, or the pod ever stopping (unlike backupDatabasesOffline's
+// gbak-based delete-time backup, which can't run while a live server has
+// the database open at all). The Job's own container therefore needs
+// nothing but network access to the instance's Service and the SYSDBA
+// credentials.
+//
+// Deliberately excludes the security database: unlike spec.databases,
+// confirmed against the actual image that it can't be nbackup'd while the
+// server has it open, neither locally ("Database already opened with
+// engine instance, incompatible with current") nor remotely through the
+// Services API ("no permission for remote access to database") — the same
+// dual restriction backupDatabasesOffline's gbak already works around by
+// stopping the pod first (see "Backup-and-release on deletion" in
+// CLAUDE.md), which this live, zero-downtime scheduled flow can't do. The
+// security database therefore stays covered only by that delete-time
+// backup; a set -e failure on every single scheduled run (as attempting it
+// here would cause) would be worse than not attempting it at all.
 //
 // The rotation sequence number is computed once, into the shell variable
 // SEQ, from freq.sequenceExpr — purely from wall-clock time, not
@@ -357,16 +369,12 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, 
 	b.WriteString("set -e\n")
 	fmt.Fprintf(&b, "SEQ=%s\n", freq.sequenceExpr(retention))
 
-	backup := func(serverDBPath, dbFileName string) {
-		dst := fmt.Sprintf("%s/%s-$SEQ.nbk", dir, strings.TrimSuffix(dbFileName, ".fdb"))
+	for _, name := range instance.Status.Databases {
+		serverDBPath := path.Join(primaryDataMountPath, name)
+		dst := fmt.Sprintf("%s/%s-$SEQ.nbk", dir, strings.TrimSuffix(name, ".fdb"))
 		fmt.Fprintf(&b, "%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_nbak -nbk_level 0 -dbname %q -nbk_file %q\n",
 			binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, serverDBPath, dst)
 	}
-
-	for _, name := range instance.Status.Databases {
-		backup(path.Join(primaryDataMountPath, name), name)
-	}
-	backup(securityDatabasePath(instance), securityDatabaseFileName(instance))
 
 	return b.String()
 }

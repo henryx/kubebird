@@ -175,8 +175,6 @@ func TestScheduledBackupScript(t *testing.T) {
 		"-nbk_level 0",
 		`-dbname "/var/lib/firebird/data/instance.fdb"`,
 		`-nbk_file "/var/lib/firebird/backup/hour/instance-$SEQ.nbk"`,
-		`-dbname "/var/lib/firebird/data/security3.fdb"`,
-		`-nbk_file "/var/lib/firebird/backup/hour/security3-$SEQ.nbk"`,
 		"$SYSDBA_PASSWORD",
 	} {
 		if !strings.Contains(script, want) {
@@ -185,5 +183,8 @@ func TestScheduledBackupScript(t *testing.T) {
 	}
 	if strings.Contains(script, "gzip") {
 		t.Errorf("scheduledBackupScript should not compress its own output; got:\n%s", script)
+	}
+	if strings.Contains(script, "security3.fdb") {
+		t.Errorf("scheduledBackupScript should not attempt to back up the security database, since it can't be nbackup'd while the server has it open; got:\n%s", script)
 	}
 }

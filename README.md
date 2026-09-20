@@ -33,10 +33,12 @@
 - Independently of `backupOnDelete`, `spec.backup.retention` runs recurring scheduled backups (hourly,
   daily, weekly, monthly, and/or yearly) into the same local backup volume, keeping the last `n`
   backups configured per frequency. Each enabled frequency gets its own native Kubernetes `CronJob`,
-  which triggers a full, `nbackup`-style backup of every database plus the security database — via the
+  which triggers a full, `nbackup`-style backup of every database in `spec.databases` — via the
   Services API, since `nbackup` itself only backs up a database local to wherever it runs — against the
   instance's own live server, so, unlike the `gbak`-based `backupOnDelete` backup, it never needs to
-  stop the pod; the result is then gzip-compressed.
+  stop the pod; the result is then gzip-compressed. The security database is deliberately excluded from
+  these scheduled backups, since Firebird refuses to back it up remotely while the server has it open;
+  it stays covered by the `backupOnDelete` backup instead.
 - Surfaces `VERSION`, `STATUS`, `DATABASES`, and `MESSAGE` printer columns on `kubectl get instances`
   for at-a-glance visibility into each instance's state.
 
@@ -338,13 +340,19 @@ CronJob controller takes it from there: Kubebird itself doesn't track or poll in
 `kubectl get cronjobs,jobs -l kubebird.github.io/instance=<name>` is the way to check a scheduled
 backup's own run history or troubleshoot a failure.
 
-Each run takes a full (level 0) backup of every database in `status.databases`, plus the security
-database, writing `<frequency>/<database>-<n>.nbk` into the backup volume (e.g. `hour/instance-2.nbk`),
-then gzip-compresses each one to `<frequency>/<database>-<n>.nbk.gz`. `<n>` rotates over `1..<the
+Each run takes a full (level 0) backup of every database in `status.databases`, writing
+`<frequency>/<database>-<n>.nbk` into the backup volume (e.g. `hour/instance-2.nbk`), then
+gzip-compresses each one to `<frequency>/<database>-<n>.nbk.gz`. `<n>` rotates over `1..<the
 frequency's configured count>`, overwriting the oldest backup once that many exist instead of the
 volume growing without bound — computed by each run itself, from wall-clock time alone (e.g. the
 number of whole hours since the Unix epoch, modulo the configured count, for the hourly frequency), so
 no state needs to survive between runs, or between one CronJob-spawned Job and the next.
+
+Unlike `backupOnDelete`'s `gbak` backup, these scheduled runs never back up the security database:
+Firebird refuses an `nbackup`-style backup of it while a live server has it open, whether reached
+locally or remotely through the Services API, and unlike `backupOnDelete` this flow can't stop the pod
+to work around that. The security database therefore stays covered only by the `backupOnDelete` backup
+taken when the `Instance` is deleted.
 
 Unlike `backupOnDelete`'s `gbak` backup, this never stops the pod. The backup itself uses the same
 mechanism as the `nbackup` CLI tool — a physically consistent backup of a database a live server still

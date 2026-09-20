@@ -319,6 +319,18 @@ var _ = Describe("Manager", Ordered, func() {
 		// a local backup volume configured, restored via gbak
 		// from the backup taken before the primary PVC was released.
 		instanceSecurityDatabaseSpecs()
+
+		// instanceScheduledBackupSpecs
+		// (test/e2e/instance_scheduled_backup_test.go) exercises
+		// spec.backup.retention's CronJob-driven scheduled backups:
+		// the hourly CronJob and its backup directory get created
+		// once the Instance is ready, a manually-triggered run of
+		// that CronJob (rather than waiting on its real schedule)
+		// backs up the database and security database via
+		// fbsvcmgr's remote nbackup action, a forced reconcile
+		// gzips the resulting .nbk files, and disabling retention
+		// removes the CronJob again.
+		instanceScheduledBackupSpecs()
 	})
 })
 
