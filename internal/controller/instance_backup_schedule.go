@@ -257,10 +257,15 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 // than queueing or overlapping it with one still in flight — a skipped
 // run just means that period's backup waits for the next one, since
 // sequenceExpr computes each run's rotation slot from wall-clock time
-// rather than from the previous run's own state.
+// rather than from the previous run's own state. BackoffLimit 0 means a
+// failed run isn't retried by the Job controller either, for the same
+// reason: a failure this period should just wait for the next scheduled
+// tick rather than the Job controller immediately re-running (and, with
+// the default backoff limit of 6, re-failing) the same script.
 func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJob, instance *kubebirdv1.Instance, freq backupFrequency, retention int32) error {
 	successfulHistory := int32(1)
-	failedHistory := int32(1)
+	failedHistory := int32(3)
+	backoffLimit := int32(0)
 
 	cronJob.Labels = labelsForInstance(instance.Name)
 	cronJob.Spec = batchv1.CronJobSpec{
@@ -271,6 +276,7 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 		JobTemplate: batchv1.JobTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
 			Spec: batchv1.JobSpec{
+				BackoffLimit: &backoffLimit,
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
 					Spec: corev1.PodSpec{

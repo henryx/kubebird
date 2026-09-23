@@ -338,7 +338,9 @@ e.g. `<name>-backup-hour`), on the fixed schedule its field name implies — hou
 January 1st — and removes it again if that frequency's count is later set back to `0`. Kubernetes' own
 CronJob controller takes it from there: Kubebird itself doesn't track or poll individual runs, so
 `kubectl get cronjobs,jobs -l kubebird.github.io/instance=<name>` is the way to check a scheduled
-backup's own run history or troubleshoot a failure.
+backup's own run history or troubleshoot a failure. Each CronJob keeps its last successful Job and
+its last 3 failed ones (a failed run isn't retried, so each failed Job reflects one distinct failed
+attempt) for that troubleshooting.
 
 Each run takes a full (level 0) backup of every database in `status.databases`, writing
 `<frequency>/<database>-<n>.nbk` into the backup volume (e.g. `hour/instance-2.nbk`), then
