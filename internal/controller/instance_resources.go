@@ -78,6 +78,20 @@ const (
 	// pick up FIREBIRD_ROOT_PASSWORD, rather than Kubebird pushing the
 	// change to the live server itself.
 	sysdbaPasswordAnnotationKey = "kubebird.github.io/sysdba-password-hash"
+
+	// firebirdComponentLabelKey/firebirdComponentValue scope the Service's
+	// selector (and the StatefulSet's own Selector/pod template) to just
+	// the Firebird server Pod itself, via firebirdPodSelector below.
+	// Every other Pod Kubebird creates for an Instance - the scheduled
+	// backup CronJob's Job pods (instance_backup_schedule.go) and the
+	// delete-time gbak backup Pod (createDatabaseBackupPod) - is labelled
+	// with plain labelsForInstance and so is deliberately left out:
+	// neither listens on firebirdPort, and a Service selector of
+	// labelsForInstance alone (as it used to be) would match them too,
+	// adding them as broken Endpoints and causing connections
+	// occasionally routed to them by kube-proxy to fail to connect.
+	firebirdComponentLabelKey = "app.kubernetes.io/component"
+	firebirdComponentValue    = "firebird"
 )
 
 func labelsForInstance(name string) map[string]string {
@@ -87,6 +101,17 @@ func labelsForInstance(name string) map[string]string {
 		"app.kubernetes.io/managed-by": "kubebird-controller",
 		instanceLabelKey:               name,
 	}
+}
+
+// firebirdPodSelector returns labelsForInstance(name) plus the component
+// label that identifies the actual Firebird server Pod - used for the
+// Service's selector and the StatefulSet's own Selector/pod template, so
+// only that Pod ever becomes a Service Endpoint. See
+// firebirdComponentLabelKey.
+func firebirdPodSelector(name string) map[string]string {
+	labels := labelsForInstance(name)
+	labels[firebirdComponentLabelKey] = firebirdComponentValue
+	return labels
 }
 
 // sysdbaSecretRefName returns the Secret name backing
@@ -340,7 +365,7 @@ func (r *InstanceReconciler) mutateService(svc *corev1.Service, instance *kubebi
 
 	svc.Labels = labelsForInstance(instance.Name)
 	svc.Spec.Type = svcType
-	svc.Spec.Selector = labelsForInstance(instance.Name)
+	svc.Spec.Selector = firebirdPodSelector(instance.Name)
 	svc.Spec.Ports = []corev1.ServicePort{
 		{
 			Name:       containerName,
@@ -357,7 +382,7 @@ func (r *InstanceReconciler) mutateService(svc *corev1.Service, instance *kubebi
 // the Firebird server. The selector is immutable after creation, so it's
 // only set the first time.
 func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, instance *kubebirdv1.Instance) error {
-	labels := labelsForInstance(instance.Name)
+	labels := firebirdPodSelector(instance.Name)
 	replicas := int32(1)
 
 	if sts.CreationTimestamp.IsZero() {

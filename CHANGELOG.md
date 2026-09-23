@@ -134,6 +134,15 @@
   with it as a bare `-password <value>` CLI argument (e.g. `isql`, misparsing the leading `-` as a
   flag of its own rather than part of the password). `generateRandomPassword` now rejects that
   case and generates another password instead.
+- The `Instance`'s `Service` selector matched any object carrying its plain
+  `kubebird.github.io/instance`/`app.kubernetes.io/*` labels, not just the actual Firebird pod — so
+  the scheduled-backup CronJob's Job pod (and the deletion-time `gbak` backup Pod), which are
+  labelled the same way, briefly became broken Service Endpoints while running. A scheduled backup's
+  own `fbsvcmgr` connection to the `Instance`'s `Service` could then get routed to that Job pod
+  itself instead of the real server, failing with "Unable to complete network request to host
+  ..."/"Failed to establish a connection." Fixed by scoping the `Service`'s selector (and the
+  `StatefulSet`'s own `Selector`/pod template) to an additional `app.kubernetes.io/component:
+  firebird` label that only the real pod carries.
 
 ## 0.2.0
 

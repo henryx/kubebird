@@ -372,6 +372,15 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, 
 	for _, name := range instance.Status.Databases {
 		serverDBPath := path.Join(primaryDataMountPath, name)
 		dst := fmt.Sprintf("%s/%s-$SEQ.nbk", dir, strings.TrimSuffix(name, ".fdb"))
+		// -action_nbak -nbk_level 0 refuses to write into an
+		// already-existing file ("Error creating backup file: ... File
+		// exists"), so reusing a rotation slot - this same period's own
+		// retry, or a manually triggered "kubectl create job
+		// --from=cronjob" landing in the same slot as an earlier
+		// successful run - must clear the old file first to actually
+		// overwrite it, matching sequenceExpr's own "just overwrites that
+		// file" rotation design (see backupFrequencies).
+		fmt.Fprintf(&b, "rm -f %q\n", dst)
 		fmt.Fprintf(&b, "%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_nbak -nbk_level 0 -dbname %q -nbk_file %q\n",
 			binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, serverDBPath, dst)
 	}
