@@ -344,11 +344,13 @@ attempt) for that troubleshooting.
 
 Each run takes a full (level 0) backup of every database in `status.databases`, writing
 `<frequency>/<database>-<n>.nbk` into the backup volume (e.g. `hour/instance-2.nbk`), then
-gzip-compresses each one to `<frequency>/<database>-<n>.nbk.gz`. `<n>` rotates over `1..<the
-frequency's configured count>`, overwriting the oldest backup once that many exist instead of the
-volume growing without bound — computed by each run itself, from wall-clock time alone (e.g. the
-number of whole hours since the Unix epoch, modulo the configured count, for the hourly frequency), so
-no state needs to survive between runs, or between one CronJob-spawned Job and the next.
+gzip-compresses each one to `<frequency>/<database>-<n>.nbk.gz`. `<n>` counts up from `1`: the first
+run for that frequency is `1`, the second `2`, and so on, restarting at `1` once it would exceed the
+frequency's configured count, so the volume holds at most that many backups per database instead of
+growing without bound. Each run computes its own `<n>` from what's already in that frequency's own
+backup directory — the numeric suffix of whichever file was written most recently, plus one, wrapped
+back to `1` past the configured count — rather than anything Kubebird tracks itself, so no state
+needs to survive between runs, or between one CronJob-spawned Job and the next.
 
 Unlike `backupOnDelete`'s `gbak` backup, these scheduled runs never back up the security database:
 Firebird refuses an `nbackup`-style backup of it while a live server has it open, whether reached

@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -53,31 +55,68 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
-// TestBackupFrequencySequenceExpr actually runs each frequency's shell
-// arithmetic expression (the same string baked into the CronJob's Job
-// script — see scheduledBackupScript) through a real "sh", for a range
-// of retention counts, and checks the result always lands in
-// 1..retention. This is the one piece of the scheduling logic that lives
-// entirely in a rendered shell snippet rather than Go, so it's only
-// meaningfully testable by actually executing it.
-func TestBackupFrequencySequenceExpr(t *testing.T) {
-	for _, freq := range backupFrequencies {
-		for _, retention := range []int32{1, 2, 3, 5} {
-			t.Run(freq.name+"/retention="+strconv.Itoa(int(retention)), func(t *testing.T) {
-				script := "echo " + freq.sequenceExpr(retention)
-				out, err := exec.Command("sh", "-c", script).Output()
-				if err != nil {
-					t.Fatalf("sh -c %q failed: %v", script, err)
-				}
-				got, err := strconv.Atoi(strings.TrimSpace(string(out)))
-				if err != nil {
-					t.Fatalf("output %q isn't an integer: %v", out, err)
-				}
-				if got < 1 || got > int(retention) {
-					t.Errorf("sequenceExpr(%d) = %d, want a value in 1..%d", retention, got, retention)
-				}
-			})
+// runSequenceRotationScript executes sequenceRotationScript(dir,
+// retention) via a real "sh" and returns the SEQ it computes. This is
+// the one piece of the scheduling logic that lives entirely in a
+// rendered shell snippet rather than Go, so it's only meaningfully
+// testable by actually executing it. Prefixes "set -e", matching
+// scheduledBackupScript's own actual usage: a bare grep with no match
+// (e.g. the very first run, with nothing in dir yet) exits non-zero,
+// and a "VAR=$(...)" assignment's exit status is that of the
+// substitution, so "set -e" aborts the whole script right there unless
+// sequenceRotationScript accounts for it — exercising this without
+// "set -e" would miss exactly that failure mode.
+func runSequenceRotationScript(t *testing.T, dir string, retention int32) int {
+	t.Helper()
+	script := "set -e\n" + sequenceRotationScript(dir, retention) + "echo \"$SEQ\"\n"
+	out, err := exec.Command("sh", "-c", script).Output()
+	if err != nil {
+		t.Fatalf("sh -c %q (dir=%q, retention=%d) failed: %v", script, dir, retention, err)
+	}
+	got, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("output %q isn't an integer: %v", out, err)
+	}
+	return got
+}
+
+// TestSequenceRotationScript exercises the SEQ computation
+// scheduledBackupScript renders: the first run (an empty, or missing,
+// backup directory) is 1, each subsequent run increments by 1 based on
+// the highest "-<n>.nbk"/"-<n>.nbk.gz" suffix already present, and once
+// that would exceed retention it restarts at 1 instead of growing
+// without bound.
+func TestSequenceRotationScript(t *testing.T) {
+	const retention = int32(7)
+	dir := t.TempDir()
+
+	for run := 1; run <= int(retention)+2; run++ {
+		got := runSequenceRotationScript(t, dir, retention)
+		want := ((run - 1) % int(retention)) + 1
+		if got != want {
+			t.Fatalf("run %d: SEQ = %d, want %d", run, got, want)
 		}
+		if err := os.WriteFile(filepath.Join(dir, "instance-"+strconv.Itoa(got)+".nbk"), nil, 0o600); err != nil {
+			t.Fatalf("failed to create fixture file: %v", err)
+		}
+	}
+}
+
+// TestSequenceRotationScriptIgnoresCompressedSuffix confirms the
+// rotation counts an already-gzip-compressed "-<n>.nbk.gz" file (left by
+// compressScheduledBackups) the same as an uncompressed "-<n>.nbk" one,
+// since a real backup directory holds a mix of both once compression has
+// caught up with some runs but not the latest one.
+func TestSequenceRotationScriptIgnoresCompressedSuffix(t *testing.T) {
+	const retention = int32(3)
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "instance-2.nbk.gz"), nil, 0o600); err != nil {
+		t.Fatalf("failed to create fixture file: %v", err)
+	}
+
+	if got := runSequenceRotationScript(t, dir, retention); got != 3 {
+		t.Errorf("SEQ = %d, want 3 (highest existing suffix 2, + 1)", got)
 	}
 }
 

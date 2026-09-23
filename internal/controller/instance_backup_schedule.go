@@ -67,15 +67,15 @@ const (
 )
 
 // backupFrequency describes one spec.backup.retention field: how to read
-// its configured count, the standard cron schedule (interpreted in UTC)
-// a CronJob for it runs on, and the shell arithmetic expression its Job
-// uses to compute its own rotation sequence number at run time, purely
-// from wall-clock time — see scheduledBackupScript.
+// its configured count and the standard cron schedule (interpreted in
+// UTC) a CronJob for it runs on. Its rotation sequence number is computed
+// generically by scheduledBackupScript, from what's already in that
+// frequency's own backup directory rather than anything specific to the
+// frequency itself — see there.
 type backupFrequency struct {
-	name         string
-	schedule     string
-	retention    func(kubebirdv1.RetentionSpec) int32
-	sequenceExpr func(retention int32) string
+	name      string
+	schedule  string
+	retention func(kubebirdv1.RetentionSpec) int32
 }
 
 // backupFrequencies lists every spec.backup.retention field, matching
@@ -85,69 +85,31 @@ type backupFrequency struct {
 // CronJob's schedule in UTC unless a CRON_TZ prefix or spec.timeZone
 // overrides it, so no explicit timezone handling is needed for the
 // schedule string itself.
-//
-// Each sequenceExpr computes a monotonically increasing index for its
-// frequency's own period length purely from the current time, then
-// reduces it into 1..retention: e.g. hour's index is whole hours since
-// the Unix epoch, so it advances by exactly 1 every hour regardless of
-// which specific CronJob-spawned Job happens to run it. This needs no
-// state of Kubebird's own: any two runs landing in the same period
-// (there should only ever be one, but ConcurrencyPolicy: Forbid doesn't
-// guarantee it across a missed/caught-up schedule) compute the same
-// sequence number and simply overwrite the same file, and a run that's
-// delayed into the next period naturally rotates forward instead of
-// reusing a stale number.
 var backupFrequencies = []backupFrequency{
 	{
 		name:      backupFrequencyHour,
 		schedule:  "0 * * * *",
 		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Hour },
-		sequenceExpr: func(retention int32) string {
-			return fmt.Sprintf("$(( ($(date -u +%%s) / 3600) %% %d + 1 ))", retention)
-		},
 	},
 	{
 		name:      backupFrequencyDay,
 		schedule:  "0 0 * * *",
 		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Day },
-		sequenceExpr: func(retention int32) string {
-			return fmt.Sprintf("$(( ($(date -u +%%s) / 86400) %% %d + 1 ))", retention)
-		},
 	},
 	{
-		// January 1st, 1970 (Unix day 0) was a Thursday, so a Sunday
-		// falls on day-since-epoch values congruent to 3 mod 7 (Thu=0,
-		// Fri=1, Sat=2, Sun=3, ...); subtracting 3 before dividing by 7
-		// aligns the resulting week index to those same Sunday
-		// boundaries.
 		name:      backupFrequencyWeek,
 		schedule:  "0 0 * * 0",
 		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Week },
-		sequenceExpr: func(retention int32) string {
-			return fmt.Sprintf("$(( (($(date -u +%%s) / 86400 - 3) / 7) %% %d + 1 ))", retention)
-		},
 	},
 	{
-		// Months don't have a fixed length in seconds, so unlike the
-		// others this can't be derived from raw epoch seconds alone;
-		// year*12+month-1 still increases by exactly 1 every calendar
-		// month. "sed 's/^0//'" strips %m's leading zero (e.g. "09"),
-		// which shell arithmetic would otherwise misparse as an invalid
-		// octal literal.
 		name:      backupFrequencyMonth,
 		schedule:  "0 0 1 * *",
 		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Month },
-		sequenceExpr: func(retention int32) string {
-			return fmt.Sprintf(`$(( ($(date -u +%%Y)*12 + $(date -u +%%m | sed 's/^0//') - 1) %% %d + 1 ))`, retention)
-		},
 	},
 	{
 		name:      backupFrequencyYear,
 		schedule:  "0 0 1 1 *",
 		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Year },
-		sequenceExpr: func(retention int32) string {
-			return fmt.Sprintf("$(( $(date -u +%%Y) %% %d + 1 ))", retention)
-		},
 	},
 }
 
@@ -256,8 +218,9 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 // backup CronJob. ConcurrencyPolicy Forbid skips a run entirely rather
 // than queueing or overlapping it with one still in flight — a skipped
 // run just means that period's backup waits for the next one, since
-// sequenceExpr computes each run's rotation slot from wall-clock time
-// rather than from the previous run's own state. BackoffLimit 0 means a
+// scheduledBackupScript computes each run's rotation slot from what's
+// already in the backup directory rather than from the previous run's
+// own state. BackoffLimit 0 means a
 // failed run isn't retried by the Job controller either, for the same
 // reason: a failure this period should just wait for the next scheduled
 // tick rather than the Job controller immediately re-running (and, with
@@ -336,6 +299,37 @@ func scheduledBackupDir(frequency string) string {
 	return path.Join(backupDataMountPath, frequency)
 }
 
+// sequenceRotationScript renders the two shell lines that compute a
+// scheduled backup run's rotation sequence number into $SEQ, purely from
+// what's already in dir — factored out of scheduledBackupScript so it
+// can be exercised directly against a real temporary directory in
+// tests, without dir needing to be the actual (unwritable-in-tests)
+// backup mount path. See scheduledBackupScript's own doc for the full
+// explanation of the rotation itself.
+//
+// Deliberately keys off the most recently *modified* "-<n>.nbk"/
+// "-<n>.nbk.gz" file ("ls -1t ... | head -1"), not the highest "<n>"
+// present: once every slot 1..retention has been used at least once,
+// the highest "<n>" that ever exists is permanently retention itself
+// (slots are overwritten in place, never renamed or removed), which
+// would otherwise wedge every future run's LAST at retention and so
+// SEQ at a constant 1 forever instead of continuing to rotate.
+//
+// The trailing "|| true" on the LAST= pipeline matters under
+// scheduledBackupScript's own "set -e": the final grep (extracting the
+// digits) exits 1 when nothing matched - the very first run, with
+// nothing in dir yet - and since a "VAR=$(...)" assignment's own exit
+// status is that of the command substitution, "set -e" would otherwise
+// abort the whole script right here, before it ever reaches fbsvcmgr,
+// with no output at all (confirmed against a real cluster: the Job's
+// pod exits 1 in under a second with an empty log).
+func sequenceRotationScript(dir string, retention int32) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "LAST=$(ls -1t %q 2>/dev/null | grep -oE -- '-[0-9]+\\.nbk(\\.gz)?$' | head -1 | grep -oE '[0-9]+' || true)\n", dir)
+	fmt.Fprintf(&b, "SEQ=$(( (${LAST:-0} %% %d) + 1 ))\n", retention)
+	return b.String()
+}
+
 // scheduledBackupScript renders the shell script each of a frequency's
 // CronJob-spawned Jobs runs: a full (level 0) backup of every database in
 // instance.Status.Databases via fbsvcmgr's -action_nbak against the
@@ -363,17 +357,26 @@ func scheduledBackupDir(frequency string) string {
 // backup; a set -e failure on every single scheduled run (as attempting it
 // here would cause) would be worse than not attempting it at all.
 //
-// The rotation sequence number is computed once, into the shell variable
-// SEQ, from freq.sequenceExpr — purely from wall-clock time, not
-// anything Kubebird tracks itself (see backupFrequencies) — and reused
-// for every database's destination file name.
+// The rotation sequence number, into the shell variable SEQ, is computed
+// once per run purely from what's already in the frequency's own backup
+// directory, not anything Kubebird tracks itself (see
+// sequenceRotationScript): it lists scheduledBackupDir(freq.name) by
+// modification time and takes the numeric suffix of whichever
+// "<database>-<n>.nbk"/"<database>-<n>.nbk.gz" file was written most
+// recently (any database's, since a single run always shares one SEQ
+// across every database - see the loop below) as LAST (0 if none exist
+// yet, i.e. the very first run). SEQ is then LAST+1, wrapped back into
+// 1..retention via "(LAST % retention) + 1" — so the very first run is
+// 1, the second is 2, and so on, restarting at 1 once retention
+// consecutive runs have happened, regardless of wall-clock time or
+// whether every scheduled tick actually ran.
 func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, retention int32) string {
 	conn := backupServiceConnection(instance)
 	dir := scheduledBackupDir(freq.name)
 
 	var b strings.Builder
 	b.WriteString("set -e\n")
-	fmt.Fprintf(&b, "SEQ=%s\n", freq.sequenceExpr(retention))
+	b.WriteString(sequenceRotationScript(dir, retention))
 
 	for _, name := range instance.Status.Databases {
 		serverDBPath := path.Join(primaryDataMountPath, name)
@@ -384,8 +387,8 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, 
 		// retry, or a manually triggered "kubectl create job
 		// --from=cronjob" landing in the same slot as an earlier
 		// successful run - must clear the old file first to actually
-		// overwrite it, matching sequenceExpr's own "just overwrites that
-		// file" rotation design (see backupFrequencies).
+		// overwrite it, matching this rotation's own "just overwrites
+		// that file" design.
 		fmt.Fprintf(&b, "rm -f %q\n", dst)
 		fmt.Fprintf(&b, "%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_nbak -nbk_level 0 -dbname %q -nbk_file %q\n",
 			binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, serverDBPath, dst)
@@ -403,8 +406,8 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, 
 // (otherwise network-only, unmounted) backup CronJob's own Job. Matching
 // by suffix, rather than a specific expected file name, means it doesn't
 // need to know which rotation sequence a given run used — that's
-// computed independently by the script itself, from wall-clock time
-// alone (see backupFrequency.sequenceExpr) — and it's naturally
+// computed independently by the script itself, from what's already in
+// the directory (see scheduledBackupScript) — and it's naturally
 // idempotent: an already-compressed file is simply not matched again by
 // "*.nbk".
 func (r *InstanceReconciler) compressScheduledBackups(ctx context.Context, instance *kubebirdv1.Instance) error {
