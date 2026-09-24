@@ -152,42 +152,35 @@ spec:
                       matching backupOnDelete. Defaults to every frequency disabled.
                     properties:
                       day:
-                        default: 0
-                        description: day keeps the last n backups taken at 00:00 UTC
-                          every day.
-                        format: int32
-                        minimum: 0
-                        type: integer
+                        description: |-
+                          day takes a backup at 00:00 UTC every day, keeping those newer than
+                          the given duration (e.g. "3d").
+                        pattern: ^([0-9]+[hdwmy])?$
+                        type: string
                       hour:
-                        default: 0
-                        description: hour keeps the last n backups taken on the hour,
-                          every hour.
-                        format: int32
-                        minimum: 0
-                        type: integer
+                        description: |-
+                          hour takes a backup on the hour, every hour, keeping those newer
+                          than the given duration (e.g. "12h").
+                        pattern: ^([0-9]+[hdwmy])?$
+                        type: string
                       month:
-                        default: 0
                         description: |-
-                          month keeps the last n backups taken at 00:00 UTC on the first day
-                          of every month.
-                        format: int32
-                        minimum: 0
-                        type: integer
+                          month takes a backup at 00:00 UTC on the first day of every month,
+                          keeping those newer than the given duration (e.g. "6m").
+                        pattern: ^([0-9]+[hdwmy])?$
+                        type: string
                       week:
-                        default: 0
-                        description: week keeps the last n backups taken at 00:00
-                          UTC every Sunday.
-                        format: int32
-                        minimum: 0
-                        type: integer
-                      year:
-                        default: 0
                         description: |-
-                          year keeps the last n backups taken at 00:00 UTC on the first of
-                          January.
-                        format: int32
-                        minimum: 0
-                        type: integer
+                          week takes a backup at 00:00 UTC every Sunday, keeping those newer
+                          than the given duration (e.g. "4w").
+                        pattern: ^([0-9]+[hdwmy])?$
+                        type: string
+                      year:
+                        description: |-
+                          year takes a backup at 00:00 UTC on the first of January, keeping
+                          those newer than the given duration (e.g. "2y").
+                        pattern: ^([0-9]+[hdwmy])?$
+                        type: string
                     type: object
                 type: object
               databases:

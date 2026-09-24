@@ -20,9 +20,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -55,68 +56,130 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
-// runSequenceRotationScript executes sequenceRotationScript(dir,
-// retention) via a real "sh" and returns the SEQ it computes. This is
-// the one piece of the scheduling logic that lives entirely in a
-// rendered shell snippet rather than Go, so it's only meaningfully
-// testable by actually executing it. Prefixes "set -e", matching
-// scheduledBackupScript's own actual usage: a bare grep with no match
-// (e.g. the very first run, with nothing in dir yet) exits non-zero,
-// and a "VAR=$(...)" assignment's exit status is that of the
-// substitution, so "set -e" aborts the whole script right there unless
-// sequenceRotationScript accounts for it — exercising this without
-// "set -e" would miss exactly that failure mode.
-func runSequenceRotationScript(t *testing.T, dir string, retention int32) int {
-	t.Helper()
-	script := "set -e\n" + sequenceRotationScript(dir, retention) + "echo \"$SEQ\"\n"
-	out, err := exec.Command("sh", "-c", script).Output()
-	if err != nil {
-		t.Fatalf("sh -c %q (dir=%q, retention=%d) failed: %v", script, dir, retention, err)
+// TestParseRetention checks every accepted spec.backup.retention unit,
+// the empty (disabled) value, a zero duration (also disabled), and that a
+// malformed value is rejected.
+func TestParseRetention(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    retentionDuration
+		enabled bool
+		wantErr bool
+	}{
+		{value: "", want: retentionDuration{}},
+		{value: "0d", want: retentionDuration{amount: 0, unit: 'd'}},
+		{value: "12h", want: retentionDuration{amount: 12, unit: 'h'}, enabled: true},
+		{value: "3d", want: retentionDuration{amount: 3, unit: 'd'}, enabled: true},
+		{value: "4w", want: retentionDuration{amount: 4, unit: 'w'}, enabled: true},
+		{value: "6m", want: retentionDuration{amount: 6, unit: 'm'}, enabled: true},
+		{value: "2y", want: retentionDuration{amount: 2, unit: 'y'}, enabled: true},
+		{value: "3", wantErr: true},
+		{value: "d", wantErr: true},
+		{value: "3x", wantErr: true},
+		{value: "-3d", wantErr: true},
+	} {
+		got, err := parseRetention(tc.value)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseRetention(%q) = %+v, want error", tc.value, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseRetention(%q) unexpected error: %v", tc.value, err)
+			continue
+		}
+		if got != tc.want || got.enabled() != tc.enabled {
+			t.Errorf("parseRetention(%q) = %+v (enabled %v), want %+v (enabled %v)", tc.value, got, got.enabled(), tc.want, tc.enabled)
+		}
 	}
-	got, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		t.Fatalf("output %q isn't an integer: %v", out, err)
-	}
-	return got
 }
 
-// TestSequenceRotationScript exercises the SEQ computation
-// scheduledBackupScript renders: the first run (an empty, or missing,
-// backup directory) is 1, each subsequent run increments by 1 based on
-// the highest "-<n>.nbk"/"-<n>.nbk.gz" suffix already present, and once
-// that would exceed retention it restarts at 1 instead of growing
-// without bound.
-func TestSequenceRotationScript(t *testing.T) {
-	const retention = int32(7)
-	dir := t.TempDir()
-
-	for run := 1; run <= int(retention)+2; run++ {
-		got := runSequenceRotationScript(t, dir, retention)
-		want := ((run - 1) % int(retention)) + 1
-		if got != want {
-			t.Fatalf("run %d: SEQ = %d, want %d", run, got, want)
+// TestRetentionDateAgo checks every unit renders as the GNU "date -d"
+// relative expression pruneScheduledBackupsScript's cutoff relies on.
+func TestRetentionDateAgo(t *testing.T) {
+	for value, want := range map[string]string{
+		"5h": "5 hours ago",
+		"3d": "3 days ago",
+		"2w": "2 weeks ago",
+		"6m": "6 months ago",
+		"1y": "1 years ago",
+	} {
+		d, err := parseRetention(value)
+		if err != nil {
+			t.Fatalf("parseRetention(%q): %v", value, err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, "instance-"+strconv.Itoa(got)+".nbk"), nil, 0o600); err != nil {
+		if got := d.dateAgo(); got != want {
+			t.Errorf("dateAgo(%q) = %q, want %q", value, got, want)
+		}
+	}
+}
+
+// TestPruneScheduledBackupsScript executes pruneScheduledBackupsScript's
+// rendered snippet via a real "sh" (prefixed with "set -e", matching
+// scheduledBackupScript's own usage) against a real temporary directory:
+// with "3d", only backups whose file name timestamp is more than three
+// days old are deleted, compressed or not, while recent ones and files not
+// following the scheduled backup naming are left alone. Fixture
+// timestamps are relative to the real clock, since the script's own
+// cutoff is.
+func TestPruneScheduledBackupsScript(t *testing.T) {
+	retention, err := parseRetention("3d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stamp := func(ago time.Duration) string { return now.Add(-ago).Format("20060102T150405Z") }
+
+	expired := []string{
+		"instance-" + stamp(4*24*time.Hour) + ".nbk.gz",
+		"instance-" + stamp(3*24*time.Hour+time.Hour) + ".nbk",
+	}
+	kept := []string{
+		"instance-" + stamp(3*24*time.Hour-time.Hour) + ".nbk.gz",
+		"instance-" + stamp(time.Hour) + ".nbk",
+		"instance-1.nbk.gz", // not timestamp-named: ignored
+		"notes.txt",         // unrelated: ignored
+	}
+	for _, name := range append(slices.Clone(expired), kept...) {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
 			t.Fatalf("failed to create fixture file: %v", err)
 		}
 	}
-}
 
-// TestSequenceRotationScriptIgnoresCompressedSuffix confirms the
-// rotation counts an already-gzip-compressed "-<n>.nbk.gz" file (left by
-// compressScheduledBackups) the same as an uncompressed "-<n>.nbk" one,
-// since a real backup directory holds a mix of both once compression has
-// caught up with some runs but not the latest one.
-func TestSequenceRotationScriptIgnoresCompressedSuffix(t *testing.T) {
-	const retention = int32(3)
-	dir := t.TempDir()
-
-	if err := os.WriteFile(filepath.Join(dir, "instance-2.nbk.gz"), nil, 0o600); err != nil {
-		t.Fatalf("failed to create fixture file: %v", err)
+	script := "set -e\n" + pruneScheduledBackupsScript(dir, retention)
+	if out, err := exec.Command("sh", "-c", script).CombinedOutput(); err != nil {
+		t.Fatalf("sh -c %q failed: %v\n%s", script, err, out)
 	}
 
-	if got := runSequenceRotationScript(t, dir, retention); got != 3 {
-		t.Errorf("SEQ = %d, want 3 (highest existing suffix 2, + 1)", got)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(entries))
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	slices.Sort(got)
+	want := slices.Clone(kept)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("remaining files = %v, want %v (expired: %v)", got, want, expired)
+	}
+}
+
+// TestPruneScheduledBackupsScriptEmptyDir confirms pruning an empty
+// directory succeeds under "set -e" — the very first run for a frequency,
+// where both globs match nothing and stay literal.
+func TestPruneScheduledBackupsScriptEmptyDir(t *testing.T) {
+	retention, err := parseRetention("1h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "set -e\n" + pruneScheduledBackupsScript(t.TempDir(), retention)
+	if out, err := exec.Command("sh", "-c", script).CombinedOutput(); err != nil {
+		t.Fatalf("sh -c %q failed: %v\n%s", script, err, out)
 	}
 }
 
@@ -151,7 +214,7 @@ func TestReconcileScheduledBackupsRemovesADisabledFrequencysCronJob(t *testing.T
 	// envtest Context, which has a real (if pod-less) apiserver to exec
 	// against. This sticks to the direction that needs no exec at all:
 	// removing an already-existing CronJob once its frequency's
-	// retention drops to 0 (or its backup volume disappears).
+	// retention is disabled (or its backup volume disappears).
 	scheme := newTestScheme(t)
 	instance := &kubebirdv1.Instance{
 		ObjectMeta: metav1.ObjectMeta{Name: testScheduleInstanceName, Namespace: "default"},
@@ -161,7 +224,7 @@ func TestReconcileScheduledBackupsRemovesADisabledFrequencysCronJob(t *testing.T
 				Destinations: []kubebirdv1.BackupDestinationSpec{
 					{Local: &kubebirdv1.LocalBackupSpec{Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")}}},
 				},
-				// Every RetentionSpec field left at 0 (disabled).
+				// Every RetentionSpec field left empty (disabled).
 			},
 		},
 	}
@@ -181,7 +244,7 @@ func TestReconcileScheduledBackupsRemovesADisabledFrequencysCronJob(t *testing.T
 
 	err := r.Get(t.Context(), client.ObjectKeyFromObject(existing), &batchv1.CronJob{})
 	if !apierrors.IsNotFound(err) {
-		t.Errorf("hourly CronJob still exists after its retention dropped to 0 (err = %v), want NotFound", err)
+		t.Errorf("hourly CronJob still exists after its retention was disabled (err = %v), want NotFound", err)
 	}
 }
 
@@ -191,6 +254,9 @@ func TestScheduledBackupScript(t *testing.T) {
 		Spec: kubebirdv1.InstanceSpec{
 			Image:   "firebirdsql/firebird",
 			Version: "3.0.14",
+			Backup: kubebirdv1.BackupSpec{
+				Retention: kubebirdv1.RetentionSpec{Hour: "3h"},
+			},
 		},
 		Status: kubebirdv1.InstanceStatus{
 			Databases: []string{"instance.fdb"},
@@ -204,21 +270,27 @@ func TestScheduledBackupScript(t *testing.T) {
 		}
 	}
 
-	script := scheduledBackupScript(instance, hour, 2)
+	script := scheduledBackupScript(instance, hour)
 
 	for _, want := range []string{
-		"SEQ=",
+		"TS=$(date -u +%Y%m%dT%H%M%SZ)",
 		"fbsvcmgr",
 		"test/3050:service_mgr",
 		"-action_nbak",
 		"-nbk_level 0",
 		`-dbname "/var/lib/firebird/data/instance.fdb"`,
-		`-nbk_file "/var/lib/firebird/backup/hour/instance-$SEQ.nbk"`,
+		`-nbk_file "/var/lib/firebird/backup/hour/instance-$TS.nbk"`,
 		"$SYSDBA_PASSWORD",
+		`CUTOFF=$(date -u -d "3 hours ago" +%Y%m%dT%H%M%SZ)`,
+		`for f in "/var/lib/firebird/backup/hour"/*.nbk "/var/lib/firebird/backup/hour"/*.nbk.gz; do`,
+		`rm -f "$f"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("scheduledBackupScript output missing %q; got:\n%s", want, script)
 		}
+	}
+	if strings.Index(script, "CUTOFF=") < strings.LastIndex(script, "fbsvcmgr") {
+		t.Errorf("scheduledBackupScript must prune only after every backup succeeded; got:\n%s", script)
 	}
 	if strings.Contains(script, "gzip") {
 		t.Errorf("scheduledBackupScript should not compress its own output; got:\n%s", script)

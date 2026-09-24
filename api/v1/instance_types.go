@@ -170,49 +170,49 @@ type BackupSpec struct {
 }
 
 // RetentionSpec configures recurring scheduled backups of the instance's
-// databases, one field per frequency. Each field is both the switch (0,
-// the default, disables that frequency entirely) and the number of most
-// recent backups to keep for it: every due run takes a full, gzip
-// compressed nbackup of each database plus the security database into
-// "<frequency>/<database>-<n>.nbk.gz" on the backup volume, where <n>
-// rotates over 1..the field's own value, overwriting the oldest backup
-// once that many have been taken instead of growing the volume without
-// bound. Unlike backupOnDelete's gbak backup, which needs the instance
-// stopped first, these run against the instance's own live server via
-// nbackup's guarded online backup, so the instance is never restarted or
-// made unavailable for them.
+// databases, one field per frequency. Each field is both the switch
+// (empty, the default, or a zero duration such as "0d", disables that
+// frequency entirely) and how long its backups are kept, as "<n><unit>"
+// where unit is h (hours), d (days), w (weeks), m (months) or y (years):
+// e.g. day: "3d" takes a backup at 00:00 UTC every day and deletes any of
+// that frequency's backups older than three days. Every due run takes a
+// full, gzip compressed nbackup of each database into
+// "<frequency>/<database>-<timestamp>.nbk.gz" on the backup volume, where
+// <timestamp> is the run's own UTC start time (YYYYMMDDTHHMMSSZ). Unlike
+// backupOnDelete's gbak backup, which needs the instance stopped first,
+// these run against the instance's own live server via nbackup's guarded
+// online backup, so the instance is never restarted or made unavailable
+// for them.
 type RetentionSpec struct {
-	// hour keeps the last n backups taken on the hour, every hour.
-	// +kubebuilder:default=0
-	// +kubebuilder:validation:Minimum=0
+	// hour takes a backup on the hour, every hour, keeping those newer
+	// than the given duration (e.g. "12h").
+	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
 	// +optional
-	Hour int32 `json:"hour,omitempty"`
+	Hour string `json:"hour,omitempty"`
 
-	// day keeps the last n backups taken at 00:00 UTC every day.
-	// +kubebuilder:default=0
-	// +kubebuilder:validation:Minimum=0
+	// day takes a backup at 00:00 UTC every day, keeping those newer than
+	// the given duration (e.g. "3d").
+	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
 	// +optional
-	Day int32 `json:"day,omitempty"`
+	Day string `json:"day,omitempty"`
 
-	// week keeps the last n backups taken at 00:00 UTC every Sunday.
-	// +kubebuilder:default=0
-	// +kubebuilder:validation:Minimum=0
+	// week takes a backup at 00:00 UTC every Sunday, keeping those newer
+	// than the given duration (e.g. "4w").
+	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
 	// +optional
-	Week int32 `json:"week,omitempty"`
+	Week string `json:"week,omitempty"`
 
-	// month keeps the last n backups taken at 00:00 UTC on the first day
-	// of every month.
-	// +kubebuilder:default=0
-	// +kubebuilder:validation:Minimum=0
+	// month takes a backup at 00:00 UTC on the first day of every month,
+	// keeping those newer than the given duration (e.g. "6m").
+	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
 	// +optional
-	Month int32 `json:"month,omitempty"`
+	Month string `json:"month,omitempty"`
 
-	// year keeps the last n backups taken at 00:00 UTC on the first of
-	// January.
-	// +kubebuilder:default=0
-	// +kubebuilder:validation:Minimum=0
+	// year takes a backup at 00:00 UTC on the first of January, keeping
+	// those newer than the given duration (e.g. "2y").
+	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
 	// +optional
-	Year int32 `json:"year,omitempty"`
+	Year string `json:"year,omitempty"`
 }
 
 // BackupDestinationSpec selects one backup destination for the instance.

@@ -326,10 +326,12 @@ var _ = Describe("Manager", Ordered, func() {
 		// the hourly CronJob and its backup directory get created
 		// once the Instance is ready, a manually-triggered run of
 		// that CronJob (rather than waiting on its real schedule)
-		// backs up the database and security database via
+		// backs up the database (not the security database) via
 		// fbsvcmgr's remote nbackup action, a forced reconcile
-		// gzips the resulting .nbk files, and disabling retention
-		// removes the CronJob again.
+		// gzips the resulting .nbk files, a second run lands next
+		// to the first while a backup older than the retention
+		// window is pruned, and disabling retention removes the
+		// CronJob again.
 		instanceScheduledBackupSpecs()
 	})
 })

@@ -814,7 +814,7 @@ var _ = Describe("Instance Controller", func() {
 						// single reconcile; orthogonal to what's under
 						// test here.
 						BackupOnDelete: ptr.To(false),
-						Retention:      kubebirdv1.RetentionSpec{Hour: 2},
+						Retention:      kubebirdv1.RetentionSpec{Hour: "2h"},
 					},
 				},
 			}
@@ -867,7 +867,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
 		})
 
-		It("builds an hourly CronJob that backs up over the network via fbsvcmgr, mounting no PVCs", func() {
+		It("builds an hourly CronJob that backs up over the network via fbsvcmgr and prunes expired backups through the backup PVC", func() {
 			// Calls mutateScheduledBackupCronJob directly rather than
 			// going through Reconcile/reconcileScheduledBackups: the
 			// latter first execs "mkdir -p" into the instance's own live
@@ -892,7 +892,7 @@ var _ = Describe("Instance Controller", func() {
 				Name:      retentionResourceName + "-backup-hour",
 				Namespace: resourceNamespace,
 			}}
-			Expect(controllerReconciler.mutateScheduledBackupCronJob(cronJob, resource, hour, 1)).To(Succeed())
+			Expect(controllerReconciler.mutateScheduledBackupCronJob(cronJob, resource, hour)).To(Succeed())
 			Expect(cronJob.OwnerReferences).NotTo(BeEmpty())
 			Expect(cronJob.Spec.Schedule).To(Equal("0 * * * *"))
 			Expect(cronJob.Spec.ConcurrencyPolicy).To(Equal(batchv1.ForbidConcurrent))
@@ -901,14 +901,30 @@ var _ = Describe("Instance Controller", func() {
 			Expect(command).To(ContainElement(ContainSubstring("fbsvcmgr")))
 			Expect(command).To(ContainElement(ContainSubstring("-action_nbak")))
 			Expect(command).To(ContainElement(ContainSubstring(retentionResourceName + "/3050:service_mgr")))
-			Expect(command).To(ContainElement(ContainSubstring(testDatabaseName[:len(testDatabaseName)-len(".fdb")] + "-$SEQ.nbk")))
-			Expect(command).NotTo(ContainElement(ContainSubstring("security3-$SEQ.nbk")),
+			Expect(command).To(ContainElement(ContainSubstring(testDatabaseName[:len(testDatabaseName)-len(".fdb")] + "-$TS.nbk")))
+			Expect(command).NotTo(ContainElement(ContainSubstring("security3-$TS.nbk")),
 				"the security database can't be nbackup'd while the server has it open, neither locally nor remotely, so it's deliberately excluded")
 			Expect(command).NotTo(ContainElement(ContainSubstring("gzip")),
 				"compression runs separately, exec'd into the live pod once a run's backup file appears")
 
-			Expect(cronJob.Spec.JobTemplate.Spec.Template.Spec.Volumes).To(BeEmpty(),
-				"the CronJob's Job reaches the instance's own server over the network, so it needs no PVCs mounted")
+			Expect(command).To(ContainElement(ContainSubstring(`CUTOFF=$(date -u -d "2 hours ago"`)),
+				"the Job prunes backups older than spec.backup.retention.hour itself, right after taking a new one")
+
+			podSpec := cronJob.Spec.JobTemplate.Spec.Template.Spec
+			Expect(podSpec.Volumes).To(HaveLen(1))
+			Expect(podSpec.Volumes[0].PersistentVolumeClaim).NotTo(BeNil())
+			Expect(podSpec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(retentionResourceName+"-backup"),
+				"the Job mounts only the backup PVC, to prune expired backups there")
+			Expect(podSpec.Containers[0].VolumeMounts).To(ContainElement(
+				corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath}))
+
+			Expect(podSpec.Affinity).NotTo(BeNil())
+			Expect(podSpec.Affinity.PodAffinity).NotTo(BeNil())
+			terms := podSpec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+			Expect(terms).To(HaveLen(1))
+			Expect(terms[0].TopologyKey).To(Equal("kubernetes.io/hostname"))
+			Expect(terms[0].LabelSelector.MatchLabels).To(Equal(firebirdPodSelector(retentionResourceName)),
+				"the backup PVC is ReadWriteOnce, so the Job must land on the Firebird pod's own node")
 
 			var hasPasswordEnv bool
 			for _, e := range cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Env {

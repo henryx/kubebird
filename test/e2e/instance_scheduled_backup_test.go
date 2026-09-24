@@ -48,8 +48,10 @@ const (
 // database (but deliberately not the security database — see
 // scheduledBackupScript in internal/controller/instance_backup_schedule.go
 // for why) via fbsvcmgr's remote nbackup action, a forced reconcile gzips
-// the resulting .nbk files, and turning spec.backup.retention.hour back to
-// 0 removes the CronJob again.
+// the resulting .nbk files, a second run lands alongside the first (each
+// file is named after its run's own UTC timestamp) while a backup older
+// than the retention window is pruned, and unsetting
+// spec.backup.retention.hour removes the CronJob again.
 //
 // The CronJob Kubebird creates only fires on its own real schedule ("0 * *
 // * *" for hourly, the fastest of the five), far too slow for an e2e run —
@@ -63,10 +65,10 @@ const (
 // e2e_test.go, after the CRDs are installed and the controller-manager is
 // deployed, and before that Describe's AfterAll tears them down.
 func instanceScheduledBackupSpecs() {
-	manifest := func(hourRetention int) string {
+	manifest := func(hourRetention string) string {
 		retention := ""
-		if hourRetention > 0 {
-			retention = fmt.Sprintf("    retention:\n      hour: %d\n", hourRetention)
+		if hourRetention != "" {
+			retention = fmt.Sprintf("    retention:\n      hour: %q\n", hourRetention)
 		}
 		return fmt.Sprintf(`
 apiVersion: kubebird.github.io/v1
@@ -110,7 +112,7 @@ spec:
 		It("should deploy with hourly retention enabled and create the hourly backup CronJob", func() {
 			By("applying an Instance with a local backup volume and spec.backup.retention.hour set")
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(manifest(2))
+			cmd.Stdin = strings.NewReader(manifest("2h"))
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -208,10 +210,57 @@ spec:
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
 
+		It("should keep a second run alongside the first and prune backups older than the retention window", func() {
+			const expiredBackup = "scheduled-20000101T000000Z.nbk.gz"
+
+			By("planting a backup file far older than the 2h retention window")
+			cmd := exec.Command("kubectl", "exec", scheduledBackupPodName, "-n", namespace, "-c", firebirdContainer,
+				"--", "touch", scheduledBackupDir+"/"+expiredBackup)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("manually running a second Job from the hourly CronJob")
+			manualJobName := scheduledBackupCronJob + "-manual-2"
+			cmd = exec.Command("kubectl", "create", "job", manualJobName,
+				"--from=cronjob/"+scheduledBackupCronJob, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				cmd := exec.Command("kubectl", "delete", "job", manualJobName, "-n", namespace, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+			}()
+
+			By("waiting for the second Job to succeed instead of colliding with the first run's file, pruning as it goes")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "job", manualJobName, "-n", namespace,
+					"-o", "jsonpath={.status.succeeded}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1"))
+			}, 3*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("forcing a fresh reconcile so compressScheduledBackups compresses the new backup immediately")
+			cmd = exec.Command("kubectl", "annotate", "instance", scheduledBackupInstanceName, "-n", namespace,
+				fmt.Sprintf("kubebird.github.io/e2e-trigger=%d", time.Now().UnixNano()), "--overwrite")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("keeping both recent backups, compressed, while the Job itself deleted the expired one")
+			Eventually(func(g Gomega) {
+				files := listBackupFiles()
+				g.Expect(files).To(HaveLen(2))
+				g.Expect(files).NotTo(ContainElement(expiredBackup))
+				for _, f := range files {
+					g.Expect(f).To(HavePrefix("scheduled-"))
+					g.Expect(f).To(HaveSuffix(".nbk.gz"))
+				}
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+		})
+
 		It("should delete the hourly CronJob once retention is disabled", func() {
-			By("re-applying the Instance with spec.backup.retention.hour back at its default of 0")
+			By("re-applying the Instance with spec.backup.retention.hour back at its default (unset)")
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(manifest(0))
+			cmd.Stdin = strings.NewReader(manifest(""))
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 

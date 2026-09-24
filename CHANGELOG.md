@@ -79,13 +79,16 @@
   live server itself.
 - `spec.backup.retention`: recurring scheduled backups, independent of `backupOnDelete` and running
   for as long as the `Instance` exists rather than only at deletion. Its five fields (`hour`,
-  `day`, `week`, `month`, `year`) are each both the switch for that frequency (`0`, the default,
-  disables it) and how many of its backups to keep. Has no effect without a local backup volume
+  `day`, `week`, `month`, `year`) are each both the switch for that frequency (empty, the default,
+  or a zero duration disables it) and how long its backups are kept, as a time-based
+  `<n><unit>` duration — `h` (hours), `d` (days), `w` (weeks), `m` (months), `y` (years); e.g.
+  `day: 3d` takes a daily backup and deletes that frequency's backups older than three days. The
+  CRD rejects any other format. Has no effect without a local backup volume
   configured, same as `backupOnDelete`.
 - Each enabled frequency gets its own native `batch/v1` `CronJob` (`<name>-backup-<frequency>`), on
   a fixed schedule matching its name (hourly on the hour, daily at 00:00 UTC, weekly at 00:00 UTC
   on Sunday, monthly at 00:00 UTC on the 1st, yearly at 00:00 UTC on January 1st) — removed again if
-  that frequency's count is later set back to `0`. Kubernetes' own CronJob controller drives each
+  that frequency's retention is later unset (or set to a zero duration). Kubernetes' own CronJob controller drives each
   one's actual run schedule; Kubebird doesn't track or poll individual runs itself.
   `ConcurrencyPolicy: Forbid` skips a run outright rather than queueing or overlapping it with one
   still in flight, and `BackoffLimit: 0` means a failed run isn't retried either — both cases just
@@ -97,25 +100,27 @@
   itself only operates on a database local to wherever it runs. Per the Services API's own
   conventions, both the source database and the backup file are resolved on the server, so the
   backup lands directly in the backup volume already mounted into the live `firebird` container —
-  the CronJob's Job template itself needs no PVCs mounted, just network access to the instance's
-  `Service` and the SYSDBA credentials from the Secret. The `Service`'s selector (and the
+  the CronJob's Job reaches the server over the network, through the instance's `Service` with the
+  SYSDBA credentials from the Secret, and mounts only the backup PVC, to prune expired backups (see
+  below). Since that PVC is `ReadWriteOnce`, the Job has a required pod affinity to the Firebird
+  pod's own node. The `Service`'s selector (and the
   `StatefulSet`'s own `Selector`/pod template) requires an `app.kubernetes.io/component: firebird`
   label that only the actual Firebird pod carries, so the Job's own pod is never routed to as a
   broken Endpoint despite sharing the rest of the `Instance`'s labels. Unlike `backupOnDelete`'s
   `gbak` backup, this never stops the pod. The security database is deliberately excluded: unlike `spec.databases`,
   it can't be `nbackup`'d while the server has it open, neither locally nor remotely through the
   Services API, so it stays covered only by the `backupOnDelete` backup taken on deletion. Each
-  backup is written as `<frequency>/<database>-<n>.nbk`, where `<n>` counts up from `1` each run
-  (the first run for a frequency is `1`, the second `2`, and so on), restarting at `1` once it would
-  exceed the frequency's configured count instead of the volume growing without bound. Each run
-  computes its own `<n>` from what's already in that frequency's own backup directory — the most
-  recently modified `-<n>.nbk`/`-<n>.nbk.gz` file's own suffix, plus one — rather than anything
-  Kubebird tracks, so no state needs to survive between one CronJob-spawned Job and the next.
+  backup is written as `<frequency>/<database>-<timestamp>.nbk`, where `<timestamp>` is the run's
+  own UTC start time (`YYYYMMDDTHHMMSSZ`), so every run writes a new file and never collides with an
+  earlier one. Once all of a run's backups have succeeded, the same Job deletes every backup in that
+  frequency's directory whose file name timestamp is older than the retention (via GNU `date -d
+  "<n> <unit> ago"`, so months and years follow the calendar); a failed run exits before pruning, so
+  it never deletes older backups.
 - Every enabled frequency's own backup directory is periodically checked (every 5 minutes) for a
   `.nbk` file not yet gzip-compressed, and compressed in place (`exec`'d into the live pod, since
   neither `nbackup` nor `fbsvcmgr` can compress their own output) to
-  `<frequency>/<database>-<n>.nbk.gz` — independently of any specific run's own lifecycle, since
-  Kubebird doesn't otherwise observe a CronJob-spawned Job's completion.
+  `<frequency>/<database>-<timestamp>.nbk.gz` — independently of any specific run's own lifecycle,
+  since Kubebird doesn't otherwise observe a CronJob-spawned Job's completion.
 - New RBAC marker (`get;list;watch;create;update;patch;delete` on `batch`'s `cronjobs`) for the
   scheduled-backup CronJobs above.
 

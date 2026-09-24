@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,16 +67,84 @@ const (
 	backupFrequencyYear  = "year"
 )
 
+// scheduledBackupTimestampDate is the "date -u" format of the UTC
+// timestamp every scheduled backup file name carries
+// ("<database>-<timestamp>.nbk[.gz]"). scheduledBackupScript renders both
+// the run's own timestamp and its retention cutoff with it: being fixed
+// width and most-significant-first, two such timestamps compare
+// correctly as plain strings, so pruning needs no date parsing beyond
+// GNU date's own "<n> <unit> ago".
+const scheduledBackupTimestampDate = "+%Y%m%dT%H%M%SZ"
+
+// scheduledBackupTimestampSedPattern extracts the timestamp from a
+// scheduled backup file name (compressed or not), matching
+// scheduledBackupTimestampDate's output; a file not following that naming
+// yields nothing, so pruning never touches it.
+const scheduledBackupTimestampSedPattern = `s/.*-\([0-9]\{8\}T[0-9]\{6\}Z\)\.nbk\(\.gz\)\{0,1\}$/\1/p`
+
+// firebirdNodeTopologyKey schedules each scheduled backup Job's pod onto
+// the same node as the instance's own Firebird pod (see
+// mutateScheduledBackupCronJob), since the backup PVC it mounts is
+// ReadWriteOnce.
+const firebirdNodeTopologyKey = "kubernetes.io/hostname"
+
 // backupFrequency describes one spec.backup.retention field: how to read
-// its configured count and the standard cron schedule (interpreted in
-// UTC) a CronJob for it runs on. Its rotation sequence number is computed
-// generically by scheduledBackupScript, from what's already in that
-// frequency's own backup directory rather than anything specific to the
-// frequency itself — see there.
+// its configured retention duration and the standard cron schedule
+// (interpreted in UTC) a CronJob for it runs on.
 type backupFrequency struct {
 	name      string
 	schedule  string
-	retention func(kubebirdv1.RetentionSpec) int32
+	retention func(kubebirdv1.RetentionSpec) string
+}
+
+// retentionDuration is a parsed spec.backup.retention value: amount units
+// of h (hours), d (days), w (weeks), m (months) or y (years).
+type retentionDuration struct {
+	amount int
+	unit   byte
+}
+
+// parseRetention parses a spec.backup.retention value of the form
+// "<n><unit>" (see RetentionSpec). An empty value parses to the zero
+// retentionDuration, i.e. disabled. The CRD's own validation pattern
+// already rejects anything else, so an error here only guards against a
+// value that bypassed it.
+func parseRetention(value string) (retentionDuration, error) {
+	if value == "" {
+		return retentionDuration{}, nil
+	}
+	unit := value[len(value)-1]
+	if !strings.ContainsRune("hdwmy", rune(unit)) {
+		return retentionDuration{}, fmt.Errorf("invalid retention %q: unit must be one of h, d, w, m, y", value)
+	}
+	amount, err := strconv.Atoi(value[:len(value)-1])
+	if err != nil || amount < 0 {
+		return retentionDuration{}, fmt.Errorf("invalid retention %q: expected <n><unit>, e.g. 3d", value)
+	}
+	return retentionDuration{amount: amount, unit: unit}, nil
+}
+
+// enabled reports whether the retention turns its frequency on at all.
+func (d retentionDuration) enabled() bool {
+	return d.amount > 0
+}
+
+// dateAgo renders the retention as a GNU "date -d" relative expression,
+// e.g. "3 days ago" — months and years follow the calendar rather than a
+// fixed length, the same way date itself computes them.
+func (d retentionDuration) dateAgo() string {
+	units := map[byte]string{'h': "hours", 'd': "days", 'w': "weeks", 'm': "months", 'y': "years"}
+	return fmt.Sprintf("%d %s ago", d.amount, units[d.unit])
+}
+
+// frequencyRetention returns freq's parsed retention for instance,
+// treating an unparsable value as disabled.
+func frequencyRetention(instance *kubebirdv1.Instance, freq backupFrequency) retentionDuration {
+	d, err := parseRetention(freq.retention(instance.Spec.Backup.Retention))
+	if err != nil {
+		return retentionDuration{}
+	}
+	return d
 }
 
 // backupFrequencies lists every spec.backup.retention field, matching
@@ -89,27 +158,27 @@ var backupFrequencies = []backupFrequency{
 	{
 		name:      backupFrequencyHour,
 		schedule:  "0 * * * *",
-		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Hour },
+		retention: func(r kubebirdv1.RetentionSpec) string { return r.Hour },
 	},
 	{
 		name:      backupFrequencyDay,
 		schedule:  "0 0 * * *",
-		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Day },
+		retention: func(r kubebirdv1.RetentionSpec) string { return r.Day },
 	},
 	{
 		name:      backupFrequencyWeek,
 		schedule:  "0 0 * * 0",
-		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Week },
+		retention: func(r kubebirdv1.RetentionSpec) string { return r.Week },
 	},
 	{
 		name:      backupFrequencyMonth,
 		schedule:  "0 0 1 * *",
-		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Month },
+		retention: func(r kubebirdv1.RetentionSpec) string { return r.Month },
 	},
 	{
 		name:      backupFrequencyYear,
 		schedule:  "0 0 1 1 *",
-		retention: func(r kubebirdv1.RetentionSpec) int32 { return r.Year },
+		retention: func(r kubebirdv1.RetentionSpec) string { return r.Year },
 	},
 }
 
@@ -123,12 +192,12 @@ func firebirdPodName(instance *kubebirdv1.Instance) string {
 }
 
 // anyRetentionEnabled reports whether at least one spec.backup.retention
-// field is non-zero, regardless of whether a backup volume actually
+// field is enabled, regardless of whether a backup volume actually
 // exists to make that effective — used only to decide whether
 // compressScheduledBackups is worth polling for at all.
 func anyRetentionEnabled(instance *kubebirdv1.Instance) bool {
 	for _, freq := range backupFrequencies {
-		if freq.retention(instance.Spec.Backup.Retention) > 0 {
+		if frequencyRetention(instance, freq).enabled() {
 			return true
 		}
 	}
@@ -143,8 +212,8 @@ func scheduledBackupCronJobName(instance *kubebirdv1.Instance, frequency string)
 }
 
 // reconcileScheduledBackups ensures a CronJob exists for every
-// spec.backup.retention frequency with a non-zero count, and that none
-// exists for a frequency left at 0 (or when no local backup volume is
+// spec.backup.retention frequency with a non-zero duration, and that none
+// exists for a frequency left disabled (or when no local backup volume is
 // configured at all — retention has no effect without one, matching
 // backupOnDelete) — reconciling both directions so turning a frequency
 // back off removes its stale schedule instead of leaving it to keep
@@ -157,10 +226,9 @@ func (r *InstanceReconciler) reconcileScheduledBackups(ctx context.Context, inst
 	hasVolume := backupVolumeSpec(instance) != nil
 
 	for _, freq := range backupFrequencies {
-		retention := freq.retention(instance.Spec.Backup.Retention)
 		name := scheduledBackupCronJobName(instance, freq.name)
 
-		if !hasVolume || retention <= 0 {
+		if !hasVolume || !frequencyRetention(instance, freq).enabled() {
 			cronJob := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace}}
 			if err := r.Delete(ctx, cronJob); err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("failed to delete backup CronJob %q: %w", name, err)
@@ -168,7 +236,7 @@ func (r *InstanceReconciler) reconcileScheduledBackups(ctx context.Context, inst
 			continue
 		}
 
-		if err := r.reconcileScheduledBackupCronJob(ctx, instance, freq, retention); err != nil {
+		if err := r.reconcileScheduledBackupCronJob(ctx, instance, freq); err != nil {
 			return fmt.Errorf("failed to reconcile %s backup CronJob: %w", freq.name, err)
 		}
 	}
@@ -183,7 +251,7 @@ func (r *InstanceReconciler) reconcileScheduledBackups(ctx context.Context, inst
 // (see scheduledBackupScript) — since retention can be turned on for an
 // already-Ready Instance at any time, long after security-database-init
 // last ran, so nothing else guarantees it's there yet.
-func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context, instance *kubebirdv1.Instance, freq backupFrequency, retention int32) error {
+func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context, instance *kubebirdv1.Instance, freq backupFrequency) error {
 	name := scheduledBackupCronJobName(instance, freq.name)
 	nsName := types.NamespacedName{Name: name, Namespace: instance.Namespace}
 
@@ -204,7 +272,7 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 
 	cronJob := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, cronJob, func() error {
-		return r.mutateScheduledBackupCronJob(cronJob, instance, freq, retention)
+		return r.mutateScheduledBackupCronJob(cronJob, instance, freq)
 	}); err != nil {
 		return fmt.Errorf("failed to reconcile backup CronJob %q: %w", name, err)
 	}
@@ -218,14 +286,13 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 // backup CronJob. ConcurrencyPolicy Forbid skips a run entirely rather
 // than queueing or overlapping it with one still in flight — a skipped
 // run just means that period's backup waits for the next one, since
-// scheduledBackupScript computes each run's rotation slot from what's
-// already in the backup directory rather than from the previous run's
-// own state. BackoffLimit 0 means a
+// each run names its files after its own start time rather than
+// depending on the previous run's state. BackoffLimit 0 means a
 // failed run isn't retried by the Job controller either, for the same
 // reason: a failure this period should just wait for the next scheduled
 // tick rather than the Job controller immediately re-running (and, with
 // the default backoff limit of 6, re-failing) the same script.
-func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJob, instance *kubebirdv1.Instance, freq backupFrequency, retention int32) error {
+func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJob, instance *kubebirdv1.Instance, freq backupFrequency) error {
 	successfulHistory := int32(1)
 	failedHistory := int32(3)
 	backoffLimit := int32(0)
@@ -244,6 +311,24 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 					ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
 					Spec: corev1.PodSpec{
 						RestartPolicy: corev1.RestartPolicyNever,
+						Affinity: &corev1.Affinity{
+							PodAffinity: &corev1.PodAffinity{
+								RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+									{
+										LabelSelector: &metav1.LabelSelector{MatchLabels: firebirdPodSelector(instance.Name)},
+										TopologyKey:   firebirdNodeTopologyKey,
+									},
+								},
+							},
+						},
+						Volumes: []corev1.Volume{
+							{
+								Name: backupVolumeName,
+								VolumeSource: corev1.VolumeSource{
+									PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)},
+								},
+							},
+						},
 						Containers: []corev1.Container{
 							{
 								Name:  containerName,
@@ -252,7 +337,8 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 									AllowPrivilegeEscalation: ptr.To(false),
 									SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 								},
-								Command: []string{"sh", "-c", scheduledBackupScript(instance, freq, retention)},
+								Command:      []string{"sh", "-c", scheduledBackupScript(instance, freq)},
+								VolumeMounts: []corev1.VolumeMount{{Name: backupVolumeName, MountPath: backupDataMountPath}},
 								Env: []corev1.EnvVar{
 									{
 										Name: "SYSDBA_PASSWORD",
@@ -299,37 +385,6 @@ func scheduledBackupDir(frequency string) string {
 	return path.Join(backupDataMountPath, frequency)
 }
 
-// sequenceRotationScript renders the two shell lines that compute a
-// scheduled backup run's rotation sequence number into $SEQ, purely from
-// what's already in dir — factored out of scheduledBackupScript so it
-// can be exercised directly against a real temporary directory in
-// tests, without dir needing to be the actual (unwritable-in-tests)
-// backup mount path. See scheduledBackupScript's own doc for the full
-// explanation of the rotation itself.
-//
-// Deliberately keys off the most recently *modified* "-<n>.nbk"/
-// "-<n>.nbk.gz" file ("ls -1t ... | head -1"), not the highest "<n>"
-// present: once every slot 1..retention has been used at least once,
-// the highest "<n>" that ever exists is permanently retention itself
-// (slots are overwritten in place, never renamed or removed), which
-// would otherwise wedge every future run's LAST at retention and so
-// SEQ at a constant 1 forever instead of continuing to rotate.
-//
-// The trailing "|| true" on the LAST= pipeline matters under
-// scheduledBackupScript's own "set -e": the final grep (extracting the
-// digits) exits 1 when nothing matched - the very first run, with
-// nothing in dir yet - and since a "VAR=$(...)" assignment's own exit
-// status is that of the command substitution, "set -e" would otherwise
-// abort the whole script right here, before it ever reaches fbsvcmgr,
-// with no output at all (confirmed against a real cluster: the Job's
-// pod exits 1 in under a second with an empty log).
-func sequenceRotationScript(dir string, retention int32) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "LAST=$(ls -1t %q 2>/dev/null | grep -oE -- '-[0-9]+\\.nbk(\\.gz)?$' | head -1 | grep -oE '[0-9]+' || true)\n", dir)
-	fmt.Fprintf(&b, "SEQ=$(( (${LAST:-0} %% %d) + 1 ))\n", retention)
-	return b.String()
-}
-
 // scheduledBackupScript renders the shell script each of a frequency's
 // CronJob-spawned Jobs runs: a full (level 0) backup of every database in
 // instance.Status.Databases via fbsvcmgr's -action_nbak against the
@@ -338,12 +393,17 @@ func sequenceRotationScript(dir string, retention int32) string {
 // documentation's remote examples), both -dbname and -nbk_file are
 // resolved by the server itself, not by the Job — so each backup lands
 // directly in the backup volume as already mounted into the live firebird
-// container, without the Job needing to mount the primary/backup PVCs
-// itself, or the pod ever stopping (unlike backupDatabasesOffline's
+// container, without the pod ever stopping (unlike backupDatabasesOffline's
 // gbak-based delete-time backup, which can't run while a live server has
-// the database open at all). The Job's own container therefore needs
-// nothing but network access to the instance's Service and the SYSDBA
-// credentials.
+// the database open at all). Every file name is made unique by the run's
+// own UTC start time ($TS), so -action_nbak never finds an
+// already-existing file ("Error creating backup file: ... File exists").
+//
+// Once every backup has succeeded, the script prunes the frequency's own
+// backup directory (see pruneScheduledBackupsScript) through the Job's
+// own mount of the backup PVC. Since it runs under set -e, a failed
+// backup exits before pruning, so a run that couldn't take a new backup
+// never deletes the older ones either.
 //
 // Deliberately excludes the security database: unlike spec.databases,
 // confirmed against the actual image that it can't be nbackup'd while the
@@ -356,44 +416,47 @@ func sequenceRotationScript(dir string, retention int32) string {
 // security database therefore stays covered only by that delete-time
 // backup; a set -e failure on every single scheduled run (as attempting it
 // here would cause) would be worse than not attempting it at all.
-//
-// The rotation sequence number, into the shell variable SEQ, is computed
-// once per run purely from what's already in the frequency's own backup
-// directory, not anything Kubebird tracks itself (see
-// sequenceRotationScript): it lists scheduledBackupDir(freq.name) by
-// modification time and takes the numeric suffix of whichever
-// "<database>-<n>.nbk"/"<database>-<n>.nbk.gz" file was written most
-// recently (any database's, since a single run always shares one SEQ
-// across every database - see the loop below) as LAST (0 if none exist
-// yet, i.e. the very first run). SEQ is then LAST+1, wrapped back into
-// 1..retention via "(LAST % retention) + 1" — so the very first run is
-// 1, the second is 2, and so on, restarting at 1 once retention
-// consecutive runs have happened, regardless of wall-clock time or
-// whether every scheduled tick actually ran.
-func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, retention int32) string {
+func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency) string {
 	conn := backupServiceConnection(instance)
 	dir := scheduledBackupDir(freq.name)
+	retention := frequencyRetention(instance, freq)
 
 	var b strings.Builder
 	b.WriteString("set -e\n")
-	b.WriteString(sequenceRotationScript(dir, retention))
+	fmt.Fprintf(&b, "TS=$(date -u %s)\n", scheduledBackupTimestampDate)
 
 	for _, name := range instance.Status.Databases {
 		serverDBPath := path.Join(primaryDataMountPath, name)
-		dst := fmt.Sprintf("%s/%s-$SEQ.nbk", dir, strings.TrimSuffix(name, ".fdb"))
-		// -action_nbak -nbk_level 0 refuses to write into an
-		// already-existing file ("Error creating backup file: ... File
-		// exists"), so reusing a rotation slot - this same period's own
-		// retry, or a manually triggered "kubectl create job
-		// --from=cronjob" landing in the same slot as an earlier
-		// successful run - must clear the old file first to actually
-		// overwrite it, matching this rotation's own "just overwrites
-		// that file" design.
-		fmt.Fprintf(&b, "rm -f %q\n", dst)
+		dst := fmt.Sprintf("%s/%s-$TS.nbk", dir, strings.TrimSuffix(name, ".fdb"))
 		fmt.Fprintf(&b, "%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_nbak -nbk_level 0 -dbname %q -nbk_file %q\n",
 			binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, serverDBPath, dst)
 	}
 
+	b.WriteString(pruneScheduledBackupsScript(dir, retention))
+	return b.String()
+}
+
+// pruneScheduledBackupsScript renders the shell snippet that deletes every
+// scheduled backup in dir whose file name timestamp is older than
+// retention, counting back from the time it runs — factored out of
+// scheduledBackupScript so it can be exercised directly against a real
+// temporary directory in tests. The cutoff comes from GNU date's own
+// "<n> <unit> ago" (see retentionDuration.dateAgo), rendered in the same
+// scheduledBackupTimestampDate format as the file names, so "expr" can
+// compare the two as plain strings. Files not following the
+// "<database>-<timestamp>.nbk[.gz]" naming are never deleted.
+func pruneScheduledBackupsScript(dir string, retention retentionDuration) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CUTOFF=$(date -u -d %q %s)\n", retention.dateAgo(), scheduledBackupTimestampDate)
+	fmt.Fprintf(&b, "for f in %q/*.nbk %q/*.nbk.gz; do\n", dir, dir)
+	b.WriteString("  [ -e \"$f\" ] || continue\n")
+	fmt.Fprintf(&b, "  FTS=$(basename \"$f\" | sed -n '%s')\n", scheduledBackupTimestampSedPattern)
+	b.WriteString("  [ -n \"$FTS\" ] || continue\n")
+	b.WriteString("  if expr \"$FTS\" \\< \"$CUTOFF\" >/dev/null; then\n")
+	b.WriteString("    rm -f \"$f\"\n")
+	b.WriteString("    echo \"Deleted expired backup $f\"\n")
+	b.WriteString("  fi\n")
+	b.WriteString("done\n")
 	return b.String()
 }
 
@@ -402,19 +465,17 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency, 
 // (scheduledBackupDir) — fbsvcmgr has no compression option of its own
 // (see scheduledBackupScript), and the file lands inside the live pod's
 // own filesystem, so this execs gzip there directly, the same mechanism
-// reconcileDatabases already uses for isql, rather than from the
-// (otherwise network-only, unmounted) backup CronJob's own Job. Matching
-// by suffix, rather than a specific expected file name, means it doesn't
-// need to know which rotation sequence a given run used — that's
-// computed independently by the script itself, from what's already in
-// the directory (see scheduledBackupScript) — and it's naturally
-// idempotent: an already-compressed file is simply not matched again by
-// "*.nbk".
+// reconcileDatabases already uses for isql. Matching by suffix, rather
+// than a specific expected file name, means it doesn't need to know
+// which timestamp a given run used, and it's naturally idempotent: an
+// already-compressed file is simply not matched again by "*.nbk".
+// Pruning expired backups isn't done here but by the CronJob's own Job,
+// right after it takes a new one (see pruneScheduledBackupsScript).
 func (r *InstanceReconciler) compressScheduledBackups(ctx context.Context, instance *kubebirdv1.Instance) error {
 	podName := firebirdPodName(instance)
 
 	for _, freq := range backupFrequencies {
-		if freq.retention(instance.Spec.Backup.Retention) <= 0 {
+		if !frequencyRetention(instance, freq).enabled() {
 			continue
 		}
 
