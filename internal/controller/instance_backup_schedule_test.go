@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -293,9 +294,50 @@ func TestScheduledBackupScript(t *testing.T) {
 		t.Errorf("scheduledBackupScript must prune only after every backup succeeded; got:\n%s", script)
 	}
 	if strings.Contains(script, "gzip") {
-		t.Errorf("scheduledBackupScript should not compress its own output; got:\n%s", script)
+		t.Errorf("scheduledBackupScript should not compress its output when spec.backup.compress is false; got:\n%s", script)
 	}
 	if strings.Contains(script, "security3.fdb") {
 		t.Errorf("scheduledBackupScript should not attempt to back up the security database, since it can't be nbackup'd while the server has it open; got:\n%s", script)
+	}
+}
+
+func TestScheduledBackupScriptCompress(t *testing.T) {
+	instance := &kubebirdv1.Instance{
+		ObjectMeta: metav1.ObjectMeta{Name: testScheduleInstanceName},
+		Spec: kubebirdv1.InstanceSpec{
+			Image:   "firebirdsql/firebird",
+			Version: "3.0.14",
+			Backup: kubebirdv1.BackupSpec{
+				Compress:  true,
+				Retention: kubebirdv1.RetentionSpec{Hour: "3h"},
+			},
+		},
+		Status: kubebirdv1.InstanceStatus{
+			Databases: []string{"instance.fdb", "other.fdb"},
+		},
+	}
+
+	var hour backupFrequency
+	for _, freq := range backupFrequencies {
+		if freq.name == backupFrequencyHour {
+			hour = freq
+		}
+	}
+
+	script := scheduledBackupScript(instance, hour)
+
+	for _, db := range []string{"instance", "other"} {
+		dst := fmt.Sprintf("/var/lib/firebird/backup/hour/%s-$TS.nbk", db)
+		backup := strings.Index(script, fmt.Sprintf("-nbk_file %q", dst))
+		compress := strings.Index(script, fmt.Sprintf("gzip -f %q", dst))
+		if backup < 0 || compress < 0 {
+			t.Fatalf("scheduledBackupScript output missing backup or gzip of %q; got:\n%s", dst, script)
+		}
+		if compress < backup {
+			t.Errorf("scheduledBackupScript must gzip %q only after fbsvcmgr wrote it; got:\n%s", dst, script)
+		}
+	}
+	if strings.Index(script, "CUTOFF=") < strings.LastIndex(script, "gzip") {
+		t.Errorf("scheduledBackupScript must prune only after every backup was compressed; got:\n%s", script)
 	}
 }

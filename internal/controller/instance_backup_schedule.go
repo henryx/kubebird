@@ -22,7 +22,6 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -47,15 +46,6 @@ import (
 // -action_nbak can. See scheduledBackupScript and
 // https://www.firebirdsql.org/file/documentation/html/en/firebirddocs/nbackup/firebird-nbackup.html
 const binFbsvcmgr = "fbsvcmgr"
-
-// scheduledBackupCompressionPollInterval is how often reconcileInstance
-// checks every enabled spec.backup.retention frequency's own backup
-// subdirectory for a ".nbk" file fbsvcmgr has finished writing but
-// nothing has gzip-compressed yet. Nothing else would otherwise trigger
-// this promptly: the backup itself now runs on a Kubernetes-managed
-// CronJob schedule, entirely independent of Kubebird's own Reconcile
-// loop — see reconcileScheduledBackups and compressScheduledBackups.
-const scheduledBackupCompressionPollInterval = 5 * time.Minute
 
 // Names of every spec.backup.retention field, matching backupFrequency's
 // own "name" values and the RetentionSpec field they read from.
@@ -184,24 +174,11 @@ var backupFrequencies = []backupFrequency{
 
 // firebirdPodName returns the name of the single Pod the instance's
 // StatefulSet manages, e.g. "test-0" — the target of this file's own
-// exec calls (preparing a frequency's backup directory, compressing its
-// output), the same convention reconcileDatabases uses to exec isql into
+// exec call (preparing a frequency's backup directory), the same
+// convention reconcileDatabases uses to exec isql into
 // it.
 func firebirdPodName(instance *kubebirdv1.Instance) string {
 	return instance.Name + "-0"
-}
-
-// anyRetentionEnabled reports whether at least one spec.backup.retention
-// field is enabled, regardless of whether a backup volume actually
-// exists to make that effective — used only to decide whether
-// compressScheduledBackups is worth polling for at all.
-func anyRetentionEnabled(instance *kubebirdv1.Instance) bool {
-	for _, freq := range backupFrequencies {
-		if frequencyRetention(instance, freq).enabled() {
-			return true
-		}
-	}
-	return false
 }
 
 // scheduledBackupCronJobName returns the name of the CronJob that runs a
@@ -399,6 +376,11 @@ func scheduledBackupDir(frequency string) string {
 // own UTC start time ($TS), so -action_nbak never finds an
 // already-existing file ("Error creating backup file: ... File exists").
 //
+// When spec.backup.compress is true, each backup is gzip-compressed to
+// ".nbk.gz" right after fbsvcmgr writes it (fbsvcmgr has no compression
+// option of its own), through the Job's own mount of the backup PVC —
+// gzip being the only compressor the firebirdsql/firebird image ships.
+//
 // Once every backup has succeeded, the script prunes the frequency's own
 // backup directory (see pruneScheduledBackupsScript) through the Job's
 // own mount of the backup PVC. Since it runs under set -e, a failed
@@ -430,6 +412,9 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency) 
 		dst := fmt.Sprintf("%s/%s-$TS.nbk", dir, strings.TrimSuffix(name, ".fdb"))
 		fmt.Fprintf(&b, "%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_nbak -nbk_level 0 -dbname %q -nbk_file %q\n",
 			binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, serverDBPath, dst)
+		if instance.Spec.Backup.Compress {
+			fmt.Fprintf(&b, "gzip -f %q\n", dst)
+		}
 	}
 
 	b.WriteString(pruneScheduledBackupsScript(dir, retention))
@@ -458,48 +443,4 @@ func pruneScheduledBackupsScript(dir string, retention retentionDuration) string
 	b.WriteString("  fi\n")
 	b.WriteString("done\n")
 	return b.String()
-}
-
-// compressScheduledBackups gzips every ".nbk" file found directly under
-// each enabled spec.backup.retention frequency's own backup subdirectory
-// (scheduledBackupDir) — fbsvcmgr has no compression option of its own
-// (see scheduledBackupScript), and the file lands inside the live pod's
-// own filesystem, so this execs gzip there directly, the same mechanism
-// reconcileDatabases already uses for isql. Matching by suffix, rather
-// than a specific expected file name, means it doesn't need to know
-// which timestamp a given run used, and it's naturally idempotent: an
-// already-compressed file is simply not matched again by "*.nbk".
-// Pruning expired backups isn't done here but by the CronJob's own Job,
-// right after it takes a new one (see pruneScheduledBackupsScript).
-func (r *InstanceReconciler) compressScheduledBackups(ctx context.Context, instance *kubebirdv1.Instance) error {
-	podName := firebirdPodName(instance)
-
-	for _, freq := range backupFrequencies {
-		if !frequencyRetention(instance, freq).enabled() {
-			continue
-		}
-
-		dir := scheduledBackupDir(freq.name)
-		// Redirects stderr to /dev/null and always exits 0: the
-		// directory might not exist yet (e.g. a CronJob was just
-		// created and hasn't had its first run yet), in which case
-		// there's simply nothing to compress.
-		output, err := r.execInPodOutput(ctx, instance.Namespace, podName,
-			[]string{"sh", "-c", fmt.Sprintf("ls -1 %s 2>/dev/null || true", dir)})
-		if err != nil {
-			return fmt.Errorf("failed to list backup directory %q: %w", dir, err)
-		}
-
-		for name := range strings.FieldsSeq(output) {
-			if !strings.HasSuffix(name, ".nbk") {
-				continue
-			}
-			file := path.Join(dir, name)
-			if err := r.execInPod(ctx, instance.Namespace, podName, []string{"gzip", "-f", file}, ""); err != nil {
-				return fmt.Errorf("failed to compress backup %q: %w", file, err)
-			}
-			logf.FromContext(ctx).Info("Compressed scheduled backup", "frequency", freq.name, "file", file)
-		}
-	}
-	return nil
 }

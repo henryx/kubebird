@@ -47,8 +47,8 @@ const (
 // Instance is ready, a manually-triggered run of that CronJob backs up the
 // database (but deliberately not the security database — see
 // scheduledBackupScript in internal/controller/instance_backup_schedule.go
-// for why) via fbsvcmgr's remote nbackup action, a forced reconcile gzips
-// the resulting .nbk files, a second run lands alongside the first (each
+// for why) via fbsvcmgr's remote nbackup action and gzips the result
+// (spec.backup.compress), a second run lands alongside the first (each
 // file is named after its run's own UTC timestamp) while a backup older
 // than the retention window is pruned, and unsetting
 // spec.backup.retention.hour removes the CronJob again.
@@ -57,9 +57,7 @@ const (
 // * *" for hourly, the fastest of the five), far too slow for an e2e run —
 // so rather than waiting on it, this creates a Job "--from=cronjob" to run
 // it immediately, the same way an operator would force an out-of-band
-// backup, and forces a fresh reconcile (a harmless annotation) to make the
-// controller notice and compress the result immediately instead of waiting
-// on its own 5-minute compression poll (scheduledBackupCompressionPollInterval).
+// backup.
 //
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, after the CRDs are installed and the controller-manager is
@@ -86,6 +84,7 @@ spec:
       size: 1Gi
   backup:
     enabled: true
+    compress: true
     destinations:
       - local:
           storage:
@@ -169,16 +168,11 @@ spec:
 				g.Expect(output).To(Equal("1"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
-			// compressScheduledBackups runs opportunistically on every
-			// reconcile, not just on its own 5-minute poll, so the file
-			// may already have been gzip-compressed by the time this
-			// checks — accept either form rather than racing the
-			// controller to observe it mid-flight.
-			By("writing one backup file for the database via fbsvcmgr's remote nbackup")
+			By("writing one gzip-compressed backup file for the database via fbsvcmgr's remote nbackup")
 			files := listBackupFiles()
 			Expect(files).To(HaveLen(1), "expected exactly one backup file, for scheduled.fdb")
 			Expect(files[0]).To(HavePrefix("scheduled-"))
-			Expect(files[0]).To(Or(HaveSuffix(".nbk"), HaveSuffix(".nbk.gz")))
+			Expect(files[0]).To(HaveSuffix(".nbk.gz"), "expected the Job itself to gzip the backup, since spec.backup.compress is true")
 
 			By("never attempting the security database, since it can't be nbackup'd while the server has it open")
 			for _, f := range files {
@@ -191,23 +185,6 @@ spec:
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(BeEmpty())
-		})
-
-		It("should gzip the backup file left behind by the manual run", func() {
-			By("forcing a fresh reconcile with a harmless annotation, rather than relying only on the 5-minute compression poll")
-			cmd := exec.Command("kubectl", "annotate", "instance", scheduledBackupInstanceName, "-n", namespace,
-				fmt.Sprintf("kubebird.github.io/e2e-trigger=%d", time.Now().UnixNano()), "--overwrite")
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("compressing the backup file left behind by the manual run into .nbk.gz")
-			Eventually(func(g Gomega) {
-				files := listBackupFiles()
-				g.Expect(files).To(HaveLen(1))
-				for _, f := range files {
-					g.Expect(f).To(HaveSuffix(".nbk.gz"), "expected the backup file to be gzip-compressed")
-				}
-			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
 
 		It("should keep a second run alongside the first and prune backups older than the retention window", func() {
@@ -238,12 +215,6 @@ spec:
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(Equal("1"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
-
-			By("forcing a fresh reconcile so compressScheduledBackups compresses the new backup immediately")
-			cmd = exec.Command("kubectl", "annotate", "instance", scheduledBackupInstanceName, "-n", namespace,
-				fmt.Sprintf("kubebird.github.io/e2e-trigger=%d", time.Now().UnixNano()), "--overwrite")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
 
 			By("keeping both recent backups, compressed, while the Job itself deleted the expired one")
 			Eventually(func(g Gomega) {

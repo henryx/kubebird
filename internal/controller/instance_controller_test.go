@@ -905,7 +905,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(command).NotTo(ContainElement(ContainSubstring("security3-$TS.nbk")),
 				"the security database can't be nbackup'd while the server has it open, neither locally nor remotely, so it's deliberately excluded")
 			Expect(command).NotTo(ContainElement(ContainSubstring("gzip")),
-				"compression runs separately, exec'd into the live pod once a run's backup file appears")
+				"the Job only gzips its backups when spec.backup.compress is true")
 
 			Expect(command).To(ContainElement(ContainSubstring(`CUTOFF=$(date -u -d "2 hours ago"`)),
 				"the Job prunes backups older than spec.backup.retention.hour itself, right after taking a new one")

@@ -36,7 +36,7 @@
   which triggers a full, `nbackup`-style backup of every database in `spec.databases` — via the
   Services API, since `nbackup` itself only backs up a database local to wherever it runs — against the
   instance's own live server, so, unlike the `gbak`-based `backupOnDelete` backup, it never needs to
-  stop the pod; the result is then gzip-compressed. The security database is deliberately excluded from
+  stop the pod; the result is then gzip-compressed when `spec.backup.compress` is `true`. The security database is deliberately excluded from
   these scheduled backups, since Firebird refuses to back it up remotely while the server has it open;
   it stays covered by the `backupOnDelete` backup instead.
 - Surfaces `VERSION`, `STATUS`, `DATABASES`, and `MESSAGE` printer columns on `kubectl get instances`
@@ -158,6 +158,7 @@ spec:
     enabled: true # enable or disable backup
     image: firebirdsql/firebird:3.0.14 # uses a specific image (default is the same image used for instance)
     backupOnDelete: true # if enabled, execute a last backup using gbak in configured destinations when CR is deleted. default is true 
+    compress: false # compress backup using gzip command. default is false
     destinations:
       - local: # use a dedicated PVC
           storage:
@@ -175,7 +176,7 @@ With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in. The `firebird` container sets `allowPrivilegeEscalation: false` and a `RuntimeDefault` seccomp profile, satisfying the `baseline` Pod Security Standard; it does **not** run as non-root or drop capabilities, since the `firebirdsql/firebird` image's entrypoint needs root's full DAC override (e.g. to manage files owned by its own `firebird` user) whenever `FIREBIRD_ROOT_PASSWORD` is set, which Kubebird always does — so `Instance` pods can't satisfy the stricter `restricted` standard, and the namespace they run in must enforce `baseline` or looser.
 - Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`), named `<instance-name>-primary`, with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else. This PVC isn't owned by the `Instance` (so it isn't garbage-collected alongside it), but Kubebird always deletes it itself when the `Instance` is deleted — see "Deleting an Instance" below.
-- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (the only backup destination currently implemented). `backup.backupOnDelete` (defaults to `true`) controls whether deleting the `Instance` runs one last backup into it first; setting it to `false` skips that final backup, but never affects whether the PVC itself is created or retained. See "Backup and restore" below for what Kubebird does with it.
+- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (the only backup destination currently implemented). `backup.backupOnDelete` (defaults to `true`) controls whether deleting the `Instance` runs one last backup into it first; setting it to `false` skips that final backup, but never affects whether the PVC itself is created or retained. `backup.compress` (defaults to `false`) gzips every scheduled `backup.retention` backup right after it's taken; the delete-time `gbak` backups are never compressed. See "Backup and restore" below for what Kubebird does with it.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
 - Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart. A `security-database-init` init container seeds it there — on every fresh primary PVC, since Kubebird always deletes the previous one on `Instance` deletion — before the `firebird` container starts, either restoring it from a backup or seeding the image's own default (see "Backup and restore" below); the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
@@ -347,8 +348,9 @@ attempt) for that troubleshooting.
 
 Each run takes a full (level 0) backup of every database in `status.databases`, writing
 `<frequency>/<database>-<timestamp>.nbk` into the backup volume (e.g.
-`hour/instance-20260924T100000Z.nbk`), where `<timestamp>` is the run's own UTC start time, then
-gzip-compresses each one to `<frequency>/<database>-<timestamp>.nbk.gz`. Once every backup of the run
+`hour/instance-20260924T100000Z.nbk`), where `<timestamp>` is the run's own UTC start time; when
+`backup.compress` is `true`, each one is then gzip-compressed to `<frequency>/<database>-<timestamp>.nbk.gz`
+(gzip being the only compressor the `firebirdsql/firebird` image ships), otherwise it's left uncompressed. Once every backup of the run
 has succeeded, the same Job deletes every backup in that frequency's directory whose timestamp is
 older than its retention (months and years follow the calendar rather than a fixed number of days).
 Files in that directory not following this naming are never touched. Since pruning only happens after
@@ -374,10 +376,8 @@ backup through the [Services API](https://www.firebirdsql.org/file/documentation
 (through its `Service`, using the SYSDBA credentials from the Secret) rather than mounting the
 primary/shadow PVCs itself; per that same Services API, the server performs the backup and writes it
 directly into its own already-mounted backup volume. The Job mounts only the backup PVC, and only to
-prune expired backups. Since neither `nbackup` nor `fbsvcmgr` can compress their own output, Kubebird periodically
-checks each enabled frequency's own directory for a backup file not yet compressed and gzips it in
-place with a follow-up command run directly against the instance's pod, independently of any specific
-Job's own lifecycle.
+prune expired backups and, since neither `nbackup` nor `fbsvcmgr` can compress their own output, to
+gzip each new backup file right after it's written when `backup.compress` is `true`.
 
 ## License
 

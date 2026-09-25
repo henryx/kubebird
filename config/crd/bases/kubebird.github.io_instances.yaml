@@ -82,6 +82,15 @@ spec:
                       its own zero value and get overwritten back to the default by CRD
                       defaulting on every submission).
                     type: boolean
+                  compress:
+                    default: false
+                    description: |-
+                      compress gzip-compresses every scheduled backup (see retention) once
+                      it's been taken, turning "<database>-<timestamp>.nbk" into
+                      "<database>-<timestamp>.nbk.gz". gzip is used because it's the only
+                      compressor the firebirdsql/firebird image ships. Defaults to false,
+                      leaving backups uncompressed.
+                    type: boolean
                   destinations:
                     description: |-
                       destinations lists the backup destinations to configure. Only a

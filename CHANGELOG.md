@@ -116,11 +116,11 @@
   frequency's directory whose file name timestamp is older than the retention (via GNU `date -d
   "<n> <unit> ago"`, so months and years follow the calendar); a failed run exits before pruning, so
   it never deletes older backups.
-- Every enabled frequency's own backup directory is periodically checked (every 5 minutes) for a
-  `.nbk` file not yet gzip-compressed, and compressed in place (`exec`'d into the live pod, since
-  neither `nbackup` nor `fbsvcmgr` can compress their own output) to
-  `<frequency>/<database>-<timestamp>.nbk.gz` — independently of any specific run's own lifecycle,
-  since Kubebird doesn't otherwise observe a CronJob-spawned Job's completion.
+- `spec.backup.compress` (defaults to `false`): when `true`, each scheduled backup's own Job
+  gzips every backup it takes right after `fbsvcmgr` writes it (neither `nbackup` nor `fbsvcmgr`
+  can compress their own output), to `<frequency>/<database>-<timestamp>.nbk.gz`, before pruning.
+  gzip is the only compressor the `firebirdsql/firebird` image ships. When `false`, scheduled
+  backups stay as plain `.nbk` files; the delete-time `gbak` backups are never compressed either way.
 - New RBAC marker (`get;list;watch;create;update;patch;delete` on `batch`'s `cronjobs`) for the
   scheduled-backup CronJobs above.
 

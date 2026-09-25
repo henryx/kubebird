@@ -161,6 +161,15 @@ type BackupSpec struct {
 	// +optional
 	BackupOnDelete *bool `json:"backupOnDelete,omitempty"`
 
+	// compress gzip-compresses every scheduled backup (see retention) once
+	// it's been taken, turning "<database>-<timestamp>.nbk" into
+	// "<database>-<timestamp>.nbk.gz". gzip is used because it's the only
+	// compressor the firebirdsql/firebird image ships. Defaults to false,
+	// leaving backups uncompressed.
+	// +kubebuilder:default=false
+	// +optional
+	Compress bool `json:"compress,omitempty"`
+
 	// retention configures recurring scheduled backups, one frequency at
 	// a time; see RetentionSpec. Only takes effect when a local backup
 	// volume exists (see destinations); has no effect otherwise,
@@ -176,8 +185,9 @@ type BackupSpec struct {
 // where unit is h (hours), d (days), w (weeks), m (months) or y (years):
 // e.g. day: "3d" takes a backup at 00:00 UTC every day and deletes any of
 // that frequency's backups older than three days. Every due run takes a
-// full, gzip compressed nbackup of each database into
-// "<frequency>/<database>-<timestamp>.nbk.gz" on the backup volume, where
+// full nbackup of each database into
+// "<frequency>/<database>-<timestamp>.nbk" on the backup volume (gzip
+// compressed to ".nbk.gz" afterwards when compress is true), where
 // <timestamp> is the run's own UTC start time (YYYYMMDDTHHMMSSZ). Unlike
 // backupOnDelete's gbak backup, which needs the instance stopped first,
 // these run against the instance's own live server via nbackup's guarded
