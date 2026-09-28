@@ -348,7 +348,8 @@ attempt) for that troubleshooting.
 
 Each run takes a full (level 0) backup of every database in `status.databases`, writing
 `<frequency>/<database>-<timestamp>.nbk` into the backup volume (e.g.
-`hour/instance-20260924T100000Z.nbk`), where `<timestamp>` is the run's own UTC start time; when
+`hour/instance-20260924T100000Z.nbk`), where `<timestamp>` is the UTC time the run actually started
+backing up (see "Overlapping runs" below for why that can be later than the Job's own start); when
 `backup.compress` is `true`, each one is then gzip-compressed to `<frequency>/<database>-<timestamp>.nbk.gz`
 (gzip being the only compressor the `firebirdsql/firebird` image ships), otherwise it's left uncompressed. Once every backup of the run
 has succeeded, the same Job deletes every backup in that frequency's directory whose timestamp is
@@ -359,6 +360,27 @@ retention comfortably longer than the frequency itself (e.g. `hour: 3h` rather t
 single missed run doesn't leave a gap. To reach the backup directory, the Job mounts the backup PVC
 and, since that PVC is `ReadWriteOnce`, is scheduled onto the same node as the Firebird pod (a
 required pod affinity).
+
+**Overlapping runs.** Different frequencies regularly come due at the same moment — the hourly and
+daily backups both at 00:00 UTC every day, all five on January 1st — and a Job created by hand from a
+CronJob (`kubectl create job --from=cronjob/<name>-backup-<frequency> <job-name>`, e.g. to force an
+out-of-band backup) can start while that CronJob's own scheduled run is still going. Firebird can't
+take two such backups of the same database at once: the second one fails ("Database is already in the
+physical backup mode"), or both hang. So every scheduled backup Job first takes an exclusive lock on a
+file at the root of the backup volume (`.scheduled-backup.lock`), shared by all frequencies, and waits
+for it rather than failing, so overlapping runs simply take turns. Kubernetes' own `Forbid` concurrency
+policy isn't enough for this, since it only keeps one CronJob from overlapping with *itself*. A run of
+the same frequency that follows another within the same second also waits for the next second, so
+it never reuses the previous run's file name. The lock is released automatically whenever a Job's
+pod stops, however it stops, so a killed or crashed run never blocks the others.
+
+Each scheduled backup Job is also given at most 6 hours, counted from its start and including any
+time spent waiting for the lock, after which Kubernetes stops it and marks it failed. This keeps a
+hung backup from blocking the others forever and, since a CronJob never starts a new run while its
+previous one is still active, from silently stopping that frequency's backups for good. If scheduled
+backups start failing this way, restart the Firebird pod (`kubectl delete pod <name>-0`): once two
+backups of a database have collided, Firebird can keep hanging every later backup of it until the
+server restarts; the data itself is unaffected.
 
 Unlike `backupOnDelete`'s `gbak` backup, these scheduled runs never back up the security database:
 Firebird refuses an `nbackup`-style backup of it while a live server has it open, whether reached

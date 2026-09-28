@@ -333,6 +333,16 @@ var _ = Describe("Manager", Ordered, func() {
 		// window is pruned, and disabling retention removes the
 		// CronJob again.
 		instanceScheduledBackupSpecs()
+
+		// instanceScheduledBackupConcurrencySpecs
+		// (test/e2e/instance_scheduled_backup_concurrency_test.go)
+		// exercises scheduled backups started at the same moment:
+		// one Job from every frequency's CronJob plus extra hourly
+		// ones, all queued behind the shared backup lock held from
+		// the Firebird pod and released at once by killing its
+		// holder, must all succeed with one distinct backup each,
+		// every one of which restores to the database's content.
+		instanceScheduledBackupConcurrencySpecs()
 	})
 })
 

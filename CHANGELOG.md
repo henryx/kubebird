@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Scheduled backup Jobs (`spec.backup.retention`) now have an `activeDeadlineSeconds` of 6 hours,
+  counted from the Job's start, time spent waiting for another scheduled backup included. A hung
+  backup used to run forever, holding up every other frequency's backups and, since each CronJob
+  forbids concurrent runs, silently stopping its own frequency's backups for good; it's now stopped
+  and reported as a failed Job, and the next scheduled run tries again. The deadline doesn't make a
+  wedged Firebird server recover by itself — once two backups of a database have collided, Firebird
+  can keep hanging every later backup of it until the pod is restarted — but it makes the failure
+  visible instead of silent.
+
+### Fixed
+
+- Scheduled backups of different frequencies that came due at the same moment (e.g. the hourly and
+  daily backups at 00:00 UTC) raced each other on the same database, and all but one failed with
+  "unsuccessful metadata update / ALTER DATABASE failed / Database is already in the physical backup
+  mode" — or, sometimes, all of them hung. Each CronJob's `Forbid` concurrency policy only kept it
+  from overlapping with itself. Every scheduled backup Job now takes an exclusive `flock` on a lock
+  file at the root of the backup volume (`.scheduled-backup.lock`), shared by all frequencies, and
+  waits for it, so overlapping runs take turns instead. The lock is released by the kernel whenever
+  a Job's pod stops, so a killed run never leaves a stale one behind.
+- Two runs of the same frequency starting within the same second — a Job created by hand with
+  `kubectl create job --from=cronjob/...` while that CronJob's own run was in flight, which `Forbid`
+  doesn't prevent — computed the same timestamped file name, and the second failed with "Error
+  creating backup file: ... File exists". The timestamp is now taken once the lock is held, and a
+  run waits for the next second if a backup in its frequency's directory already carries the current
+  one.
+
 ## 0.3.0
 
 ### Added

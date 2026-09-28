@@ -184,6 +184,81 @@ func TestPruneScheduledBackupsScriptEmptyDir(t *testing.T) {
 	}
 }
 
+// TestScheduledBackupUniqueTimestampScript executes
+// scheduledBackupUniqueTimestampScript's rendered snippet via a real "sh"
+// against a real temporary directory already holding backups (compressed
+// or not, of different databases) for the current second and the next two:
+// the $TS it settles on must be none of them, so a run of the same
+// frequency right after another one never reuses its file names.
+func TestScheduledBackupUniqueTimestampScript(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	taken := map[string]bool{}
+	for i, name := range []string{"instance-%s.nbk", "other-%s.nbk.gz", "instance-%s.nbk.gz"} {
+		ts := now.Add(time.Duration(i) * time.Second).Format("20060102T150405Z")
+		taken[ts] = true
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf(name, ts)), nil, 0o600); err != nil {
+			t.Fatalf("failed to create fixture file: %v", err)
+		}
+	}
+
+	script := "set -e\n" + scheduledBackupUniqueTimestampScript(dir) + "echo \"$TS\"\n"
+	out, err := exec.Command("sh", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("sh -c %q failed: %v\n%s", script, err, out)
+	}
+	ts := strings.TrimSpace(string(out))
+	if _, err := time.Parse("20060102T150405Z", ts); err != nil {
+		t.Fatalf("$TS = %q, want a scheduledBackupTimestampDate timestamp: %v", ts, err)
+	}
+	if taken[ts] {
+		t.Errorf("$TS = %q, which a backup in %s already carries", ts, dir)
+	}
+}
+
+// TestScheduledBackupLockedRunsConcurrently starts several runs at once,
+// each taking an flock on a shared lock file the same way
+// scheduledBackupScript does, then settling on a unique $TS
+// (scheduledBackupUniqueTimestampScript) and creating its "backup" file
+// with it: every run must succeed and end up with its own file, even
+// though they all start within the same second — the case of a Job created
+// by hand from a CronJob while that CronJob's scheduled run is in flight.
+func TestScheduledBackupLockedRunsConcurrently(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not available")
+	}
+	const runs = 3
+	dir := t.TempDir()
+	lock := filepath.Join(t.TempDir(), "lock")
+	script := fmt.Sprintf("set -e\nexec 9>%q\nflock 9\n", lock) +
+		scheduledBackupUniqueTimestampScript(dir) +
+		fmt.Sprintf("touch %q/instance-\"$TS\".nbk\n", dir)
+
+	errs := make(chan error, runs)
+	for range runs {
+		go func() {
+			out, err := exec.Command("sh", "-c", script).CombinedOutput()
+			if err != nil {
+				err = fmt.Errorf("%w: %s", err, out)
+			}
+			errs <- err
+		}()
+	}
+	for range runs {
+		if err := <-errs; err != nil {
+			t.Errorf("run failed: %v", err)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != runs {
+		t.Errorf("got %d backup files, want %d (one per run)", len(entries), runs)
+	}
+}
+
 // TestBackupFrequencySchedules checks every backupFrequency's cron
 // schedule string against what RetentionSpec documents: hourly on the
 // hour, daily at 00:00 UTC, weekly at 00:00 UTC on Sunday, monthly at
@@ -274,7 +349,10 @@ func TestScheduledBackupScript(t *testing.T) {
 	script := scheduledBackupScript(instance, hour)
 
 	for _, want := range []string{
+		`exec 9>"/var/lib/firebird/backup/.scheduled-backup.lock"`,
+		"flock 9\n",
 		"TS=$(date -u +%Y%m%dT%H%M%SZ)",
+		`while ls "/var/lib/firebird/backup/hour"/*-"$TS".nbk* >/dev/null 2>&1; do`,
 		"fbsvcmgr",
 		"test/3050:service_mgr",
 		"-action_nbak",
@@ -289,6 +367,9 @@ func TestScheduledBackupScript(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("scheduledBackupScript output missing %q; got:\n%s", want, script)
 		}
+	}
+	if lock := strings.Index(script, "flock 9"); lock < 0 || lock > strings.Index(script, "TS=") || lock > strings.Index(script, "fbsvcmgr") {
+		t.Errorf("scheduledBackupScript must hold the shared backup lock before timestamping or backing up anything; got:\n%s", script)
 	}
 	if strings.Index(script, "CUTOFF=") < strings.LastIndex(script, "fbsvcmgr") {
 		t.Errorf("scheduledBackupScript must prune only after every backup succeeded; got:\n%s", script)

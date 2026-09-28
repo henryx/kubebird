@@ -22,6 +22,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -71,6 +72,39 @@ const scheduledBackupTimestampDate = "+%Y%m%dT%H%M%SZ"
 // scheduledBackupTimestampDate's output; a file not following that naming
 // yields nothing, so pruning never touches it.
 const scheduledBackupTimestampSedPattern = `s/.*-\([0-9]\{8\}T[0-9]\{6\}Z\)\.nbk\(\.gz\)\{0,1\}$/\1/p`
+
+// scheduledBackupLockPath is the lock file every scheduled backup Job
+// holds (via flock) for its whole run, at the backup volume's root so it's
+// shared by every frequency's CronJob. ConcurrencyPolicy Forbid only keeps
+// a single CronJob from overlapping with itself, but different
+// frequencies routinely fire at the same instant (e.g. hourly and daily
+// at 00:00 UTC), and the server rejects a second -action_nbak on a
+// database still locked by the first ("Database is already in the
+// physical backup mode"). flock works across those Jobs' pods since
+// they're all scheduled onto the Firebird pod's own node (see
+// firebirdNodeTopologyKey) and so share one kernel mount of the
+// ReadWriteOnce backup PVC, and the kernel releases the lock by itself
+// when a Job's shell exits, however it exits, so no stale lock survives a
+// crashed or killed run.
+var scheduledBackupLockPath = path.Join(backupDataMountPath, ".scheduled-backup.lock")
+
+// scheduledBackupActiveDeadline bounds how long a scheduled backup Job may
+// run, counting from its start, time spent waiting for
+// scheduledBackupLockPath included, before the Job controller kills its
+// pod and marks it Failed. It guards against a hung fbsvcmgr: confirmed
+// against the actual image that once two -action_nbak calls race on the
+// same database, both can hang indefinitely, and so does every later one
+// until the server restarts. Unbounded, a hung Job would keep holding the
+// lock every other frequency waits on, and ConcurrencyPolicy Forbid would
+// skip every later run of its own CronJob, so scheduled backups would
+// stop for good with nothing failing visibly. The deadline doesn't make
+// the server recover by itself, but the failure shows up, the lock is
+// released and the next scheduled run tries again. It's deliberately
+// generous, since killing a legitimately slow backup loses that period's
+// backup: on January 1st all five frequencies queue behind one another on
+// the lock, so it has to cover five full backups (gzip included) of a
+// large database.
+const scheduledBackupActiveDeadline = 6 * time.Hour
 
 // firebirdNodeTopologyKey schedules each scheduled backup Job's pod onto
 // the same node as the instance's own Firebird pod (see
@@ -269,6 +303,8 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 // reason: a failure this period should just wait for the next scheduled
 // tick rather than the Job controller immediately re-running (and, with
 // the default backoff limit of 6, re-failing) the same script.
+// ActiveDeadlineSeconds (scheduledBackupActiveDeadline) keeps a hung run
+// from blocking every later one forever.
 func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJob, instance *kubebirdv1.Instance, freq backupFrequency) error {
 	successfulHistory := int32(1)
 	failedHistory := int32(3)
@@ -283,7 +319,8 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 		JobTemplate: batchv1.JobTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
 			Spec: batchv1.JobSpec{
-				BackoffLimit: &backoffLimit,
+				BackoffLimit:          &backoffLimit,
+				ActiveDeadlineSeconds: ptr.To(int64(scheduledBackupActiveDeadline.Seconds())),
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
 					Spec: corev1.PodSpec{
@@ -381,6 +418,20 @@ func scheduledBackupDir(frequency string) string {
 // option of its own), through the Job's own mount of the backup PVC —
 // gzip being the only compressor the firebirdsql/firebird image ships.
 //
+// The whole run holds an exclusive flock on scheduledBackupLockPath
+// (waiting for it rather than failing), serializing it against every
+// other frequency's Job that fires at the same moment; $TS is taken only
+// once the lock is held, so it reflects when the backup actually ran.
+// Holding the lock doesn't keep two runs of the *same* frequency from
+// naming their files alike, though: ConcurrencyPolicy Forbid rules that
+// out between scheduled runs, but not between a scheduled run and a Job
+// created from the CronJob by hand ("kubectl create job --from"), and a
+// backup can finish within the same second it started, handing the next
+// run an identical $TS ("Error creating backup file: ... File exists").
+// So, still under the lock, the script waits for the clock to move past
+// any timestamp one of the frequency's backup files already carries
+// (see scheduledBackupUniqueTimestampScript).
+//
 // Once every backup has succeeded, the script prunes the frequency's own
 // backup directory (see pruneScheduledBackupsScript) through the Job's
 // own mount of the backup PVC. Since it runs under set -e, a failed
@@ -405,7 +456,9 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency) 
 
 	var b strings.Builder
 	b.WriteString("set -e\n")
-	fmt.Fprintf(&b, "TS=$(date -u %s)\n", scheduledBackupTimestampDate)
+	fmt.Fprintf(&b, "exec 9>%q\n", scheduledBackupLockPath)
+	b.WriteString("flock 9\n")
+	b.WriteString(scheduledBackupUniqueTimestampScript(dir))
 
 	for _, name := range instance.Status.Databases {
 		serverDBPath := path.Join(primaryDataMountPath, name)
@@ -418,6 +471,24 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency) 
 	}
 
 	b.WriteString(pruneScheduledBackupsScript(dir, retention))
+	return b.String()
+}
+
+// scheduledBackupUniqueTimestampScript renders the shell snippet that sets
+// $TS to the current UTC time (scheduledBackupTimestampDate), sleeping and
+// taking it again for as long as some file in dir already carries that
+// timestamp ("<database>-$TS.nbk", compressed or not) — factored out of
+// scheduledBackupScript so it can be exercised directly against a real
+// temporary directory in tests. Only safe to rely on while holding
+// scheduledBackupLockPath, since otherwise another run could still claim
+// the same timestamp between this check and its own fbsvcmgr call.
+func scheduledBackupUniqueTimestampScript(dir string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "TS=$(date -u %s)\n", scheduledBackupTimestampDate)
+	fmt.Fprintf(&b, "while ls %q/*-\"$TS\".nbk* >/dev/null 2>&1; do\n", dir)
+	b.WriteString("  sleep 1\n")
+	fmt.Fprintf(&b, "  TS=$(date -u %s)\n", scheduledBackupTimestampDate)
+	b.WriteString("done\n")
 	return b.String()
 }
 

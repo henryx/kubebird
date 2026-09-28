@@ -896,6 +896,8 @@ var _ = Describe("Instance Controller", func() {
 			Expect(cronJob.OwnerReferences).NotTo(BeEmpty())
 			Expect(cronJob.Spec.Schedule).To(Equal("0 * * * *"))
 			Expect(cronJob.Spec.ConcurrencyPolicy).To(Equal(batchv1.ForbidConcurrent))
+			Expect(cronJob.Spec.JobTemplate.Spec.ActiveDeadlineSeconds).To(HaveValue(Equal(int64(6*60*60))),
+				"a hung backup must not keep the shared lock, or block its CronJob, forever")
 
 			command := cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Command
 			Expect(command).To(ContainElement(ContainSubstring("fbsvcmgr")))
