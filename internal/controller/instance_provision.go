@@ -626,7 +626,7 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      databaseBackupPodName(instance),
 			Namespace: instance.Namespace,
-			Labels:    labelsForInstance(instance.Name),
+			Labels:    withFirebirdVersionLabel(instance, labelsForInstance(instance.Name)),
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,

@@ -86,7 +86,7 @@ type InstanceReconciler struct {
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups=batch,namespace=kubebird-system,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 
@@ -166,6 +166,9 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 
 	if sts.Status.ReadyReplicas > 0 {
 		if err := r.reconcileScheduledBackups(ctx, instance); err != nil {
+			return err
+		}
+		if err := r.reconcileFirebirdVersion(ctx, instance); err != nil {
 			return err
 		}
 	}

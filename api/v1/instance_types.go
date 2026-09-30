@@ -336,6 +336,13 @@ type InstanceStatus struct {
 	// spec.databases changes and the condition no longer applies.
 	// +optional
 	Warning string `json:"warning,omitempty"`
+
+	// firebirdVersion is the version the running Firebird server itself
+	// reports (e.g. "3.0.14"), detected once per server pod. Copied into
+	// the kubebird.github.io/firebird-version label on the objects
+	// Kubebird generates for the Instance.
+	// +optional
+	FirebirdVersion string `json:"firebirdVersion,omitempty"`
 }
 
 // +kubebuilder:object:root=true

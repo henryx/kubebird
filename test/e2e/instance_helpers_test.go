@@ -107,3 +107,31 @@ func runVerifyBackupPod(pvcName, script string) {
 		g.Expect(output).To(Equal("Succeeded"))
 	}, 2*time.Minute, 2*time.Second).Should(Succeed())
 }
+
+// expectFirebirdVersionLabel waits for Kubebird to detect the version the
+// running Firebird server reports and to record it both in
+// status.firebirdVersion and in the kubebird.github.io/firebird-version
+// label on the server pod itself, its StatefulSet, Service and aliases
+// ConfigMap.
+func expectFirebirdVersionLabel(instanceName, podName, version string) {
+	const labelPath = `jsonpath={.metadata.labels.kubebird\.github\.io/firebird-version}`
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "get", "instance", instanceName, "-n", namespace,
+			"-o", "jsonpath={.status.firebirdVersion}")
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(output).To(Equal(version))
+
+		for _, obj := range []string{
+			"pod/" + podName,
+			"statefulset/" + instanceName,
+			"service/" + instanceName,
+			"configmap/" + instanceName + "-aliases",
+		} {
+			cmd := exec.Command("kubectl", "get", obj, "-n", namespace, "-o", labelPath)
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal(version), "label on %s", obj)
+		}
+	}, 3*time.Minute, 2*time.Second).Should(Succeed())
+}

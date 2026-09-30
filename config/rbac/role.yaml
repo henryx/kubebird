@@ -22,12 +22,22 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""

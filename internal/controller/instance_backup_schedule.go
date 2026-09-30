@@ -310,19 +310,19 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 	failedHistory := int32(3)
 	backoffLimit := int32(0)
 
-	cronJob.Labels = labelsForInstance(instance.Name)
+	cronJob.Labels = withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))
 	cronJob.Spec = batchv1.CronJobSpec{
 		Schedule:                   freq.schedule,
 		ConcurrencyPolicy:          batchv1.ForbidConcurrent,
 		SuccessfulJobsHistoryLimit: &successfulHistory,
 		FailedJobsHistoryLimit:     &failedHistory,
 		JobTemplate: batchv1.JobTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
+			ObjectMeta: metav1.ObjectMeta{Labels: withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))},
 			Spec: batchv1.JobSpec{
 				BackoffLimit:          &backoffLimit,
 				ActiveDeadlineSeconds: ptr.To(int64(scheduledBackupActiveDeadline.Seconds())),
 				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: labelsForInstance(instance.Name)},
+					ObjectMeta: metav1.ObjectMeta{Labels: withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))},
 					Spec: corev1.PodSpec{
 						RestartPolicy: corev1.RestartPolicyNever,
 						Affinity: &corev1.Affinity{

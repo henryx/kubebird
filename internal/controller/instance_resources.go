@@ -333,7 +333,7 @@ func generateRandomPassword() (string, error) {
 // firebird container in mutateStatefulSet — $(dir_secDb) is a fixed macro
 // tied to the image's install root and doesn't follow that override.
 func (r *InstanceReconciler) mutateAliasesConfigMap(cm *corev1.ConfigMap, instance *kubebirdv1.Instance) error {
-	cm.Labels = labelsForInstance(instance.Name)
+	cm.Labels = withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))
 
 	var b strings.Builder
 	for _, db := range instance.Spec.Databases {
@@ -363,7 +363,7 @@ func (r *InstanceReconciler) mutateService(svc *corev1.Service, instance *kubebi
 		port = firebirdPort
 	}
 
-	svc.Labels = labelsForInstance(instance.Name)
+	svc.Labels = withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))
 	svc.Spec.Type = svcType
 	svc.Spec.Selector = firebirdPodSelector(instance.Name)
 	svc.Spec.Ports = []corev1.ServicePort{
@@ -394,7 +394,7 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 		return err
 	}
 
-	sts.Labels = labels
+	sts.Labels = withFirebirdVersionLabel(instance, labels)
 	sts.Spec.Replicas = &replicas
 	sts.Spec.ServiceName = instance.Name
 	sts.Spec.Template.Labels = labels

@@ -215,6 +215,9 @@ spec:
 				"--", "test", "-d", "/var/lib/firebird/backup")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			By("labelling the generated objects with the version the running server reports")
+			expectFirebirdVersionLabel(instanceName, instancePod(), "3.0.14")
 		})
 
 		It("should provision a newly added database without disturbing existing ones", func() {

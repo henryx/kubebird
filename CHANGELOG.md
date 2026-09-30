@@ -4,6 +4,16 @@
 
 ### Added
 
+- Kubebird now labels the objects it generates for an `Instance` with
+  `kubebird.github.io/firebird-version: <version>`: the Firebird server pod, the StatefulSet, the
+  Service, the aliases ConfigMap, the scheduled backup CronJobs (and their Jobs' pods) and the
+  delete-time backup Pod. The version comes from the running server itself (e.g. `3.0.14`), not from
+  `spec.version`, and is also recorded in the new `status.firebirdVersion` field. It is detected
+  once per server pod through the Services API (`fbsvcmgr -info_server_version`), so it works even
+  for an `Instance` with no databases, and is detected again after the pod is recreated, e.g.
+  following a `spec.version` change. The label never goes into the StatefulSet's selector or pod
+  template, so detecting it doesn't restart the pod. The PVCs and the SYSDBA Secret don't get the
+  label: they are created before the server is running, and the Secret may belong to the user.
 - Scheduled backup Jobs (`spec.backup.retention`) now have an `activeDeadlineSeconds` of 6 hours,
   counted from the Job's start, time spent waiting for another scheduled backup included. A hung
   backup used to run forever, holding up every other frequency's backups and, since each CronJob

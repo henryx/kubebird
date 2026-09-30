@@ -157,6 +157,8 @@ var _ = Describe("Instance Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testImage + ":" + testVersion))
 			Expect(sts.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", resourceName))
+			Expect(sts.Labels).NotTo(HaveKey("kubebird.github.io/firebird-version"),
+				"the version label is only added once the running server has reported its version")
 
 			By("annotating the pod template with a hash of the SYSDBA Secret's current password")
 			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(

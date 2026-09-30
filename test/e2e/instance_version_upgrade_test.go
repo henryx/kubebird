@@ -110,6 +110,9 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("firebirdsql/firebird:" + versionUpgradeFromVersion))
 
+			By("labelling the generated objects with Firebird " + versionUpgradeFromVersion)
+			expectFirebirdVersionLabel(versionUpgradeInstanceName, versionUpgradePodName, versionUpgradeFromVersion)
+
 			By("creating a marker table to prove data survives the upgrade")
 			_, err = versionUpgradeRunIsql(versionUpgradeSecretName, "CREATE TABLE PRE_UPGRADE (ID INTEGER);\nCOMMIT;\nQUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
@@ -154,6 +157,15 @@ spec:
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("firebirdsql/firebird:" + versionUpgradeToVersion))
+
+			By("re-labelling the generated objects with the upgraded server's version")
+			expectFirebirdVersionLabel(versionUpgradeInstanceName, versionUpgradePodName, versionUpgradeToVersion)
+
+			By("matching the version the server itself reports over SQL")
+			output, err = versionUpgradeRunIsql(versionUpgradeSecretName,
+				"SET HEADING OFF;\nSELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') FROM rdb$database;\nQUIT;\n")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(output)).To(Equal(versionUpgradeToVersion))
 
 			By("finding the marker table created before the upgrade")
 			schema, err := versionUpgradeExtractSchema(versionUpgradeSecretName)

@@ -419,6 +419,13 @@ spec:
                   any. Cleared automatically once the Instance reconciles
                   successfully again.
                 type: string
+              firebirdVersion:
+                description: |-
+                  firebirdVersion is the version the running Firebird server itself
+                  reports (e.g. "3.0.14"), detected once per server pod. Copied into
+                  the kubebird.github.io/firebird-version label on the objects
+                  Kubebird generates for the Instance.
+                type: string
               message:
                 description: |-
                   message is a human-readable summary of the Instance's current
@@ -599,12 +606,22 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
