@@ -217,7 +217,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("labelling the generated objects with the version the running server reports")
-			expectFirebirdVersionLabel(instanceName, instancePod(), "3.0.14")
+			expectFirebirdVersionLabel(instanceName, instancePod(), "3.0.14", "pvc/"+instanceName+"-shadow")
 		})
 
 		It("should provision a newly added database without disturbing existing ones", func() {

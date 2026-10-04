@@ -111,9 +111,10 @@ func runVerifyBackupPod(pvcName, script string) {
 // expectFirebirdVersionLabel waits for Kubebird to detect the version the
 // running Firebird server reports and to record it both in
 // status.firebirdVersion and in the kubebird.github.io/firebird-version
-// label on the server pod itself, its StatefulSet, Service and aliases
-// ConfigMap.
-func expectFirebirdVersionLabel(instanceName, podName, version string) {
+// label on the server pod itself, its StatefulSet, Service, aliases
+// ConfigMap, primary and backup PVCs and SYSDBA Secret, plus any
+// extraObjects (e.g. "pvc/<name>-shadow") the Instance under test also has.
+func expectFirebirdVersionLabel(instanceName, podName, version string, extraObjects ...string) {
 	const labelPath = `jsonpath={.metadata.labels.kubebird\.github\.io/firebird-version}`
 	Eventually(func(g Gomega) {
 		cmd := exec.Command("kubectl", "get", "instance", instanceName, "-n", namespace,
@@ -122,12 +123,15 @@ func expectFirebirdVersionLabel(instanceName, podName, version string) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(output).To(Equal(version))
 
-		for _, obj := range []string{
+		for _, obj := range append([]string{
 			"pod/" + podName,
 			"statefulset/" + instanceName,
 			"service/" + instanceName,
 			"configmap/" + instanceName + "-aliases",
-		} {
+			"pvc/" + instanceName + "-primary",
+			"pvc/" + instanceName + "-backup",
+			"secret/" + instanceName + "-sysdba",
+		}, extraObjects...) {
 			cmd := exec.Command("kubectl", "get", obj, "-n", namespace, "-o", labelPath)
 			output, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())

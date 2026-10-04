@@ -145,6 +145,10 @@ spec:
 				"--", "test", "-d", scheduledBackupDir)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			By("labelling the generated objects, the CronJob included, with the version the running server reports")
+			expectFirebirdVersionLabel(scheduledBackupInstanceName, scheduledBackupPodName, "3.0.14",
+				"cronjob/"+scheduledBackupCronJob)
 		})
 
 		It("should back up the database, but not the security database, when the CronJob is triggered manually", func() {

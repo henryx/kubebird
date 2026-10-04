@@ -83,8 +83,8 @@ type InstanceReconciler struct {
 // +kubebuilder:rbac:groups=kubebird.github.io,namespace=kubebird-system,resources=instances/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,namespace=kubebird-system,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=secrets,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=secrets,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=persistentvolumeclaims,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",namespace=kubebird-system,resources=pods/exec,verbs=create

@@ -197,14 +197,19 @@ func (r *InstanceReconciler) reconcilePVCs(ctx context.Context, instance *kubebi
 // reconcilePVC ensures a single PVC exists, creating it from vol when it
 // doesn't. Like a StatefulSet's own volumeClaimTemplates, size and
 // storage class are only applied at creation time: an existing PVC is
-// left untouched. Unlike a StatefulSet's own PVCs, it isn't
+// left untouched, apart from its firebirdVersionLabelKey label, which
+// syncFirebirdVersionLabel keeps in step with status.firebirdVersion. Unlike a StatefulSet's own PVCs, it isn't
 // owner-referenced to the Instance, so it isn't garbage collected along
 // with it — but only the backup PVC actually survives an Instance
 // deletion this way: the primary and shadow PVCs are explicitly deleted
 // by releasePrimaryAndShadowStorage regardless (see reconcileDeletion).
 func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebirdv1.Instance, name string, vol kubebirdv1.StorageVolumeSpec) error {
 	nsName := types.NamespacedName{Name: name, Namespace: instance.Namespace}
-	if err := r.Get(ctx, nsName, &corev1.PersistentVolumeClaim{}); err == nil {
+	existing := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, nsName, existing); err == nil {
+		if err := r.syncFirebirdVersionLabel(ctx, instance, existing); err != nil {
+			return fmt.Errorf("failed to label PVC %q with the Firebird version: %w", name, err)
+		}
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to get PVC %q: %w", name, err)
@@ -214,7 +219,7 @@ func (r *InstanceReconciler) reconcilePVC(ctx context.Context, instance *kubebir
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: instance.Namespace,
-			Labels:    labelsForInstance(instance.Name),
+			Labels:    withFirebirdVersionLabel(instance, labelsForInstance(instance.Name)),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -256,7 +261,8 @@ func (r *InstanceReconciler) deletePVC(ctx context.Context, instance *kubebirdv1
 // reconciliation fails if it doesn't; when unset, the default
 // "<instance-name>-sysdba" Secret is created with a freshly generated random
 // password if missing. An existing Secret, whether created by a previous
-// reconcile or supplied by the user ahead of time, is left untouched. The
+// reconcile or supplied by the user ahead of time, is left untouched, apart
+// from its firebirdVersionLabelKey label (see syncFirebirdVersionLabel). The
 // Secret is deliberately never owner-referenced to the Instance, so it
 // survives deleting the Instance rather than being garbage collected along
 // with it.
@@ -264,7 +270,11 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 	secretRef := sysdbaSecretRefName(instance)
 	nsName := types.NamespacedName{Name: secretRef, Namespace: instance.Namespace}
 
-	if err := r.Get(ctx, nsName, &corev1.Secret{}); err == nil {
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, nsName, existing); err == nil {
+		if err := r.syncFirebirdVersionLabel(ctx, instance, existing); err != nil {
+			return fmt.Errorf("failed to label SYSDBA Secret %q with the Firebird version: %w", secretRef, err)
+		}
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to get SYSDBA Secret %q: %w", secretRef, err)
@@ -283,7 +293,7 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretRef,
 			Namespace: instance.Namespace,
-			Labels:    labelsForInstance(instance.Name),
+			Labels:    withFirebirdVersionLabel(instance, labelsForInstance(instance.Name)),
 		},
 		StringData: map[string]string{
 			sysdbaSecretUsernameKey: sysdbaUsername,

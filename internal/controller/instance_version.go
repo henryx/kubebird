@@ -66,13 +66,36 @@ func withFirebirdVersionLabel(instance *kubebirdv1.Instance, labels map[string]s
 	return out
 }
 
+// syncFirebirdVersionLabel patches obj's firebirdVersionLabelKey label to
+// status.firebirdVersion when it differs. Used for the objects Kubebird
+// only creates and never otherwise updates — the PVCs and the SYSDBA
+// Secret — which, being never owner-referenced, also outlive the Instance:
+// after a recreate with a new spec.version they keep the old label until
+// the new server's version is detected, then follow it here. A label is
+// never removed while the version is still unknown.
+func (r *InstanceReconciler) syncFirebirdVersionLabel(ctx context.Context, instance *kubebirdv1.Instance, obj client.Object) error {
+	version := instance.Status.FirebirdVersion
+	if version == "" || obj.GetLabels()[firebirdVersionLabelKey] == version {
+		return nil
+	}
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[firebirdVersionLabelKey] = version
+	obj.SetLabels(labels)
+	return r.Patch(ctx, obj, patch)
+}
+
 // reconcileFirebirdVersion asks the running Firebird server for its
 // version via the Services API (fbsvcmgr -info_server_version, which,
 // unlike a SQL query, needs no database to connect to — the security
 // database can't be opened while the server holds it, and spec.databases
 // may be empty), labels the Firebird pod with it, and records it in
 // status.firebirdVersion, from which the next reconcile labels every
-// other generated object (withFirebirdVersionLabel). The pod's own label
+// other generated object (withFirebirdVersionLabel, plus
+// syncFirebirdVersionLabel for the PVCs and the SYSDBA Secret). The pod's own label
 // doubles as the "already detected" marker: a pod recreated by the
 // StatefulSet controller (e.g. after spec.version changed) comes back
 // without it, so the version is re-detected exactly once per server pod.

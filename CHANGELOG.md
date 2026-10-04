@@ -12,8 +12,14 @@
   once per server pod through the Services API (`fbsvcmgr -info_server_version`), so it works even
   for an `Instance` with no databases, and is detected again after the pod is recreated, e.g.
   following a `spec.version` change. The label never goes into the StatefulSet's selector or pod
-  template, so detecting it doesn't restart the pod. The PVCs and the SYSDBA Secret don't get the
-  label: they are created before the server is running, and the Secret may belong to the user.
+  template, so detecting it doesn't restart the pod. The PVCs (primary, shadow and backup) and the
+  SYSDBA Secret, including one supplied via `spec.authentication.sysdba.secretRef`, get it too:
+  since they are created before the server runs and outlive the `Instance`, Kubebird patches just
+  that label onto them once the version is known, and updates it when it changes. After deleting
+  and recreating an `Instance` with a new `spec.version`, the surviving backup PVC and Secret keep
+  the old version's label until the new server's version is detected, then switch to it. This
+  needs the new `patch` verb on `persistentvolumeclaims` and `secrets` in the manager's Role, so
+  apply the new RBAC along with the new image.
 - Scheduled backup Jobs (`spec.backup.retention`) now have an `activeDeadlineSeconds` of 6 hours,
   counted from the Job's start, time spent waiting for another scheduled backup included. A hung
   backup used to run forever, holding up every other frequency's backups and, since each CronJob

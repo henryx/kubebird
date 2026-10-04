@@ -22,15 +22,6 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
   - pods
   verbs:
   - create
@@ -53,6 +44,7 @@ rules:
   - create
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - apps

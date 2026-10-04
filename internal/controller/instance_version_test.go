@@ -146,3 +146,50 @@ func TestReconcileFirebirdVersionFromLabelledPod(t *testing.T) {
 		t.Errorf("status.firebirdVersion = %q, want %q", stored.Status.FirebirdVersion, upgradedTestVersion)
 	}
 }
+
+func TestSyncFirebirdVersionLabelOnPVCsAndSecret(t *testing.T) {
+	// The PVCs and the SYSDBA Secret outlive the Instance, so a recreate
+	// with a new spec.version finds them still labelled with the old one.
+	staleLabels := func(name string) map[string]string {
+		return withFirebirdVersionLabel(versionTestInstance(testVersion), labelsForInstance(name))
+	}
+	instance := versionTestInstance("")
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: primaryPVCName(instance), Namespace: instance.Namespace, Labels: staleLabels(instance.Name),
+	}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: sysdbaSecretRefName(instance), Namespace: instance.Namespace, Labels: staleLabels(instance.Name),
+	}}
+	c := versionTestClient(t, pvc, secret)
+	r := &InstanceReconciler{Client: c, Scheme: c.Scheme()}
+	ctx := context.Background()
+
+	reconcileAndExpect := func(want string) {
+		t.Helper()
+		if err := r.reconcilePVC(ctx, instance, pvc.Name, instance.Spec.Storage.Primary); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.reconcileSysdbaSecret(ctx, instance); err != nil {
+			t.Fatal(err)
+		}
+		for _, obj := range []client.Object{&corev1.PersistentVolumeClaim{}, &corev1.Secret{}} {
+			name := pvc.Name
+			if _, ok := obj.(*corev1.Secret); ok {
+				name = secret.Name
+			}
+			if err := c.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: name}, obj); err != nil {
+				t.Fatal(err)
+			}
+			if got := obj.GetLabels()[firebirdVersionLabelKey]; got != want {
+				t.Errorf("%T %s label = %q, want %q", obj, firebirdVersionLabelKey, got, want)
+			}
+		}
+	}
+
+	// Not yet detected: the old label is kept rather than removed.
+	reconcileAndExpect(testVersion)
+
+	// Detected: the label follows the upgraded version.
+	instance.Status.FirebirdVersion = upgradedTestVersion
+	reconcileAndExpect(upgradedTestVersion)
+}
