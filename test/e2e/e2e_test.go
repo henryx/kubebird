@@ -327,7 +327,7 @@ var _ = Describe("Manager", Ordered, func() {
 		// once the Instance is ready, a manually-triggered run of
 		// that CronJob (rather than waiting on its real schedule)
 		// backs up the database (not the security database) via
-		// fbsvcmgr's remote nbackup action and gzips the result
+		// fbsvcmgr's remote gbak action and gzips the result
 		// (spec.backup.compress), a second run lands next
 		// to the first while a backup older than the retention
 		// window is pruned, and disabling retention removes the
@@ -338,10 +338,10 @@ var _ = Describe("Manager", Ordered, func() {
 		// (test/e2e/instance_scheduled_backup_concurrency_test.go)
 		// exercises scheduled backups started at the same moment:
 		// one Job from every frequency's CronJob plus extra hourly
-		// ones, all queued behind the shared backup lock held from
-		// the Firebird pod and released at once by killing its
-		// holder, must all succeed with one distinct backup each,
-		// every one of which restores to the database's content.
+		// ones, all created together while a writer keeps
+		// committing to the database, must all succeed with one
+		// distinct backup each, every one of which restores to the
+		// database's content.
 		instanceScheduledBackupConcurrencySpecs()
 	})
 })

@@ -33,10 +33,9 @@
 - Independently of `backupOnDelete`, `spec.backup.retention` runs recurring scheduled backups (hourly,
   daily, weekly, monthly, and/or yearly) into the same local backup volume, deleting each
   frequency's backups once they're older than its configured retention (e.g. `3d`). Each enabled frequency gets its own native Kubernetes `CronJob`,
-  which triggers a full, `nbackup`-style backup of every database in `spec.databases` — via the
-  Services API, since `nbackup` itself only backs up a database local to wherever it runs — against the
-  instance's own live server, so, unlike the `gbak`-based `backupOnDelete` backup, it never needs to
-  stop the pod; the result is then gzip-compressed when `spec.backup.compress` is `true`. The security database is deliberately excluded from
+  which triggers a `gbak` backup of every database in `spec.databases` through the Services API,
+  run by the instance's own live server, so, unlike the `backupOnDelete` backup, it never needs to
+  stop the pod and the databases stay writable throughout; the result is then gzip-compressed when `spec.backup.compress` is `true`. The security database is deliberately excluded from
   these scheduled backups, since Firebird refuses to back it up remotely while the server has it open;
   it stays covered by the `backupOnDelete` backup instead.
 - Surfaces `VERSION`, `STATUS`, `DATABASES`, and `MESSAGE` printer columns on `kubectl get instances`
@@ -164,7 +163,7 @@ spec:
           storage:
             class: ""
             size: 3Gi
-    retention: # time-based retention per frequency, as <n><unit> with unit h (hours), d (days), w (weeks), m (months), y (years). if omitted (or zero), that frequency is disabled. these backups are made with nbackup
+    retention: # time-based retention per frequency, as <n><unit> with unit h (hours), d (days), w (weeks), m (months), y (years). if omitted (or zero), that frequency is disabled. these backups are made with gbak
       hour: ""  # start every hour, e.g. "12h" deletes hourly backups older than 12 hours
       day: ""   # start at 00:00 of every day, e.g. "3d" deletes daily backups older than three days
       week: ""  # start every Sunday, e.g. "4w"
@@ -347,14 +346,15 @@ backup's own run history or troubleshoot a failure. Each CronJob keeps its last 
 its last 3 failed ones (a failed run isn't retried, so each failed Job reflects one distinct failed
 attempt) for that troubleshooting.
 
-Each run takes a full (level 0) backup of every database in `status.databases`, writing
-`<frequency>/<database>-<timestamp>.nbk` into the backup volume (e.g.
-`hour/instance-20260924T100000Z.nbk`), where `<timestamp>` is the UTC time the run actually started
-backing up (see "Overlapping runs" below for why that can be later than the Job's own start); when
-`backup.compress` is `true`, each one is then gzip-compressed to `<frequency>/<database>-<timestamp>.nbk.gz`
-(gzip being the only compressor the `firebirdsql/firebird` image ships), otherwise it's left uncompressed. Once every backup of the run
+Each run takes a `gbak` backup of every database in `status.databases`, writing
+`<frequency>/<database>-<timestamp>.fbk` into the backup volume (e.g.
+`hour/instance-20260924T100000Z.fbk`), where `<timestamp>` is the UTC time the run started; when
+`backup.compress` is `true`, each one is then gzip-compressed to `<frequency>/<database>-<timestamp>.fbk.gz`
+(gzip being the only compressor the `firebirdsql/firebird` image ships), otherwise it's left uncompressed.
+Restore one with `gbak -create` (after `gunzip`, if compressed). Once every backup of the run
 has succeeded, the same Job deletes every backup in that frequency's directory whose timestamp is
-older than its retention (months and years follow the calendar rather than a fixed number of days).
+older than its retention (months and years follow the calendar rather than a fixed number of days),
+including `.nbk` backups left by Kubebird 0.3.1 and earlier.
 Files in that directory not following this naming are never touched. Since pruning only happens after
 a successful run, a frequency whose runs keep failing never loses its older backups; still, pick a
 retention comfortably longer than the frequency itself (e.g. `hour: 3h` rather than `hour: 1h`) so a
@@ -365,42 +365,36 @@ required pod affinity).
 **Overlapping runs.** Different frequencies regularly come due at the same moment — the hourly and
 daily backups both at 00:00 UTC every day, all five on January 1st — and a Job created by hand from a
 CronJob (`kubectl create job --from=cronjob/<name>-backup-<frequency> <job-name>`, e.g. to force an
-out-of-band backup) can start while that CronJob's own scheduled run is still going. Firebird can't
-take two such backups of the same database at once: the second one fails ("Database is already in the
-physical backup mode"), or both hang. So every scheduled backup Job first takes an exclusive lock on a
-file at the root of the backup volume (`.scheduled-backup.lock`), shared by all frequencies, and waits
-for it rather than failing, so overlapping runs simply take turns. Kubernetes' own `Forbid` concurrency
-policy isn't enough for this, since it only keeps one CronJob from overlapping with *itself*. A run of
-the same frequency that follows another within the same second also waits for the next second, so
-it never reuses the previous run's file name. The lock is released automatically whenever a Job's
-pod stops, however it stops, so a killed or crashed run never blocks the others.
+out-of-band backup) can start while that CronJob's own scheduled run is still going. These runs simply
+proceed side by side: `gbak` backups of the same database don't conflict with each other. Two runs of
+the same frequency starting within the same second would pick the same file name, so each run first
+claims its timestamp with a `.claim-<timestamp>` directory in the frequency's directory, moving on to
+the next second if another run already has it. The claim is removed when the run ends; one left
+behind by a killed run is removed once it's older than the retention.
 
-Each scheduled backup Job is also given at most 6 hours, counted from its start and including any
-time spent waiting for the lock, after which Kubernetes stops it and marks it failed. This keeps a
-hung backup from blocking the others forever and, since a CronJob never starts a new run while its
-previous one is still active, from silently stopping that frequency's backups for good. If scheduled
-backups start failing this way, restart the Firebird pod (`kubectl delete pod <name>-0`): once two
-backups of a database have collided, Firebird can keep hanging every later backup of it until the
-server restarts; the data itself is unaffected.
+Each scheduled backup Job is also given at most 6 hours, counted from its start, after which
+Kubernetes stops it and marks it failed. This keeps a hung backup from silently stopping that
+frequency's backups for good, since a CronJob never starts a new run while its previous one is still
+active.
 
-Unlike `backupOnDelete`'s `gbak` backup, these scheduled runs never back up the security database:
-Firebird refuses an `nbackup`-style backup of it while a live server has it open, whether reached
-locally or remotely through the Services API, and unlike `backupOnDelete` this flow can't stop the pod
-to work around that. The security database therefore stays covered only by the `backupOnDelete` backup
-taken when the `Instance` is deleted.
+Unlike `backupOnDelete`'s backup, these scheduled runs never back up the security database:
+Firebird refuses to back it up while a live server has it open, whether reached locally or remotely
+through the Services API, and unlike `backupOnDelete` this flow can't stop the pod to work around
+that. The security database therefore stays covered only by the `backupOnDelete` backup taken when
+the `Instance` is deleted.
 
-Unlike `backupOnDelete`'s `gbak` backup, this never stops the pod. The backup itself uses the same
-mechanism as the `nbackup` CLI tool — a physically consistent backup of a database a live server still
-has open, taken via a brief guard lock rather than requiring exclusive access — but `nbackup` itself
-only operates on a database local to wherever it runs, so it can't reach a database a *separate*, live
-server process already has open. Kubebird works around that by having the CronJob's Job trigger the
-backup through the [Services API](https://www.firebirdsql.org/file/documentation/html/en/firebirddocs/nbackup/firebird-nbackup.html#fbscm-nbackup)
-(`fbsvcmgr -action_nbak`) instead, reaching the instance's own already-running server over the network
-(through its `Service`, using the SYSDBA credentials from the Secret) rather than mounting the
-primary/shadow PVCs itself; per that same Services API, the server performs the backup and writes it
-directly into its own already-mounted backup volume. The Job mounts only the backup PVC, and only to
-prune expired backups and, since neither `nbackup` nor `fbsvcmgr` can compress their own output, to
-gzip each new backup file right after it's written when `backup.compress` is `true`.
+Unlike `backupOnDelete`'s backup, this never stops the pod, and it never locks the databases: `gbak`
+reads each one inside a single snapshot transaction, so writes, and even schema changes, go on while
+it runs, and the backup holds the database as it was when it started. Rather than running `gbak`
+itself against the primary PVC, which a live server already has open, the CronJob's Job triggers the
+backup through the [Services API](https://www.firebirdsql.org/file/documentation/html/en/firebirddocs/gbak/firebird-gbak.html)
+(`fbsvcmgr -action_backup`), reaching the instance's own already-running server over the network
+(through its `Service`, using the SYSDBA credentials from the Secret); the server performs the backup
+and writes it directly into its own already-mounted backup volume. The Job mounts only the backup
+PVC, and only to prune expired backups and, since `fbsvcmgr` can't compress its own output, to gzip
+each new backup file right after it's written when `backup.compress` is `true`. Keep in mind that, as
+with any long-running transaction, a backup of a large, busy database holds back garbage collection
+of old record versions until it finishes.
 
 ## License
 

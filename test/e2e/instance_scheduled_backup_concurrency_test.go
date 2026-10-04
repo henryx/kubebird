@@ -38,14 +38,19 @@ const (
 	concurrentBackupSecretName   = concurrentBackupInstanceName + "-sysdba"
 	concurrentBackupDatabaseName = "concurrent.fdb"
 	concurrentBackupDBPath       = "/var/lib/firebird/data/" + concurrentBackupDatabaseName
-	// concurrentBackupRoot mirrors backupDataMountPath, and
-	// concurrentBackupLockPath scheduledBackupLockPath, in
+	// concurrentBackupDBConn reaches the database through the live server.
+	// A bare path would make isql open the file with its own embedded
+	// engine, which can't share it with the server: while the writer holds
+	// it that way, the server (and so every backup Job) fails with
+	// "Database already opened with engine instance, incompatible with
+	// current".
+	concurrentBackupDBConn = "localhost:" + concurrentBackupDBPath
+	// concurrentBackupRoot mirrors backupDataMountPath in
 	// internal/controller.
-	concurrentBackupRoot     = "/var/lib/firebird/backup"
-	concurrentBackupLockPath = concurrentBackupRoot + "/.scheduled-backup.lock"
-	// concurrentBackupHolderPIDFile is where the lock-holding process
-	// started in the Firebird pod records its PID, so it can be killed.
-	concurrentBackupHolderPIDFile = "/tmp/kubebird-e2e-lock-holder.pid"
+	concurrentBackupRoot = "/var/lib/firebird/backup"
+	// concurrentBackupWriterPIDFile is where the writer process started
+	// in the Firebird pod records its PID, so it can be stopped.
+	concurrentBackupWriterPIDFile = "/tmp/kubebird-e2e-writer.pid"
 	// concurrentBackupExtraHourlyRuns is how many additional Jobs are
 	// created from the hourly CronJob on top of one per frequency — runs of
 	// the same frequency that ConcurrencyPolicy Forbid can't keep apart
@@ -62,19 +67,18 @@ var concurrentBackupFrequencies = []string{"hour", "day", "week", "month", "year
 // scheduled backups running at the same moment — e.g. the hourly and
 // daily CronJobs both firing at 00:00 UTC, or all five on January 1st.
 // Each frequency has its own CronJob, and ConcurrencyPolicy Forbid only
-// keeps a CronJob from overlapping with itself, so without
-// scheduledBackupScript's shared flock their fbsvcmgr -action_nbak calls
-// race on the same database and one fails ("Database is already in the
-// physical backup mode") or both hang.
+// keeps a CronJob from overlapping with itself, so their fbsvcmgr
+// -action_backup calls run against the same database at the same time.
+// gbak backups, unlike the nbackup-based -action_nbak Kubebird 0.3.1 and
+// earlier used, don't conflict with each other, so nothing serializes
+// them.
 //
-// Rather than hoping independently started Jobs happen to overlap, the
-// contention is forced: a process in the Firebird pod takes the same lock
-// the Jobs use, one Job is created from every frequency's CronJob plus
-// extra ones from the hourly CronJob, and only once every Job's pod is
-// running (and so queued on the lock) is the holder killed with SIGKILL,
-// releasing all of them at the same instant. That also proves the lock
-// works across separate pods sharing the backup PVC, and that the kernel
-// drops it when its holder dies without cleaning up.
+// One Job is created from every frequency's CronJob plus extra ones from
+// the hourly CronJob, all at once, while a process in the Firebird pod
+// keeps committing rows to the database: every Job must succeed with its
+// own backup file (same-frequency runs starting within the same second
+// claim distinct timestamps), the writer must never fail, so the backups
+// never lock the database, and every backup must restore.
 //
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, after the CRDs are installed and the controller-manager is
@@ -121,7 +125,7 @@ spec:
 			return "", err
 		}
 		cmd := exec.Command("kubectl", "exec", "-i", concurrentBackupPodName, "-n", namespace, "-c", firebirdContainer,
-			"--", "isql", "-user", "SYSDBA", "-password", password, concurrentBackupDBPath)
+			"--", "isql", "-user", "SYSDBA", "-password", password, concurrentBackupDBConn)
 		cmd.Stdin = strings.NewReader(script)
 		return utils.Run(cmd)
 	}
@@ -166,8 +170,8 @@ spec:
 
 	Context("Instance scheduled backups running concurrently", Ordered, func() {
 		AfterAll(func() {
-			By("killing the lock holder, if it's still running")
-			_, _ = podExec(fmt.Sprintf("[ -f %[1]s ] && kill -9 $(cat %[1]s); rm -f %[1]s", concurrentBackupHolderPIDFile))
+			By("stopping the writer, if it's still running")
+			_, _ = podExec(fmt.Sprintf("[ -f %[1]s ] && kill $(cat %[1]s); rm -f %[1]s", concurrentBackupWriterPIDFile))
 
 			By("deleting the manually-created Jobs")
 			for _, job := range jobs {
@@ -209,23 +213,32 @@ spec:
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("writing a marker row, to check the backups' content later on")
-			_, err = runIsql("CREATE TABLE MARKER (ID INTEGER);\nCOMMIT;\nINSERT INTO MARKER VALUES (42);\nCOMMIT;\nQUIT;\n")
+			_, err = runIsql("CREATE TABLE MARKER (ID INTEGER);\nCREATE TABLE WRITES (ID INTEGER);\nCOMMIT;\n" +
+				"INSERT INTO MARKER VALUES (42);\nCOMMIT;\nQUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should serialize backups started at the same moment instead of failing any of them", func() {
-			By("holding the shared backup lock from a process in the Firebird pod")
-			holder := exec.Command("kubectl", "exec", concurrentBackupPodName, "-n", namespace, "-c", firebirdContainer,
-				"--", "sh", "-c", fmt.Sprintf("exec 9>%q; flock 9; echo $$ > %s; exec sleep 600",
-					concurrentBackupLockPath, concurrentBackupHolderPIDFile))
-			Expect(holder.Start()).To(Succeed())
-			defer func() { _ = holder.Wait() }()
-			Eventually(func() error {
-				_, err := podExec("test -s " + concurrentBackupHolderPIDFile)
-				return err
-			}, time.Minute, time.Second).Should(Succeed(), "the lock holder never acquired the lock")
+		It("should run backups started at the same moment side by side without locking the database", func() {
+			By("committing a row every half second from a writer in the Firebird pod")
+			password, err := getSecretField(concurrentBackupSecretName, "password")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = podExec(fmt.Sprintf(`echo $$ > %[1]s
+exec </dev/null >/dev/null 2>&1
+nohup sh -c 'i=0; while :; do i=$((i+1)); echo "INSERT INTO WRITES VALUES ($i); COMMIT;" | isql -q -user SYSDBA -password %[2]q %[3]q || exit 1; sleep 0.5; done' &
+echo $! > %[1]s`, concurrentBackupWriterPIDFile, password, concurrentBackupDBConn))
+			Expect(err).NotTo(HaveOccurred())
 
-			By("creating a Job from every frequency's CronJob, plus extra ones from the hourly CronJob")
+			countWrites := func() int {
+				output, err := runIsql("SELECT 'WRITES=' || COUNT(*) FROM WRITES;\nQUIT;\n")
+				Expect(err).NotTo(HaveOccurred())
+				var n int
+				_, err = fmt.Sscanf(output[strings.Index(output, "WRITES=")+len("WRITES="):], "%d", &n)
+				Expect(err).NotTo(HaveOccurred(), "parsing %q", output)
+				return n
+			}
+			Eventually(countWrites, time.Minute, time.Second).Should(BeNumerically(">", 0), "the writer never committed")
+
+			By("creating a Job from every frequency's CronJob, plus extra ones from the hourly CronJob, all at once")
 			for _, freq := range concurrentBackupFrequencies {
 				jobs = append(jobs, fmt.Sprintf("%s-concurrent-%s", concurrentBackupInstanceName, freq))
 			}
@@ -238,30 +251,6 @@ spec:
 				createJobFromCronJob(job, concurrentBackupInstanceName+"-backup-"+freq)
 			}
 
-			By("waiting until every Job's pod is running, i.e. queued on the lock")
-			Eventually(func(g Gomega) {
-				for _, job := range jobs {
-					cmd := exec.Command("kubectl", "get", "pods", "-l", "job-name="+job, "-n", namespace,
-						"-o", "jsonpath={.items[*].status.phase}")
-					output, err := utils.Run(cmd)
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(output).To(Equal("Running"), "pod of Job %s", job)
-				}
-			}, 3*time.Minute, 2*time.Second).Should(Succeed())
-
-			By("not backing anything up while another process holds the lock")
-			Consistently(func(g Gomega) {
-				for _, freq := range concurrentBackupFrequencies {
-					output, err := podExec(fmt.Sprintf("ls -1 %s/%s", concurrentBackupRoot, freq))
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(strings.Fields(output)).To(BeEmpty(), "%s backup written while the lock was held", freq)
-				}
-			}, 15*time.Second, 3*time.Second).Should(Succeed())
-
-			By("killing the lock holder with SIGKILL, releasing every queued Job at once")
-			_, err := podExec(fmt.Sprintf("kill -9 $(cat %[1]s) && rm -f %[1]s", concurrentBackupHolderPIDFile))
-			Expect(err).NotTo(HaveOccurred())
-
 			By("waiting for every Job to succeed")
 			Eventually(func(g Gomega) {
 				for _, job := range jobs {
@@ -269,13 +258,23 @@ spec:
 						"-o", "jsonpath={.status.succeeded}/{.status.failed}")
 					output, err := utils.Run(cmd)
 					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(output).NotTo(HaveSuffix("/1"), "Job %s failed", job)
+					if strings.HasSuffix(output, "/1") {
+						logs, _ := utils.Run(exec.Command("kubectl", "logs", "job/"+job, "-n", namespace))
+						StopTrying(fmt.Sprintf("Job %s failed:\n%s", job, logs)).Now()
+					}
 					g.Expect(output).To(HavePrefix("1/"), "Job %s hasn't succeeded yet", job)
 				}
 			}, 5*time.Minute, 2*time.Second).Should(Succeed())
 			for _, job := range jobs {
 				Expect(jobField(job, "{.status.failed}")).To(BeEmpty(), "Job %s failed", job)
 			}
+
+			By("having kept the writer committing throughout")
+			before := countWrites()
+			Eventually(countWrites, 30*time.Second, time.Second).Should(BeNumerically(">", before),
+				"the writer stopped committing")
+			_, err = podExec(fmt.Sprintf("kill -0 $(cat %s)", concurrentBackupWriterPIDFile))
+			Expect(err).NotTo(HaveOccurred(), "the writer exited, so one of its commits failed")
 
 			// A frequency's real schedule can tick while this runs (the
 			// hourly one at every :00), adding its own backup to the
@@ -291,11 +290,11 @@ spec:
 				files := listBackupFiles(freq)
 				Expect(len(files)).To(BeNumerically(">=", want), "%s backups: %v", freq, files)
 				for _, f := range files {
-					Expect(f).To(MatchRegexp(`^concurrent-[0-9]{8}T[0-9]{6}Z\.nbk\.gz$`), "%s backup", freq)
+					Expect(f).To(MatchRegexp(`^concurrent-[0-9]{8}T[0-9]{6}Z\.fbk\.gz$`), "%s backup", freq)
 				}
 			}
 
-			By("leaving the database out of physical backup mode")
+			By("never putting the database into physical backup mode")
 			output, err := runIsql("SELECT 'STATE=' || MON$BACKUP_STATE FROM MON$DATABASE;\nQUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(ContainSubstring("STATE=0"))
@@ -309,17 +308,17 @@ spec:
 		})
 
 		It("should have taken backups that restore to the database's content", func() {
-			By("restoring every frequency's backup with nbackup into a scratch database")
+			By("restoring every frequency's backup with gbak into a scratch database")
 			password, err := getSecretField(concurrentBackupSecretName, "password")
 			Expect(err).NotTo(HaveOccurred())
 			for _, freq := range concurrentBackupFrequencies {
 				for _, f := range listBackupFiles(freq) {
 					output, err := podExec(fmt.Sprintf(`set -e
-rm -f /tmp/restore.nbk /tmp/restore.fdb
-gunzip -c %[1]q > /tmp/restore.nbk
-nbackup -R /tmp/restore.fdb /tmp/restore.nbk
+rm -f /tmp/restore.fbk /tmp/restore.fdb
+gunzip -c %[1]q > /tmp/restore.fbk
+gbak -create /tmp/restore.fbk /tmp/restore.fdb
 echo "SELECT 'MARKER=' || ID FROM MARKER;" | isql -q -user SYSDBA -password %[2]q /tmp/restore.fdb
-rm -f /tmp/restore.nbk /tmp/restore.fdb`, concurrentBackupRoot+"/"+freq+"/"+f, password))
+rm -f /tmp/restore.fbk /tmp/restore.fdb`, concurrentBackupRoot+"/"+freq+"/"+f, password))
 					Expect(err).NotTo(HaveOccurred(), "restoring %s/%s", freq, f)
 					Expect(output).To(ContainSubstring("MARKER=42"), "restoring %s/%s", freq, f)
 				}

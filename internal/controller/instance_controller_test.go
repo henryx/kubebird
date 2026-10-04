@@ -899,15 +899,15 @@ var _ = Describe("Instance Controller", func() {
 			Expect(cronJob.Spec.Schedule).To(Equal("0 * * * *"))
 			Expect(cronJob.Spec.ConcurrencyPolicy).To(Equal(batchv1.ForbidConcurrent))
 			Expect(cronJob.Spec.JobTemplate.Spec.ActiveDeadlineSeconds).To(HaveValue(Equal(int64(6*60*60))),
-				"a hung backup must not keep the shared lock, or block its CronJob, forever")
+				"a hung backup must not block its CronJob forever")
 
 			command := cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Command
 			Expect(command).To(ContainElement(ContainSubstring("fbsvcmgr")))
-			Expect(command).To(ContainElement(ContainSubstring("-action_nbak")))
+			Expect(command).To(ContainElement(ContainSubstring("-action_backup")))
 			Expect(command).To(ContainElement(ContainSubstring(retentionResourceName + "/3050:service_mgr")))
-			Expect(command).To(ContainElement(ContainSubstring(testDatabaseName[:len(testDatabaseName)-len(".fdb")] + "-$TS.nbk")))
-			Expect(command).NotTo(ContainElement(ContainSubstring("security3-$TS.nbk")),
-				"the security database can't be nbackup'd while the server has it open, neither locally nor remotely, so it's deliberately excluded")
+			Expect(command).To(ContainElement(ContainSubstring(testDatabaseName[:len(testDatabaseName)-len(".fdb")] + "-$TS.fbk")))
+			Expect(command).NotTo(ContainElement(ContainSubstring("security3-$TS.fbk")),
+				"the security database can't be backed up while the server has it open, neither locally nor remotely, so it's deliberately excluded")
 			Expect(command).NotTo(ContainElement(ContainSubstring("gzip")),
 				"the Job only gzips its backups when spec.backup.compress is true")
 

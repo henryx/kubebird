@@ -47,7 +47,7 @@ const (
 // Instance is ready, a manually-triggered run of that CronJob backs up the
 // database (but deliberately not the security database — see
 // scheduledBackupScript in internal/controller/instance_backup_schedule.go
-// for why) via fbsvcmgr's remote nbackup action and gzips the result
+// for why) via fbsvcmgr's remote gbak action and gzips the result
 // (spec.backup.compress), a second run lands alongside the first (each
 // file is named after its run's own UTC timestamp) while a backup older
 // than the retention window is pruned, and unsetting
@@ -172,13 +172,13 @@ spec:
 				g.Expect(output).To(Equal("1"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 
-			By("writing one gzip-compressed backup file for the database via fbsvcmgr's remote nbackup")
+			By("writing one gzip-compressed backup file for the database via fbsvcmgr's remote gbak")
 			files := listBackupFiles()
 			Expect(files).To(HaveLen(1), "expected exactly one backup file, for scheduled.fdb")
 			Expect(files[0]).To(HavePrefix("scheduled-"))
-			Expect(files[0]).To(HaveSuffix(".nbk.gz"), "expected the Job itself to gzip the backup, since spec.backup.compress is true")
+			Expect(files[0]).To(HaveSuffix(".fbk.gz"), "expected the Job itself to gzip the backup, since spec.backup.compress is true")
 
-			By("never attempting the security database, since it can't be nbackup'd while the server has it open")
+			By("never attempting the security database, since the Services API refuses it while the server has it open")
 			for _, f := range files {
 				Expect(f).NotTo(HavePrefix("security"))
 			}
@@ -192,7 +192,7 @@ spec:
 		})
 
 		It("should keep a second run alongside the first and prune backups older than the retention window", func() {
-			const expiredBackup = "scheduled-20000101T000000Z.nbk.gz"
+			const expiredBackup = "scheduled-20000101T000000Z.fbk.gz"
 
 			By("planting a backup file far older than the 2h retention window")
 			cmd := exec.Command("kubectl", "exec", scheduledBackupPodName, "-n", namespace, "-c", firebirdContainer,
@@ -227,7 +227,7 @@ spec:
 				g.Expect(files).NotTo(ContainElement(expiredBackup))
 				for _, f := range files {
 					g.Expect(f).To(HavePrefix("scheduled-"))
-					g.Expect(f).To(HaveSuffix(".nbk.gz"))
+					g.Expect(f).To(HaveSuffix(".fbk.gz"))
 				}
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})

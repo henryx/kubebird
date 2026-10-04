@@ -121,9 +121,10 @@ func TestRetentionDateAgo(t *testing.T) {
 // scheduledBackupScript's own usage) against a real temporary directory:
 // with "3d", only backups whose file name timestamp is more than three
 // days old are deleted, compressed or not, while recent ones and files not
-// following the scheduled backup naming are left alone. Fixture
-// timestamps are relative to the real clock, since the script's own
-// cutoff is.
+// following the scheduled backup naming are left alone. ".nbk" backups
+// left by Kubebird 0.3.1 and earlier expire the same way, and so do
+// timestamp claims left behind by killed runs. Fixture timestamps are
+// relative to the real clock, since the script's own cutoff is.
 func TestPruneScheduledBackupsScript(t *testing.T) {
 	retention, err := parseRetention("3d")
 	if err != nil {
@@ -134,18 +135,28 @@ func TestPruneScheduledBackupsScript(t *testing.T) {
 	stamp := func(ago time.Duration) string { return now.Add(-ago).Format("20060102T150405Z") }
 
 	expired := []string{
-		"instance-" + stamp(4*24*time.Hour) + ".nbk.gz",
-		"instance-" + stamp(3*24*time.Hour+time.Hour) + ".nbk",
+		"instance-" + stamp(4*24*time.Hour) + ".fbk.gz",
+		"instance-" + stamp(3*24*time.Hour+time.Hour) + ".fbk",
+		"instance-" + stamp(5*24*time.Hour) + ".nbk.gz", // Kubebird 0.3.1 and earlier
+		"instance-" + stamp(5*24*time.Hour) + ".nbk",
 	}
+	expiredClaims := []string{scheduledBackupClaimPrefix + stamp(4*24*time.Hour)}
 	kept := []string{
-		"instance-" + stamp(3*24*time.Hour-time.Hour) + ".nbk.gz",
-		"instance-" + stamp(time.Hour) + ".nbk",
-		"instance-1.nbk.gz", // not timestamp-named: ignored
+		"instance-" + stamp(3*24*time.Hour-time.Hour) + ".fbk.gz",
+		"instance-" + stamp(time.Hour) + ".fbk",
+		"instance-" + stamp(time.Hour) + ".nbk.gz",
+		"instance-1.fbk.gz", // not timestamp-named: ignored
 		"notes.txt",         // unrelated: ignored
 	}
+	keptClaims := []string{scheduledBackupClaimPrefix + stamp(time.Hour)}
 	for _, name := range append(slices.Clone(expired), kept...) {
 		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
 			t.Fatalf("failed to create fixture file: %v", err)
+		}
+	}
+	for _, name := range append(slices.Clone(expiredClaims), keptClaims...) {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatalf("failed to create fixture claim: %v", err)
 		}
 	}
 
@@ -163,16 +174,16 @@ func TestPruneScheduledBackupsScript(t *testing.T) {
 		got = append(got, e.Name())
 	}
 	slices.Sort(got)
-	want := slices.Clone(kept)
+	want := append(slices.Clone(kept), keptClaims...)
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
-		t.Errorf("remaining files = %v, want %v (expired: %v)", got, want, expired)
+		t.Errorf("remaining files = %v, want %v (expired: %v, %v)", got, want, expired, expiredClaims)
 	}
 }
 
 // TestPruneScheduledBackupsScriptEmptyDir confirms pruning an empty
 // directory succeeds under "set -e" — the very first run for a frequency,
-// where both globs match nothing and stay literal.
+// where every glob matches nothing and stays literal.
 func TestPruneScheduledBackupsScriptEmptyDir(t *testing.T) {
 	retention, err := parseRetention("1h")
 	if err != nil {
@@ -187,19 +198,26 @@ func TestPruneScheduledBackupsScriptEmptyDir(t *testing.T) {
 // TestScheduledBackupUniqueTimestampScript executes
 // scheduledBackupUniqueTimestampScript's rendered snippet via a real "sh"
 // against a real temporary directory already holding backups (compressed
-// or not, of different databases) for the current second and the next two:
-// the $TS it settles on must be none of them, so a run of the same
-// frequency right after another one never reuses its file names.
+// or not, of different databases) for the current second and the next
+// two, plus another run's claim on the third: the $TS it settles on must
+// be none of them, so a run of the same frequency right after, or at the
+// same time as, another one never reuses its file names. Its own claim
+// must be gone once the script exits.
 func TestScheduledBackupUniqueTimestampScript(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
 	taken := map[string]bool{}
-	for i, name := range []string{"instance-%s.nbk", "other-%s.nbk.gz", "instance-%s.nbk.gz"} {
+	for i, name := range []string{"instance-%s.fbk", "other-%s.fbk.gz", "instance-%s.fbk.gz"} {
 		ts := now.Add(time.Duration(i) * time.Second).Format("20060102T150405Z")
 		taken[ts] = true
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf(name, ts)), nil, 0o600); err != nil {
 			t.Fatalf("failed to create fixture file: %v", err)
 		}
+	}
+	claimed := now.Add(3 * time.Second).Format("20060102T150405Z")
+	taken[claimed] = true
+	if err := os.Mkdir(filepath.Join(dir, scheduledBackupClaimPrefix+claimed), 0o700); err != nil {
+		t.Fatalf("failed to create fixture claim: %v", err)
 	}
 
 	script := "set -e\n" + scheduledBackupUniqueTimestampScript(dir) + "echo \"$TS\"\n"
@@ -212,27 +230,24 @@ func TestScheduledBackupUniqueTimestampScript(t *testing.T) {
 		t.Fatalf("$TS = %q, want a scheduledBackupTimestampDate timestamp: %v", ts, err)
 	}
 	if taken[ts] {
-		t.Errorf("$TS = %q, which a backup in %s already carries", ts, dir)
+		t.Errorf("$TS = %q, which a backup or claim in %s already carries", ts, dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, scheduledBackupClaimPrefix+ts)); !os.IsNotExist(err) {
+		t.Errorf("claim on %q still there after the script exited (err = %v)", ts, err)
 	}
 }
 
-// TestScheduledBackupLockedRunsConcurrently starts several runs at once,
-// each taking an flock on a shared lock file the same way
-// scheduledBackupScript does, then settling on a unique $TS
-// (scheduledBackupUniqueTimestampScript) and creating its "backup" file
-// with it: every run must succeed and end up with its own file, even
-// though they all start within the same second — the case of a Job created
-// by hand from a CronJob while that CronJob's scheduled run is in flight.
-func TestScheduledBackupLockedRunsConcurrently(t *testing.T) {
-	if _, err := exec.LookPath("flock"); err != nil {
-		t.Skip("flock not available")
-	}
+// TestScheduledBackupRunsConcurrently starts several runs at once, each
+// settling on a unique $TS (scheduledBackupUniqueTimestampScript) and
+// creating its "backup" file with it: every run must succeed and end up
+// with its own file, even though they all start within the same second —
+// the case of a Job created by hand from a CronJob while that CronJob's
+// scheduled run is in flight. No claim may be left behind.
+func TestScheduledBackupRunsConcurrently(t *testing.T) {
 	const runs = 3
 	dir := t.TempDir()
-	lock := filepath.Join(t.TempDir(), "lock")
-	script := fmt.Sprintf("set -e\nexec 9>%q\nflock 9\n", lock) +
-		scheduledBackupUniqueTimestampScript(dir) +
-		fmt.Sprintf("touch %q/instance-\"$TS\".nbk\n", dir)
+	script := "set -e\n" + scheduledBackupUniqueTimestampScript(dir) +
+		fmt.Sprintf("touch %q/instance-\"$TS\".fbk\n", dir)
 
 	errs := make(chan error, runs)
 	for range runs {
@@ -255,7 +270,12 @@ func TestScheduledBackupLockedRunsConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(entries) != runs {
-		t.Errorf("got %d backup files, want %d (one per run)", len(entries), runs)
+		t.Errorf("got %d entries %v, want %d backup files (one per run) and no claims", len(entries), entries, runs)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), scheduledBackupClaimPrefix) {
+			t.Errorf("claim %q left behind", e.Name())
+		}
 	}
 }
 
@@ -349,27 +369,29 @@ func TestScheduledBackupScript(t *testing.T) {
 	script := scheduledBackupScript(instance, hour)
 
 	for _, want := range []string{
-		`exec 9>"/var/lib/firebird/backup/.scheduled-backup.lock"`,
-		"flock 9\n",
 		"TS=$(date -u +%Y%m%dT%H%M%SZ)",
-		`while ls "/var/lib/firebird/backup/hour"/*-"$TS".nbk* >/dev/null 2>&1; do`,
+		`if mkdir "/var/lib/firebird/backup/hour"/.claim-"$TS" 2>/dev/null; then`,
+		`ls "/var/lib/firebird/backup/hour"/*-"$TS".fbk* >/dev/null 2>&1 || break`,
+		`trap 'rmdir "/var/lib/firebird/backup/hour"/.claim-"$TS"' EXIT`,
 		"fbsvcmgr",
 		"test/3050:service_mgr",
-		"-action_nbak",
-		"-nbk_level 0",
+		"-action_backup",
 		`-dbname "/var/lib/firebird/data/instance.fdb"`,
-		`-nbk_file "/var/lib/firebird/backup/hour/instance-$TS.nbk"`,
+		`-bkp_file "/var/lib/firebird/backup/hour/instance-$TS.fbk"`,
 		"$SYSDBA_PASSWORD",
 		`CUTOFF=$(date -u -d "3 hours ago" +%Y%m%dT%H%M%SZ)`,
-		`for f in "/var/lib/firebird/backup/hour"/*.nbk "/var/lib/firebird/backup/hour"/*.nbk.gz; do`,
+		`for f in "/var/lib/firebird/backup/hour"/*.fbk "/var/lib/firebird/backup/hour"/*.fbk.gz "/var/lib/firebird/backup/hour"/*.nbk "/var/lib/firebird/backup/hour"/*.nbk.gz; do`,
 		`rm -f "$f"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("scheduledBackupScript output missing %q; got:\n%s", want, script)
 		}
 	}
-	if lock := strings.Index(script, "flock 9"); lock < 0 || lock > strings.Index(script, "TS=") || lock > strings.Index(script, "fbsvcmgr") {
-		t.Errorf("scheduledBackupScript must hold the shared backup lock before timestamping or backing up anything; got:\n%s", script)
+	if strings.Contains(script, "flock") || strings.Contains(script, "-action_nbak") {
+		t.Errorf("scheduledBackupScript must back up with gbak (-action_backup), which needs no lock between concurrent runs; got:\n%s", script)
+	}
+	if claim := strings.Index(script, "trap "); claim < 0 || claim > strings.Index(script, "fbsvcmgr") {
+		t.Errorf("scheduledBackupScript must claim its timestamp before backing up anything; got:\n%s", script)
 	}
 	if strings.Index(script, "CUTOFF=") < strings.LastIndex(script, "fbsvcmgr") {
 		t.Errorf("scheduledBackupScript must prune only after every backup succeeded; got:\n%s", script)
@@ -378,7 +400,7 @@ func TestScheduledBackupScript(t *testing.T) {
 		t.Errorf("scheduledBackupScript should not compress its output when spec.backup.compress is false; got:\n%s", script)
 	}
 	if strings.Contains(script, "security3.fdb") {
-		t.Errorf("scheduledBackupScript should not attempt to back up the security database, since it can't be nbackup'd while the server has it open; got:\n%s", script)
+		t.Errorf("scheduledBackupScript should not attempt to back up the security database, since the Services API refuses it while the server has it open; got:\n%s", script)
 	}
 }
 
@@ -408,8 +430,8 @@ func TestScheduledBackupScriptCompress(t *testing.T) {
 	script := scheduledBackupScript(instance, hour)
 
 	for _, db := range []string{"instance", "other"} {
-		dst := fmt.Sprintf("/var/lib/firebird/backup/hour/%s-$TS.nbk", db)
-		backup := strings.Index(script, fmt.Sprintf("-nbk_file %q", dst))
+		dst := fmt.Sprintf("/var/lib/firebird/backup/hour/%s-$TS.fbk", db)
+		backup := strings.Index(script, fmt.Sprintf("-bkp_file %q", dst))
 		compress := strings.Index(script, fmt.Sprintf("gzip -f %q", dst))
 		if backup < 0 || compress < 0 {
 			t.Fatalf("scheduledBackupScript output missing backup or gzip of %q; got:\n%s", dst, script)

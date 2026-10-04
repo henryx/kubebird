@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed
+
+- Scheduled backups (`spec.backup.retention`) are now `gbak` backups instead of `nbackup` ones, still
+  taken by the instance's own live server through the Services API (`fbsvcmgr -action_backup`
+  instead of `-action_nbak`). They're written as `<frequency>/<database>-<timestamp>.fbk` (`.fbk.gz`
+  when `spec.backup.compress` is `true`) and restored with `gbak -create` instead of `nbackup -R`.
+  A `gbak` backup never puts the database into physical backup mode: writes and schema changes
+  carry on while it runs, and backups of the same database no longer conflict with each other, so
+  the hangs and "Database is already in the physical backup mode" failures they could hit are gone.
+  `.nbk` backups left by earlier versions stay where they are and are pruned under the same
+  retention as the new ones. The security database is still not covered by scheduled backups, since
+  the Services API refuses it while the server has it open.
+- Scheduled backup Jobs no longer take the shared `.scheduled-backup.lock` `flock`, since concurrent
+  `gbak` backups don't need it: overlapping runs (e.g. the hourly and daily ones at 00:00 UTC) now
+  run side by side instead of waiting for each other. The lock file left on the backup volume by
+  0.3.1 is no longer used and can be deleted. Two runs of the same frequency starting within the
+  same second still never share a file name: each run claims its timestamp with a
+  `.claim-<timestamp>` directory, created atomically, before using it. The 6-hour
+  `activeDeadlineSeconds` stays, so a hung backup still can't stop its frequency's backups for good.
+
+## 0.3.1
+
 ### Added
 
 - Kubebird now labels the objects it generates for an `Instance` with
