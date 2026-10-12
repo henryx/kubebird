@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -221,7 +222,16 @@ func securityDatabaseImageDefaultPath(instance *kubebirdv1.Instance) string {
 // the instance's Firebird major version, e.g. "security3.fdb" for version
 // "3.0.14".
 func securityDatabaseFileName(instance *kubebirdv1.Instance) string {
-	major, _, _ := strings.Cut(instance.Spec.Version, ".")
+	return securityDatabaseFileNameForVersion(instance.Spec.Version)
+}
+
+// securityDatabaseFileNameForVersion returns the security database's file
+// name for the given Firebird version, e.g. "security3.fdb" for "3.0.14" —
+// what securityDatabaseFileName returns for spec.version, but for another
+// version too, e.g. the one still running while a major version upgrade
+// backs it up (see reconcileMajorUpgrade).
+func securityDatabaseFileNameForVersion(version string) string {
+	major, _, _ := strings.Cut(version, ".")
 	if major == "" {
 		major = "4"
 	}
@@ -274,42 +284,136 @@ func databaseCreateScript(db kubebirdv1.DatabaseSpec) string {
 	return b.String()
 }
 
-// securityDatabaseBackupPath returns where backupSecurityDatabaseOffline
-// leaves the instance's security database backup inside the backup
-// volume's base subdirectory (see instanceBackupDir), e.g.
-// "/var/lib/firebird/backup/base/security3.fbk" — a gbak archive, just
-// like every other database's backup (see backupFileName), restored by
-// securityDatabaseInitScript with its own local gbak restore.
-func securityDatabaseBackupPath(instance *kubebirdv1.Instance) string {
-	return path.Join(instanceBackupDir(), backupFileName(securityDatabaseFileName(instance)))
+// securityDatabaseBackupPathForVersion returns where backupDatabasesOffline
+// leaves the security database backup of the given Firebird version
+// inside the backup volume's base subdirectory (see instanceBackupDir),
+// e.g. "/var/lib/firebird/backup/base/security3.fbk" for "3.0.14" — a gbak
+// archive, just like every other database's backup (see backupFileName),
+// restored by securityDatabaseInitScript with its own local gbak restore.
+func securityDatabaseBackupPathForVersion(version string) string {
+	return path.Join(instanceBackupDir(), backupFileName(securityDatabaseFileNameForVersion(version)))
 }
+
+// securityDatabaseBackupPattern matches the file name of a security
+// database backup of any Firebird major version (e.g. "security3.fbk"),
+// as left in the backup volume's base subdirectory by backupDatabasesOffline.
+// A backup of an older major version stays there after an upgrade (see
+// securityDatabaseInitScript), so none of them is ever a spec.databases
+// entry's (see orphanedBackups).
+var securityDatabaseBackupPattern = regexp.MustCompile(`^security[0-9]+\.fbk$`)
+
+// securityMigrationScript is the isql script, from the Firebird 4.0
+// migration guide's "Migrating user list from Firebird 3.0"
+// (https://ib-aid.com/download/docs/fb4migrationguide.html#_migrating_user_list),
+// that copies every user but SYSDBA from a Firebird 3.0 security database,
+// restored by the new version's gbak as a separate database at %s, into
+// the new version's own security database isql is connected to: both the
+// Srp users (PLG$SRP, password verifiers included, so passwords carry over)
+// and the Legacy_UserManager ones (PLG$USERS). SYSDBA is left out because
+// the image's entrypoint sets it from FIREBIRD_ROOT_PASSWORD on every
+// start anyway. The guide prefers this over restoring the old security
+// database as the new one, which would lose the new version's own changes
+// to it. See securityDatabaseInitScript.
+const securityMigrationScript = `set term ^;
+EXECUTE BLOCK
+AS
+  DECLARE SRC_SEC_DB     VARCHAR(255) = '%s';
+  DECLARE SRC_SEC_USER   VARCHAR(63) = 'SYSDBA';
+  DECLARE PLG$USER_NAME  SEC$USER_NAME;
+  DECLARE PLG$VERIFIER   VARCHAR(128) CHARACTER SET OCTETS;
+  DECLARE PLG$SALT       VARCHAR(32) CHARACTER SET OCTETS;
+  DECLARE PLG$COMMENT    BLOB SUB_TYPE TEXT CHARACTER SET UTF8;
+  DECLARE PLG$FIRST      SEC$NAME_PART;
+  DECLARE PLG$MIDDLE     SEC$NAME_PART;
+  DECLARE PLG$LAST       SEC$NAME_PART;
+  DECLARE PLG$ATTRIBUTES BLOB SUB_TYPE TEXT CHARACTER SET UTF8;
+  DECLARE PLG$ACTIVE     BOOLEAN;
+  DECLARE PLG$GROUP_NAME SEC$USER_NAME;
+  DECLARE PLG$UID        PLG$ID;
+  DECLARE PLG$GID        PLG$ID;
+  DECLARE PLG$PASSWD     PLG$PASSWD;
+BEGIN
+  FOR EXECUTE STATEMENT Q'!
+      SELECT PLG$USER_NAME, PLG$VERIFIER, PLG$SALT, PLG$COMMENT, PLG$FIRST,
+             PLG$MIDDLE, PLG$LAST, PLG$ATTRIBUTES, PLG$ACTIVE
+      FROM PLG$SRP
+      WHERE PLG$USER_NAME <> 'SYSDBA'
+!'
+      ON EXTERNAL :SRC_SEC_DB
+      AS USER :SRC_SEC_USER
+      INTO :PLG$USER_NAME, :PLG$VERIFIER, :PLG$SALT, :PLG$COMMENT, :PLG$FIRST,
+           :PLG$MIDDLE, :PLG$LAST, :PLG$ATTRIBUTES, :PLG$ACTIVE
+  DO
+    INSERT INTO PLG$SRP (PLG$USER_NAME, PLG$VERIFIER, PLG$SALT, PLG$COMMENT, PLG$FIRST,
+                         PLG$MIDDLE, PLG$LAST, PLG$ATTRIBUTES, PLG$ACTIVE)
+    VALUES (:PLG$USER_NAME, :PLG$VERIFIER, :PLG$SALT, :PLG$COMMENT, :PLG$FIRST,
+            :PLG$MIDDLE, :PLG$LAST, :PLG$ATTRIBUTES, :PLG$ACTIVE);
+  FOR EXECUTE STATEMENT Q'!
+      SELECT PLG$USER_NAME, PLG$GROUP_NAME, PLG$UID, PLG$GID, PLG$PASSWD,
+             PLG$COMMENT, PLG$FIRST_NAME, PLG$MIDDLE_NAME, PLG$LAST_NAME
+      FROM PLG$USERS
+      WHERE PLG$USER_NAME <> 'SYSDBA'
+!'
+      ON EXTERNAL :SRC_SEC_DB
+      AS USER :SRC_SEC_USER
+      INTO :PLG$USER_NAME, :PLG$GROUP_NAME, :PLG$UID, :PLG$GID, :PLG$PASSWD,
+           :PLG$COMMENT, :PLG$FIRST, :PLG$MIDDLE, :PLG$LAST
+  DO
+    INSERT INTO PLG$USERS (PLG$USER_NAME, PLG$GROUP_NAME, PLG$UID, PLG$GID, PLG$PASSWD,
+                           PLG$COMMENT, PLG$FIRST_NAME, PLG$MIDDLE_NAME, PLG$LAST_NAME)
+    VALUES (:PLG$USER_NAME, :PLG$GROUP_NAME, :PLG$UID, :PLG$GID, :PLG$PASSWD,
+            :PLG$COMMENT, :PLG$FIRST, :PLG$MIDDLE, :PLG$LAST);
+END^
+set term ;^
+commit;
+exit;
+`
 
 // securityDatabaseInitScript renders the shell script run by the
 // security-database-init initContainer (see mutateStatefulSet) before the
 // firebird container starts, if the security database isn't already
 // present on the primary PVC — the normal case is a brand-new PVC, since
-// releasePrimaryAndShadowStorage always deletes the primary PVC on
-// Instance deletion, so a freshly created or recreated Instance always
-// needs seeding; the check only ever finds one already there across a
-// plain pod restart within the same Instance's lifetime. It's seeded
-// from, in preference order:
+// releasePrimaryAndShadowStorage deletes the primary PVC on Instance
+// deletion and on a major version upgrade (see reconcileMajorUpgrade), so
+// a freshly created, recreated or upgraded Instance always needs seeding;
+// the check only ever finds one already there across a plain pod restart.
+// When a backup volume exists (backupVolumeSpec), it's seeded from the
+// most recently written security database backup in the backup volume's
+// base subdirectory (backupDatabasesOffline's "security<M>.fbk", see
+// securityDatabaseBackupPathForVersion) of a Firebird major version M no
+// newer than spec.version's own N — the most recent one, rather than
+// security<N>.fbk first, since right after an upgrade from M the backup
+// of M is the one just taken, while a security<N>.fbk can only be one left
+// behind long before:
 //
-//  1. its own backup, if a backup volume exists (backupVolumeSpec) and
-//     backupDatabases left one behind at securityDatabaseBackupPath — e.g.
-//     this Instance is recreating one deleted earlier under the same name
-//     with a backup volume — restored with a local
-//     "gbak -create" (no host given, so it runs against the image's own
-//     local engine directly rather than a network connection, which is
-//     the only option anyway: no firebird server is listening yet at this
-//     point in the Pod's startup), carrying over whatever users/roles it
-//     held instead of falling back to the image's stock ones. This local
-//     restore needs no -user/-password: there's no pre-existing security
-//     database yet for gbak to authenticate the connection against in the
-//     first place, so the engine accepts the local connection unchecked
-//     — confirmed against the actual image, not just documentation;
-//  2. otherwise, the image's own baked-in default
-//     (securityDatabaseImageDefaultPath) — a plain file copy, since it's
-//     a raw database file rather than a gbak archive.
+//  1. M is N (e.g. this Instance is recreating one deleted earlier under
+//     the same name), or M is older than N but newer than 3 (an upgrade,
+//     e.g. 4 to 5): restored with a local "gbak -create" (no host given,
+//     so it runs against the image's own local engine directly, the only
+//     option anyway since no server is listening yet), carrying over its
+//     users and roles. This needs no -user/-password, since there's no
+//     pre-existing security database yet for gbak to authenticate the
+//     connection against — confirmed against the actual images, as is
+//     restoring a 4.0 one with 5.0's gbak;
+//  2. M is 3 and N newer (an upgrade from Firebird 3, in place or by
+//     recreating the Instance): following the Firebird 4.0 migration
+//     guide, the backup is restored as a separate database, the image's
+//     own default security database is seeded as in 3., and
+//     securityMigrationScript, run by isql in embedded mode (again, no
+//     server yet, and -b so any failed statement fails the script),
+//     copies the users from the former into the latter.
+//     Built under a temporary name and only then renamed into place, so a
+//     failure partway leaves nothing behind for the next pod start to
+//     mistake for a finished security database. Confirmed against the
+//     actual 3.0.14, 4.0.3 and 5.0.4 images that a user created on 3.0
+//     logs in with its old password on 4.0 and 5.0 afterwards;
+//  3. otherwise (no backup volume, or no such backup), the image's own
+//     baked-in default (securityDatabaseImageDefaultPath) — a plain file
+//     copy, since it's a raw database file rather than a gbak archive.
+//
+// The script depends only on spec (version and backup volume), never on
+// status.upgrade, so finishing an upgrade doesn't change the pod template
+// and restart the pod once more.
 func securityDatabaseInitScript(instance *kubebirdv1.Instance) string {
 	if backupVolumeSpec(instance) == nil {
 		return fmt.Sprintf(`set -e
@@ -319,15 +423,43 @@ fi
 `, securityDatabasePath(instance), securityDatabaseImageDefaultPath(instance))
 	}
 
+	major, _, _ := strings.Cut(securityDatabaseFileName(instance), ".")
+	major = strings.TrimPrefix(major, "security")
+	dst := securityDatabasePath(instance)
+	migrated := path.Join(primaryDataMountPath, ".security-migrated.fdb")
+	source := path.Join(primaryDataMountPath, ".security-migration-source.fdb")
 	return fmt.Sprintf(`set -e
 if [ ! -f %[1]q ]; then
-	if [ -f %[3]q ]; then
-		%[4]s -create -verify %[3]q %[1]q
-	else
+	SRC=
+	SRC_MAJOR=
+	for f in $(ls -t %[3]q/security*.fbk 2>/dev/null); do
+		m=$(basename "$f" .fbk)
+		m=${m#security}
+		case "$m" in ''|*[!0-9]*) continue ;; esac
+		if [ "$m" -le %[4]s ]; then
+			SRC=$f
+			SRC_MAJOR=$m
+			break
+		fi
+	done
+	if [ -z "$SRC" ]; then
 		cp %[2]q %[1]q
+	elif [ "$SRC_MAJOR" -eq 3 ] && [ %[4]s -gt 3 ]; then
+		echo "Migrating the users of $SRC into Firebird %[4]s's security database"
+		rm -f %[6]q %[7]q
+		cp %[2]q %[6]q
+		%[5]s -create "$SRC" %[7]q
+		%[8]s -q -b %[9]s %[10]s %[6]q <<'SQLEOF'
+%[11]sSQLEOF
+		rm -f %[7]q
+		mv %[6]q %[1]q
+	else
+		echo "Restoring the security database from $SRC"
+		%[5]s -create -verify "$SRC" %[1]q
 	fi
 fi
-`, securityDatabasePath(instance), securityDatabaseImageDefaultPath(instance), securityDatabaseBackupPath(instance), binGbak)
+`, dst, securityDatabaseImageDefaultPath(instance), instanceBackupDir(), major, binGbak,
+		migrated, source, binIsql, flagUser, sysdbaUsername, fmt.Sprintf(securityMigrationScript, source))
 }
 
 // execInPod runs command inside the firebird container of podName,
@@ -400,16 +532,16 @@ func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, pod
 // different database list, or a database was dropped from spec.databases
 // after spec.backup was enabled. Reports the database names those
 // orphaned backups belong to (reversing backupFileName), sorted. The
-// security database's own backup (securityDatabaseBackupPath) is excluded
-// even though it shares the same .fbk directory and naming scheme: it has
-// no corresponding spec.databases entry to match by design, so it would
-// otherwise always show up as orphaned.
+// security database's own backups (securityDatabaseBackupPattern, of the
+// current Firebird major version or, after an upgrade, an older one) are
+// excluded even though they share the same .fbk directory and naming
+// scheme: they have no corresponding spec.databases entry to match by
+// design, so they would otherwise always show up as orphaned.
 func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kubebirdv1.Instance, podName string) ([]string, error) {
 	desired := make(map[string]bool, len(instance.Spec.Databases))
 	for _, db := range instance.Spec.Databases {
 		desired[db.Name] = true
 	}
-	securityBackupName := path.Base(securityDatabaseBackupPath(instance))
 
 	dir := instanceBackupDir()
 	// Redirects stderr to /dev/null and always exits 0: the directory
@@ -423,7 +555,7 @@ func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kube
 
 	var orphaned []string
 	for name := range strings.FieldsSeq(output) {
-		if !strings.HasSuffix(name, ".fbk") || name == securityBackupName {
+		if !strings.HasSuffix(name, ".fbk") || securityDatabaseBackupPattern.MatchString(name) {
 			continue
 		}
 		if dbName := strings.TrimSuffix(name, ".fbk") + ".fdb"; !desired[dbName] {
@@ -501,6 +633,20 @@ func backupImage(instance *kubebirdv1.Instance) string {
 	return fmt.Sprintf("%s:%s", instance.Spec.Image, instance.Spec.Version)
 }
 
+// databaseBackupImage returns the image createDatabaseBackupPod runs to
+// back up databases written by the given Firebird version: backupImage
+// for spec.version itself, but "<spec.image>:<version>" for any other,
+// ignoring spec.backup.image, since only that version's own engine is sure
+// to open its databases — e.g. a 4.0 engine refuses a 3.0 database's
+// on-disk structure, so a major version upgrade (see reconcileMajorUpgrade)
+// must back up with the version it's upgrading from.
+func databaseBackupImage(instance *kubebirdv1.Instance, version string) string {
+	if version == instance.Spec.Version {
+		return backupImage(instance)
+	}
+	return fmt.Sprintf("%s:%s", instance.Spec.Image, version)
+}
+
 // databaseBackupScript renders the shell script run by the helper Pod
 // createDatabaseBackupPod creates: a local (no host) "gbak -backup" for
 // every database in instance.Status.Databases, plus the security
@@ -509,7 +655,10 @@ func backupImage(instance *kubebirdv1.Instance) string {
 // run as root, a local gbak backup of an already-existing database
 // (security database included) doesn't validate them against
 // anything — confirmed against the actual image, not just documentation.
-func databaseBackupScript(instance *kubebirdv1.Instance) string {
+//
+// version is the Firebird version that wrote the databases, which picks
+// the security database's file name (see securityDatabaseFileNameForVersion).
+func databaseBackupScript(instance *kubebirdv1.Instance, version string) string {
 	var b strings.Builder
 	b.WriteString("set -e\n")
 	fmt.Fprintf(&b, "mkdir -p %q\n", instanceBackupDir())
@@ -518,7 +667,8 @@ func databaseBackupScript(instance *kubebirdv1.Instance) string {
 		dst := path.Join(instanceBackupDir(), backupFileName(name))
 		fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak, src, dst)
 	}
-	fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak, securityDatabasePath(instance), securityDatabaseBackupPath(instance))
+	fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak,
+		path.Join(primaryDataMountPath, securityDatabaseFileNameForVersion(version)), securityDatabaseBackupPathForVersion(version))
 	return b.String()
 }
 
@@ -548,13 +698,16 @@ func databaseBackupScript(instance *kubebirdv1.Instance) string {
 // means every backup in this run comes from the exact same quiesced,
 // fully-stopped snapshot instead of a live one gbak's own transaction
 // semantics merely made internally consistent.
-func (r *InstanceReconciler) backupDatabasesOffline(ctx context.Context, instance *kubebirdv1.Instance) error {
+//
+// version is the Firebird version that wrote the databases (see
+// createDatabaseBackupPod).
+func (r *InstanceReconciler) backupDatabasesOffline(ctx context.Context, instance *kubebirdv1.Instance, version string) error {
 	podName := databaseBackupPodName(instance)
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: instance.Namespace}, pod)
 	switch {
 	case apierrors.IsNotFound(err):
-		return r.createDatabaseBackupPod(ctx, instance)
+		return r.createDatabaseBackupPod(ctx, instance, version)
 	case err != nil:
 		return fmt.Errorf("failed to get database backup Pod: %w", err)
 	}
@@ -576,7 +729,7 @@ func (r *InstanceReconciler) backupDatabasesOffline(ctx context.Context, instanc
 		}
 		return fmt.Errorf("database backup Pod %q failed: %s", podName, reason)
 	default:
-		return fmt.Errorf("waiting for database backup Pod %q to complete", podName)
+		return waiting("waiting for database backup Pod %q to complete", podName)
 	}
 }
 
@@ -594,7 +747,11 @@ func (r *InstanceReconciler) backupDatabasesOffline(ctx context.Context, instanc
 // for that whole type to populate its local cache — confirmed the hard
 // way, via "pods is forbidden" on List even with get;create;delete
 // already granted.
-func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instance *kubebirdv1.Instance) error {
+//
+// The Pod runs version's own image and gbak (see databaseBackupImage and
+// databaseBackupScript): spec.version, except while a major version
+// upgrade is still backing up the version it's upgrading from.
+func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instance *kubebirdv1.Instance, version string) error {
 	mounts := []corev1.VolumeMount{
 		{Name: primaryVolumeName, MountPath: primaryDataMountPath},
 		{Name: backupVolumeName, MountPath: backupDataMountPath},
@@ -633,12 +790,12 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 			Containers: []corev1.Container{
 				{
 					Name:  containerName,
-					Image: backupImage(instance),
+					Image: databaseBackupImage(instance, version),
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: ptr.To(false),
 						SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Command:      []string{"sh", "-c", databaseBackupScript(instance)},
+					Command:      []string{"sh", "-c", databaseBackupScript(instance, version)},
 					VolumeMounts: mounts,
 				},
 			},
@@ -651,7 +808,7 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 	if err := r.Create(ctx, pod); err != nil {
 		return fmt.Errorf("failed to create database backup Pod: %w", err)
 	}
-	return fmt.Errorf("waiting for database backup Pod %q to start", pod.Name)
+	return waiting("waiting for database backup Pod %q to start", pod.Name)
 }
 
 // podFailureReason returns a human-readable reason pod's single container

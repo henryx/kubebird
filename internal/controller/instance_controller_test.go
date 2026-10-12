@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -994,6 +995,227 @@ var _ = Describe("Instance Controller", func() {
 				Expect(k8sClient.Create(ctx, instance)).To(Succeed(), name)
 				Expect(k8sClient.Delete(ctx, instance)).To(Succeed(), name)
 			}
+		})
+	})
+
+	Context("When spec.version changes", func() {
+		const (
+			upgradeResourceName = "test-upgrade-resource"
+			upgradeFromVersion  = "4.0.3"
+		)
+
+		ctx := context.Background()
+		upgradeNamespacedName := types.NamespacedName{Name: upgradeResourceName, Namespace: resourceNamespace}
+		primaryPVCKey := types.NamespacedName{Name: upgradeResourceName + "-primary", Namespace: resourceNamespace}
+		var controllerReconciler *InstanceReconciler
+
+		reconcileOnce := func() (reconcile.Result, error) {
+			return controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: upgradeNamespacedName})
+		}
+		setVersion := func(version string) {
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Version = version
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+		}
+		statefulSetImage := func() string {
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, sts)).To(Succeed())
+			return sts.Spec.Template.Spec.Containers[0].Image
+		}
+		getInstance := func() *kubebirdv1.Instance {
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, resource)).To(Succeed())
+			return resource
+		}
+
+		BeforeEach(func() {
+			controllerReconciler = &InstanceReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			resource := &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName, Namespace: resourceNamespace},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:     testImage,
+					Version:   upgradeFromVersion,
+					Databases: []kubebirdv1.DatabaseSpec{{Name: testDatabaseName}},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{
+						Enabled: true,
+						Destinations: []kubebirdv1.BackupDestinationSpec{
+							{Local: &kubebirdv1.LocalBackupSpec{Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")}}},
+						},
+						// Keeps AfterEach's cleanup to a single reconcile;
+						// the delete-time backup is covered by the
+						// earlier Contexts.
+						BackupOnDelete: ptr.To(false),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			_, err := reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(statefulSetImage()).To(Equal(testImage + ":" + upgradeFromVersion))
+		})
+
+		AfterEach(func() {
+			resource := &kubebirdv1.Instance{}
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			_, err := reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, &kubebirdv1.Instance{})).To(HaveOccurred())
+
+			// envtest runs no garbage collector, nor the pvc-protection
+			// controller: remove what an It may have left behind, so the
+			// next It's Instance of the same name starts clean.
+			for _, obj := range []client.Object{
+				&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName, Namespace: resourceNamespace}},
+				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-0", Namespace: resourceNamespace}},
+				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-database-backup", Namespace: resourceNamespace}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-sysdba", Namespace: resourceNamespace}},
+			} {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, obj))).To(Succeed())
+			}
+			for _, name := range []string{upgradeResourceName + "-primary", upgradeResourceName + "-backup"} {
+				pvc := &corev1.PersistentVolumeClaim{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: resourceNamespace}, pvc); err == nil {
+					pvc.Finalizers = nil
+					Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+					Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, pvc))).To(Succeed())
+				}
+			}
+		})
+
+		It("just moves the StatefulSet to another release of the same major version, in either direction", func() {
+			for _, version := range []string{"4.0.5", upgradeFromVersion} {
+				setVersion(version)
+				_, err := reconcileOnce()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statefulSetImage()).To(Equal(testImage + ":" + version))
+				Expect(getInstance().Status.Upgrade).To(BeNil())
+				Expect(k8sClient.Get(ctx, primaryPVCKey, &corev1.PersistentVolumeClaim{})).To(Succeed())
+			}
+		})
+
+		It("refuses to downgrade to an older major version, leaving the StatefulSet alone", func() {
+			setVersion(testVersion)
+			_, err := reconcileOnce()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("downgrading Firebird from 4.0.3 to 3.0.14 isn't supported"))
+			Expect(statefulSetImage()).To(Equal(testImage + ":" + upgradeFromVersion))
+			updated := getInstance()
+			Expect(updated.Status.Upgrade).To(BeNil())
+			Expect(updated.Status.Error).To(ContainSubstring("isn't supported"))
+		})
+
+		It("refuses to upgrade to a newer major version without a local backup volume", func() {
+			resource := getInstance()
+			resource.Spec.Backup.Enabled = false
+			resource.Spec.Backup.Destinations = nil
+			resource.Spec.Version = testFirebird5Version
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+
+			_, err := reconcileOnce()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("needs a local backup volume"))
+			Expect(statefulSetImage()).To(Equal(testImage + ":" + upgradeFromVersion))
+		})
+
+		It("backs up with the old version, releases the storage, then restores onto the new one", func() {
+			By("faking a provisioned database, since envtest never gets a real pod ready")
+			resource := getInstance()
+			resource.Status.Databases = []string{testDatabaseName}
+			resource.Status.DatabaseCount = 1
+			Expect(k8sClient.Status().Update(ctx, resource)).To(Succeed())
+
+			By("upgrading to the next major version, which records the upgrade and stops the pod")
+			setVersion(testFirebird5Version)
+			result, err := reconcileOnce()
+			Expect(err).NotTo(HaveOccurred(), "waiting on the cluster isn't a reconcile failure")
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			updated := getInstance()
+			Expect(updated.Status.Upgrade).To(Equal(&kubebirdv1.UpgradeStatus{
+				FromVersion: upgradeFromVersion, ToVersion: testFirebird5Version, Stage: kubebirdv1.UpgradeStageBackingUp,
+			}))
+			Expect(updated.Status.Phase).To(Equal(phaseUpgrading))
+			Expect(updated.Status.Error).To(BeEmpty())
+			Expect(updated.Status.Message).To(ContainSubstring("stopping the Firebird pod"))
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, sts)).To(Succeed())
+			Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+			Expect(statefulSetImage()).To(Equal(testImage+":"+upgradeFromVersion), "the old version must stay until it's backed up")
+
+			By("backing up with the old version's own image and security database once the pod has stopped")
+			_, err = reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			backupPodKey := types.NamespacedName{Name: upgradeResourceName + "-database-backup", Namespace: resourceNamespace}
+			backupPod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, backupPodKey, backupPod)).To(Succeed())
+			Expect(backupPod.Spec.Containers[0].Image).To(Equal(testImage + ":" + upgradeFromVersion))
+			script := backupPod.Spec.Containers[0].Command[2]
+			Expect(script).To(ContainSubstring("/var/lib/firebird/data/security4.fdb"))
+			Expect(script).To(ContainSubstring("/var/lib/firebird/backup/base/security4.fbk"))
+			Expect(script).To(ContainSubstring(testDatabaseName))
+
+			By("releasing the primary storage once the backup succeeded, without restarting the pod yet")
+			backupPod.Status.Phase = corev1.PodSucceeded
+			Expect(k8sClient.Status().Update(ctx, backupPod)).To(Succeed())
+			_, err = reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			updated = getInstance()
+			Expect(updated.Status.Upgrade.Stage).To(Equal(kubebirdv1.UpgradeStageReleasing))
+			Expect(updated.Status.Databases).To(BeEmpty(), "every database must be restored on the new version")
+			Expect(updated.Status.Message).To(ContainSubstring("to be released"))
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, primaryPVCKey, pvc)).To(Succeed())
+			Expect(pvc.DeletionTimestamp).NotTo(BeNil())
+			Expect(statefulSetImage()).To(Equal(testImage + ":" + upgradeFromVersion))
+
+			By("starting the new version on fresh storage once the old one is gone")
+			pvc.Finalizers = nil // what envtest's missing pvc-protection controller would do
+			Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+			_, err = reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getInstance().Status.Upgrade.Stage).To(Equal(kubebirdv1.UpgradeStageRestoring))
+			Expect(statefulSetImage()).To(Equal(testImage + ":" + testFirebird5Version))
+			Expect(k8sClient.Get(ctx, upgradeNamespacedName, sts)).To(Succeed())
+			Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
+			Expect(sts.Spec.Template.Spec.InitContainers[0].Command[2]).To(ContainSubstring("security5.fdb"))
+			Expect(k8sClient.Get(ctx, primaryPVCKey, pvc)).To(Succeed())
+			Expect(pvc.DeletionTimestamp).To(BeNil())
+
+			By("never releasing the fresh storage again while restoring")
+			_, err = reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, primaryPVCKey, pvc)).To(Succeed())
+			Expect(pvc.DeletionTimestamp).To(BeNil())
+			Expect(getInstance().Status.Phase).To(Equal(phaseUpgrading))
+
+			By("finishing once the new version is ready with every database restored")
+			sts.Status.Replicas = 1
+			sts.Status.ReadyReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      upgradeResourceName + "-0",
+					Namespace: resourceNamespace,
+					// Already detected, so reconcileFirebirdVersion
+					// needs no exec into this stand-in pod.
+					Labels: map[string]string{firebirdVersionLabelKey: testFirebird5Version},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: testImage + ":" + testFirebird5Version}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			updated = getInstance()
+			updated.Status.Databases = []string{testDatabaseName}
+			updated.Status.DatabaseCount = 1
+			Expect(k8sClient.Status().Update(ctx, updated)).To(Succeed())
+			_, err = reconcileOnce()
+			Expect(err).NotTo(HaveOccurred())
+			updated = getInstance()
+			Expect(updated.Status.Upgrade).To(BeNil())
+			Expect(updated.Status.Phase).To(Equal(phaseReady))
 		})
 	})
 })

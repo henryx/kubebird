@@ -28,6 +28,11 @@
   with backups taken by an older version. Setting `spec.backup.backupOnDelete` to `false` skips that
   final backup while still releasing the primary/shadow storage. Without a backup volume, a
   recreated `Instance` starts fresh instead.
+- Upgrades an `Instance` in place when `spec.version` changes: within a major version it just
+  restarts the pod on the new image (downgrades included); to a newer major version it backs up
+  every database and the security database with the old version, then restores them onto the new
+  one, migrating the users per the Firebird 4.0 migration guide when coming from Firebird 3. A move
+  to an older major version is refused. See "Upgrading an Instance" below.
 - Warns via `status.warning`/`status.message` about orphaned backups left behind when a recreated
   `Instance` no longer declares a database that has a backup on disk.
 - Independently of `backupOnDelete`, `spec.backup.retention` runs recurring scheduled backups (hourly,
@@ -76,7 +81,7 @@ kubectl delete -f https://github.com/henryx/kubebird/releases/latest/download/in
 ```
 
 Both the release and the `dev` build below only publish once lint, unit/envtest, and e2e tests all
-pass on the triggering commit.
+pass on the triggering commit. The e2e tests run against Firebird `3.0.14`, `4.0.3` and `5.0.4`.
 
 ### Development builds
 
@@ -255,6 +260,47 @@ Kubebird also reacts to updates on an existing `Instance`:
   apply the new password the same way it already does for a brand-new `Instance`. This causes a
   short disruption to every connection to the `Instance` while the pod restarts.
 
+### Upgrading an Instance
+
+Change `spec.version` on a live `Instance` to move it to another Firebird release. What Kubebird
+does depends on how the version changes, compared with the version the `StatefulSet` currently runs:
+
+- **Within the same major version** (e.g. `4.0.3` to `4.0.5`), in either direction: the `StatefulSet`
+  simply restarts its pod on the new image, keeping the databases and the security database as they
+  are. Downgrading (e.g. back to `4.0.3`) works the same way.
+- **To a newer major version** (e.g. `3.0.14` to `4.0.3`, or `4.0.3` to `5.0.4`): the on-disk
+  structure changes between major versions, so Kubebird moves the data the same way deleting and
+  recreating the `Instance` would, without deleting it. This needs a local backup volume
+  (`backup.enabled` with a `local` entry in `backup.destinations`); without one, the upgrade is
+  refused and reported in `status.error`. `status.phase` is `Upgrading` meanwhile, and
+  `status.upgrade` records `fromVersion`, `toVersion` and the current `stage`:
+  1. `BackingUp`: the pod is stopped and every database, plus the security database, is backed up
+     with `gbak` by the old version's own image (the new version's engine can't open the old on-disk
+     structure) into the backup volume's `base/` directory, exactly as on deletion, whatever
+     `backup.backupOnDelete` says.
+  2. `Releasing`: the primary and shadow PVCs are deleted.
+  3. `Restoring`: the new version starts on fresh PVCs, restoring the security database and then
+     every database from those backups. Once it's all `Ready`, `status.upgrade` is cleared.
+
+  When upgrading **from Firebird 3**, the security database isn't restored as is: following the
+  [Firebird 4.0 migration guide](https://ib-aid.com/download/docs/fb4migrationguide.html#_migrating_user_list),
+  the new version starts from its own default security database, and the users of the 3.0 one
+  (Srp and Legacy_UserManager alike, passwords included) are copied into it, all but SYSDBA, whose
+  password always comes from the SYSDBA Secret. From Firebird 4 on, the security database is restored
+  from its backup like every other database. Keep `spec.version` at the new version until the
+  upgrade finishes; changing it meanwhile is refused.
+- **To an older major version** (e.g. `4.0.3` to `3.0.14`): refused, since a database, or a backup,
+  written by a newer major version can't be read by an older one. Kubebird reports it in
+  `status.error` and leaves the running server alone; set `spec.version` back to clear it.
+
+A tag Kubebird can't read a major version from (e.g. `latest`) is treated like a change within the
+same major version.
+
+Deleting an `Instance` in the middle of a major upgrade is safe. While still `BackingUp`, the usual
+delete-time backup is taken with the old version, as the upgrade itself would. Once past it, the
+delete-time backup is skipped, since the backup volume already holds the upgrade's backup of the old
+version and the fresh storage holds at most part of it restored.
+
 ### Deleting an Instance
 
 Deleting an `Instance` relies on Kubernetes garbage collection of the objects Kubebird created for
@@ -314,8 +360,12 @@ on the (fresh) primary PVC is restored via `gbak -create -verify` from a matchin
 `shadow: true` database, and the security database is restored the same way by the
 `security-database-init` init container (which runs before the `firebird` container starts, since no
 server is listening yet to `exec` a restore into), carrying over whatever users/roles were created
-directly in it. SYSDBA's own password, meanwhile, always comes from the Secret rather than the
-restored security database — and since the Secret itself also survives the deletion (see "Deleting
+directly in it. The init container picks the most recently written `base/securityM.fbk` whose major
+version `M` isn't newer than the version starting, so after a major upgrade (see "Upgrading an
+Instance" above) or a recreate with a bumped `spec.version`, the older version's backup is used; from
+a Firebird 3 backup into a newer version, its users are migrated into the new version's default
+security database rather than restored as is. SYSDBA's own password, meanwhile, always comes from
+the Secret rather than the restored security database — and since the Secret itself also survives the deletion (see "Deleting
 an Instance" above), it's the same password as before the delete/recreate, unless you rotate it
 yourself; see "Rotating the SYSDBA secret's password" above. If the recreated `Instance` declares a
 different `spec.databases` list than the one that was backed up, any `.fbk` file with no matching
@@ -323,7 +373,9 @@ entry is left unrestored and reported in `status.warning` (and thus in the `MESS
 of being silently ignored. This also works if the recreated `Instance` sets a different
 `spec.version`: the new version's own `gbak` restores a `.fbk` backed up by the old version's
 `gbak`, so deleting and recreating an `Instance` with a bumped `spec.version` (and the same local
-backup volume configured) doubles as a supported way to upgrade between Firebird major versions.
+backup volume configured) doubles as a way to upgrade between Firebird major versions, though
+changing `spec.version` in place does the same without deleting the `Instance` (see "Upgrading an
+Instance" above).
 Without a backup volume, there is nothing to restore from: a recreated `Instance` gets fresh, empty
 primary/shadow storage and a brand-new security database, just like a first-time `Instance` of that
 name.

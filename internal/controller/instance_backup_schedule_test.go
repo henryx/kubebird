@@ -364,8 +364,8 @@ func TestScheduledBackupScript(t *testing.T) {
 	instance := &kubebirdv1.Instance{
 		ObjectMeta: metav1.ObjectMeta{Name: testScheduleInstanceName},
 		Spec: kubebirdv1.InstanceSpec{
-			Image:   "firebirdsql/firebird",
-			Version: "3.0.14",
+			Image:   testImage,
+			Version: testVersion,
 			Backup: kubebirdv1.BackupSpec{
 				Retention: kubebirdv1.RetentionSpec{Hour: "3h"},
 			},
@@ -424,8 +424,8 @@ func TestScheduledBackupScriptCompress(t *testing.T) {
 	instance := &kubebirdv1.Instance{
 		ObjectMeta: metav1.ObjectMeta{Name: testScheduleInstanceName},
 		Spec: kubebirdv1.InstanceSpec{
-			Image:   "firebirdsql/firebird",
-			Version: "3.0.14",
+			Image:   testImage,
+			Version: testVersion,
 			Backup: kubebirdv1.BackupSpec{
 				Compress:  true,
 				Retention: kubebirdv1.RetentionSpec{Hour: "3h"},
@@ -707,7 +707,7 @@ func TestIncrementalBackupScriptCleansHistory(t *testing.T) {
 	}{
 		{"", false},
 		{testVersion, false},
-		{"4.0.3", true},
+		{upgradedTestVersion, true},
 		{"5.0.1", true},
 	} {
 		instance := &kubebirdv1.Instance{

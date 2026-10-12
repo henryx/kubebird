@@ -367,8 +367,9 @@ type InstanceStatus struct {
 	// phase is a high-level summary of the Instance's lifecycle state:
 	// "Provisioning" while the StatefulSet or its databases aren't ready
 	// yet, "Ready" once the pod is ready and every database in
-	// spec.databases has been created, or "Deleting" while owned
-	// resources are being garbage collected.
+	// spec.databases has been created, "Upgrading" while spec.version is
+	// being upgraded to a new Firebird major version (see upgrade), or
+	// "Deleting" while owned resources are being garbage collected.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -400,6 +401,45 @@ type InstanceStatus struct {
 	// Kubebird generates for the Instance.
 	// +optional
 	FirebirdVersion string `json:"firebirdVersion,omitempty"`
+
+	// upgrade tracks an upgrade of spec.version to a new Firebird major
+	// version while it's in progress; cleared once the Instance is Ready
+	// on the new version. A change within the same major version (e.g.
+	// 4.0.3 to 4.0.5, or back) needs no tracking: the StatefulSet just
+	// restarts its pod on the new image.
+	// +optional
+	Upgrade *UpgradeStatus `json:"upgrade,omitempty"`
+}
+
+// UpgradeStage is the step an in-progress major version upgrade is at.
+// +kubebuilder:validation:Enum=BackingUp;Releasing;Restoring
+type UpgradeStage string
+
+const (
+	// UpgradeStageBackingUp stops the pod still running fromVersion and
+	// backs up every database, plus the security database, with that
+	// version's gbak into the backup volume, the same way deleting the
+	// Instance does.
+	UpgradeStageBackingUp UpgradeStage = "BackingUp"
+	// UpgradeStageReleasing deletes the primary and shadow storage, whose
+	// databases BackingUp has backed up, and waits for it to be gone.
+	UpgradeStageReleasing UpgradeStage = "Releasing"
+	// UpgradeStageRestoring starts toVersion on fresh storage, which
+	// restores the backups taken while BackingUp.
+	UpgradeStageRestoring UpgradeStage = "Restoring"
+)
+
+// UpgradeStatus describes an in-progress upgrade to a new Firebird major
+// version.
+type UpgradeStatus struct {
+	// fromVersion is the version running when the upgrade started.
+	FromVersion string `json:"fromVersion"`
+
+	// toVersion is the spec.version being upgraded to.
+	ToVersion string `json:"toVersion"`
+
+	// stage is the step the upgrade is at.
+	Stage UpgradeStage `json:"stage"`
 }
 
 // +kubebuilder:object:root=true

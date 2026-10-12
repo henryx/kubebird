@@ -4,6 +4,23 @@
 
 ### Added
 
+- Changing `spec.version` on a live `Instance` now follows the Firebird upgrade path. Within the same
+  major version (e.g. `4.0.3` to `4.0.5`, or back), the pod just restarts on the new image, as before.
+  To a newer major version (e.g. `3.0.14` to `4.0.3`, or `4.0.3` to `5.0.4`), Kubebird stops the pod,
+  backs up every database and the security database with the old version's `gbak` into the backup
+  volume's `base/` directory, releases the primary and shadow PVCs and starts the new version on
+  fresh ones, restoring everything; it needs a local backup volume. Progress shows as
+  `status.phase: Upgrading` and in the new `status.upgrade` field (`fromVersion`, `toVersion`,
+  `stage`). Previously, a major version change restarted the new version on the old version's files,
+  which it can't open. Moving to an older major version is refused, in `status.error`, leaving the
+  running server alone.
+- When the security database comes from a Firebird 3 backup into a newer version, whether by an
+  in-place upgrade or by recreating the `Instance` with a bumped `spec.version`, its users are now
+  migrated into the new version's default security database following the Firebird 4.0 migration
+  guide, passwords included, instead of being lost to a stock security database. The
+  `security-database-init` init container now restores the most recent `securityM.fbk` backup of a
+  major version no newer than its own, rather than only its own version's.
+
 - `spec.backup.mode` picks how scheduled backups (`spec.backup.retention`) are taken: `type: logical`
   (the default, `gbak` as before) or `type: physical`, an `nbackup` backup taken by the live server
   through the Services API (`fbsvcmgr -action_nbak`), written as `<frequency>/<database>-<timestamp>.nbk`
@@ -36,6 +53,11 @@
   needs the new `patch` verb on `persistentvolumeclaims` and `secrets` in the manager's Role, so
   apply the new RBAC along with the new image.
 ### Changed
+
+- The e2e suite runs against Firebird `3.0.14`, `4.0.3` and `5.0.4`: the version most specs deploy
+  now comes from `FIREBIRD_VERSION` (default `3.0.14`, e.g. `FIREBIRD_VERSION=5.0.4 make test-e2e`),
+  and the CI `test-e2e` workflow runs one job per version, all of which must pass before an image is
+  published or a release is cut. The delete/recreate upgrade spec also covers `4.0.3` to `5.0.4` now.
 
 - Scheduled backups (`spec.backup.retention`) are now `gbak` backups instead of `nbackup` ones, still
   taken by the instance's own live server through the Services API (`fbsvcmgr -action_backup`
