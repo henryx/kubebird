@@ -125,6 +125,7 @@ type StorageSpec struct {
 }
 
 // BackupSpec configures backing up the instance's databases.
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || !has(self.mode.incremental) || !self.mode.incremental || !has(self.retention) || [has(self.retention.hour) ? self.retention.hour : '0', has(self.retention.day) ? self.retention.day : '0', has(self.retention.week) ? self.retention.week : '0', has(self.retention.month) ? self.retention.month : '0', has(self.retention.year) ? self.retention.year : '0'].filter(r, r.matches('[1-9]')).size() <= 1",message="retention can enable at most one frequency when mode.incremental is true"
 type BackupSpec struct {
 	// enabled turns on backing up the instance's databases. It only makes
 	// the ability available; a destination still has to be configured in
@@ -170,12 +171,61 @@ type BackupSpec struct {
 	// +optional
 	Compress bool `json:"compress,omitempty"`
 
+	// mode selects how scheduled backups (see retention) are taken; see
+	// BackupModeSpec. Defaults to logical (gbak) full backups. The
+	// delete-time backupOnDelete backup is always a gbak one, whatever
+	// the mode.
+	// +optional
+	Mode BackupModeSpec `json:"mode,omitzero"`
+
 	// retention configures recurring scheduled backups, one frequency at
 	// a time; see RetentionSpec. Only takes effect when a local backup
 	// volume exists (see destinations); has no effect otherwise,
 	// matching backupOnDelete. Defaults to every frequency disabled.
 	// +optional
 	Retention RetentionSpec `json:"retention,omitzero"`
+}
+
+// BackupModeType is the kind of backup scheduled backups take.
+// +kubebuilder:validation:Enum=logical;physical
+type BackupModeType string
+
+const (
+	// BackupModeLogical takes gbak backups ("<database>-<timestamp>.fbk").
+	BackupModeLogical BackupModeType = "logical"
+	// BackupModePhysical takes nbackup backups ("<database>-<timestamp>.nbk").
+	BackupModePhysical BackupModeType = "physical"
+)
+
+// BackupModeSpec selects how scheduled backups (see RetentionSpec) are
+// taken.
+// +kubebuilder:validation:XValidation:rule="!has(self.incremental) || !self.incremental || (has(self.type) && self.type == 'physical')",message="mode.incremental requires mode.type to be physical"
+type BackupModeSpec struct {
+	// type is logical (gbak, the default) or physical (nbackup). A
+	// physical backup copies the database's pages, so it's faster to take
+	// and restore than a logical one, but it puts the database into
+	// physical backup mode while it runs and can only be restored
+	// (nbackup -R) by a server of the same Firebird major version.
+	// +kubebuilder:default=logical
+	// +optional
+	Type BackupModeType `json:"type,omitempty"`
+
+	// incremental, only allowed when type is physical, keeps each
+	// frequency's backups in a pool: the first run of a pool takes a full
+	// level 0 nbackup into "<frequency>/pool-<timestamp>/<database>-level0.nbk",
+	// every later run a level 1 one, holding only the pages changed since
+	// that level 0, into "<database>-level1-<timestamp>.nbk". Once the
+	// pool's level 0 is older than the frequency's retention, the next run
+	// starts a new pool with a new level 0 and, once that succeeds,
+	// deletes the old pool. On Firebird 4.0 and later, every level 0 backup
+	// also prunes the database's backup history down to itself. Since
+	// Firebird bases a level 1 backup on the
+	// database's latest level 0, whichever frequency took it, only one
+	// retention frequency may be enabled. Defaults to false, every run
+	// taking a full level 0 backup.
+	// +kubebuilder:default=false
+	// +optional
+	Incremental bool `json:"incremental,omitempty"`
 }
 
 // RetentionSpec configures recurring scheduled backups of the instance's
@@ -188,7 +238,9 @@ type BackupSpec struct {
 // gbak backup of each database into
 // "<frequency>/<database>-<timestamp>.fbk" on the backup volume (gzip
 // compressed to ".fbk.gz" afterwards when compress is true), where
-// <timestamp> is the run's own UTC start time (YYYYMMDDTHHMMSSZ). Unlike
+// <timestamp> is the run's own UTC start time (YYYYMMDDTHHMMSSZ), or, when
+// mode.type is physical, an nbackup one into ".nbk" (see BackupModeSpec
+// for mode.incremental's pools). Unlike
 // backupOnDelete's gbak backup, which needs the instance stopped first,
 // these run inside the instance's own live server through the Services
 // API, so the instance is never restarted or made unavailable for them,
@@ -197,30 +249,35 @@ type RetentionSpec struct {
 	// hour takes a backup on the hour, every hour, keeping those newer
 	// than the given duration (e.g. "12h").
 	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
+	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	Hour string `json:"hour,omitempty"`
 
 	// day takes a backup at 00:00 UTC every day, keeping those newer than
 	// the given duration (e.g. "3d").
 	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
+	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	Day string `json:"day,omitempty"`
 
 	// week takes a backup at 00:00 UTC every Sunday, keeping those newer
 	// than the given duration (e.g. "4w").
 	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
+	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	Week string `json:"week,omitempty"`
 
 	// month takes a backup at 00:00 UTC on the first day of every month,
 	// keeping those newer than the given duration (e.g. "6m").
 	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
+	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	Month string `json:"month,omitempty"`
 
 	// year takes a backup at 00:00 UTC on the first of January, keeping
 	// those newer than the given duration (e.g. "2y").
 	// +kubebuilder:validation:Pattern=`^([0-9]+[hdwmy])?$`
+	// +kubebuilder:validation:MaxLength=16
 	// +optional
 	Year string `json:"year,omitempty"`
 }

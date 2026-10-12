@@ -4,6 +4,21 @@
 
 ### Added
 
+- `spec.backup.mode` picks how scheduled backups (`spec.backup.retention`) are taken: `type: logical`
+  (the default, `gbak` as before) or `type: physical`, an `nbackup` backup taken by the live server
+  through the Services API (`fbsvcmgr -action_nbak`), written as `<frequency>/<database>-<timestamp>.nbk`
+  and pruned under the same retention. Physical runs, across every frequency, wait for each other on
+  the shared `.scheduled-backup.lock` `flock` again, since Firebird refuses two `nbackup` runs of one
+  database at the same time. With `incremental: true` (physical only), each run instead adds to a pool,
+  `<frequency>/pool-<timestamp>`: the first run takes a level 0 backup of every database, later runs
+  level 1 backups relative to it. Once the pool's level 0 is older than the retention, the next run
+  starts a new pool and, once it succeeds, deletes the old one. Since a level 1 backup is always
+  relative to the database's latest level 0, `incremental` allows only one enabled retention
+  frequency. On Firebird 4.0 and later, every level 0 backup also prunes the database's backup
+  history (`RDB$BACKUP_HISTORY`) down to itself (`-nbk_clean_history -nbk_keep_rows 1`); Firebird 3.0
+  can't prune it, so there it keeps one row per run. The delete-time `backupOnDelete` backup is
+  always a `gbak` one.
+
 - Kubebird now labels the objects it generates for an `Instance` with
   `kubebird.github.io/firebird-version: <version>`: the Firebird server pod, the StatefulSet, the
   Service, the aliases ConfigMap, the scheduled backup CronJobs (and their Jobs' pods) and the

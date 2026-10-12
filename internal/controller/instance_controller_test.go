@@ -947,4 +947,53 @@ var _ = Describe("Instance Controller", func() {
 				"no CronJob should be created before its backup directory is prepared")
 		})
 	})
+
+	Context("When validating spec.backup.mode", func() {
+		ctx := context.Background()
+
+		instanceWithMode := func(name string, mode kubebirdv1.BackupModeSpec, retention kubebirdv1.RetentionSpec) *kubebirdv1.Instance {
+			return &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: resourceNamespace},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:     testImage,
+					Version:   testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{{Name: testDatabaseName}},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{Mode: mode, Retention: retention},
+				},
+			}
+		}
+
+		It("rejects mode.incremental unless mode.type is physical", func() {
+			err := k8sClient.Create(ctx, instanceWithMode("test-mode-logical-incremental",
+				kubebirdv1.BackupModeSpec{Type: kubebirdv1.BackupModeLogical, Incremental: true},
+				kubebirdv1.RetentionSpec{Day: "3d"}))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("mode.incremental requires mode.type to be physical"))
+		})
+
+		It("rejects mode.incremental with more than one retention frequency enabled", func() {
+			err := k8sClient.Create(ctx, instanceWithMode("test-mode-incremental-two",
+				kubebirdv1.BackupModeSpec{Type: kubebirdv1.BackupModePhysical, Incremental: true},
+				kubebirdv1.RetentionSpec{Hour: "6h", Day: "3d"}))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("retention can enable at most one frequency when mode.incremental is true"))
+		})
+
+		It("accepts mode.incremental with one frequency enabled and the others zero, and physical backups on several frequencies", func() {
+			for name, instance := range map[string]*kubebirdv1.Instance{
+				"test-mode-incremental-one": instanceWithMode("test-mode-incremental-one",
+					kubebirdv1.BackupModeSpec{Type: kubebirdv1.BackupModePhysical, Incremental: true},
+					kubebirdv1.RetentionSpec{Hour: "0h", Day: "3d", Week: "00w"}),
+				"test-mode-physical-many": instanceWithMode("test-mode-physical-many",
+					kubebirdv1.BackupModeSpec{Type: kubebirdv1.BackupModePhysical},
+					kubebirdv1.RetentionSpec{Hour: "6h", Day: "3d"}),
+			} {
+				Expect(k8sClient.Create(ctx, instance)).To(Succeed(), name)
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed(), name)
+			}
+		})
+	})
 })

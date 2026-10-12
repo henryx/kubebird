@@ -74,6 +74,24 @@ const scheduledBackupTimestampDate = "+%Y%m%dT%H%M%SZ"
 // under the same retention as the ".fbk" files that replaced them.
 const scheduledBackupTimestampSedPattern = `s/.*-\([0-9]\{8\}T[0-9]\{6\}Z\)\.[fn]bk\(\.gz\)\{0,1\}$/\1/p`
 
+// scheduledBackupLockPath is the lock file every physical (nbackup)
+// scheduled backup run holds (via flock) for its whole run, at the backup
+// volume's root so it's shared by every frequency's CronJob. Unlike gbak,
+// the server rejects a second -action_nbak on a database still locked by
+// the first ("Database is already in the physical backup mode"), and
+// different frequencies (or a Job created by hand next to a scheduled one)
+// can run at the same time. flock works across those Jobs' pods since
+// they're all scheduled onto the Firebird pod's own node (see
+// firebirdNodeTopologyKey) and so share one kernel mount of the
+// ReadWriteOnce backup PVC, and the kernel releases the lock by itself
+// when a Job's shell exits, however it exits.
+var scheduledBackupLockPath = path.Join(backupDataMountPath, ".scheduled-backup.lock")
+
+// scheduledBackupPoolPrefix names the directories mode.incremental keeps
+// its backup pools in, "<frequency>/pool-<timestamp>", where <timestamp>
+// is the time the pool's first run started (see incrementalBackupScript).
+const scheduledBackupPoolPrefix = "pool-"
+
 // scheduledBackupClaimPrefix names the directory a scheduled backup run
 // creates in its frequency's backup directory, ".claim-<timestamp>", to
 // claim its timestamp before using it (see
@@ -407,6 +425,12 @@ func scheduledBackupDir(frequency string) string {
 // Forbid doesn't cover — so each run claims its timestamp first (see
 // scheduledBackupUniqueTimestampScript).
 //
+// When spec.backup.mode.type is physical, every run takes an nbackup
+// (-action_nbak) backup instead, "<database>-$TS.nbk", holding
+// scheduledBackupLockPath throughout, since concurrent nbackup runs on one
+// database fail; with spec.backup.mode.incremental, runs build up
+// level 0 + level 1 pools instead (see incrementalBackupScript).
+//
 // When spec.backup.compress is true, each backup is gzip-compressed to
 // ".fbk.gz" right after fbsvcmgr writes it (fbsvcmgr has no compression
 // option of its own), through the Job's own mount of the backup PVC —
@@ -433,22 +457,159 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency) 
 	conn := backupServiceConnection(instance)
 	dir := scheduledBackupDir(freq.name)
 	retention := frequencyRetention(instance, freq)
+	mode := instance.Spec.Backup.Mode
 
 	var b strings.Builder
 	b.WriteString("set -e\n")
+	if mode.Type == kubebirdv1.BackupModePhysical {
+		fmt.Fprintf(&b, "exec 9>%q\n", scheduledBackupLockPath)
+		b.WriteString("flock 9\n")
+	}
 	b.WriteString(scheduledBackupUniqueTimestampScript(dir))
+
+	if mode.Type == kubebirdv1.BackupModePhysical && mode.Incremental {
+		b.WriteString(incrementalBackupScript(instance, dir, retention))
+		b.WriteString(pruneScheduledBackupsScript(dir, retention))
+		return b.String()
+	}
 
 	for _, name := range instance.Status.Databases {
 		serverDBPath := path.Join(primaryDataMountPath, name)
+		if mode.Type == kubebirdv1.BackupModePhysical {
+			dst := fmt.Sprintf("%s/%s-$TS.nbk", dir, strings.TrimSuffix(name, ".fdb"))
+			b.WriteString(nbackupCommand(conn, serverDBPath, 0, strconv.Quote(dst), ""))
+			writeGzip(&b, instance, "", strconv.Quote(dst))
+			continue
+		}
 		dst := fmt.Sprintf("%s/%s-$TS.fbk", dir, strings.TrimSuffix(name, ".fdb"))
 		fmt.Fprintf(&b, "%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_backup -dbname %q -bkp_file %q\n",
 			binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, serverDBPath, dst)
-		if instance.Spec.Backup.Compress {
-			fmt.Fprintf(&b, "gzip -f %q\n", dst)
-		}
+		writeGzip(&b, instance, "", strconv.Quote(dst))
 	}
 
 	b.WriteString(pruneScheduledBackupsScript(dir, retention))
+	b.WriteString(pruneExpiredPoolsScript(dir))
+	return b.String()
+}
+
+// nbackupCommand renders the fbsvcmgr call taking a level nbackup
+// (-action_nbak) of the server-side database dbPath into dst, an
+// already-quoted shell word resolved by the server too, followed by any
+// extra fbsvcmgr arguments.
+func nbackupCommand(conn, dbPath string, level int, dst, extra string) string {
+	return fmt.Sprintf("%s %s %s %s %s \"$SYSDBA_PASSWORD\" -action_nbak -nbk_level %d -dbname %q -nbk_file %s%s\n",
+		binFbsvcmgr, conn, flagUser, sysdbaUsername, flagPassword, level, dbPath, dst, extra)
+}
+
+// nbackupCleanHistoryArgs are the fbsvcmgr arguments incrementalBackupScript
+// adds to every level 0 backup it takes, on servers that support them (see
+// canCleanBackupHistory): once the backup is done, the server deletes every
+// row of the database's RDB$BACKUP_HISTORY but the newest, i.e. the level 0
+// just taken. That's the only one later level 1 backups are based on, and
+// the backups of the pools deleted along with it are of no further use, so
+// the history doesn't keep growing by a row per run for as long as the
+// database lives. Confirmed against the actual 4.0.3 image that a level 1
+// backup works right after.
+const nbackupCleanHistoryArgs = " -nbk_clean_history -nbk_keep_rows 1"
+
+// canCleanBackupHistory reports whether the instance's server supports
+// nbackupCleanHistoryArgs, i.e. its detected version (status.firebirdVersion)
+// is Firebird 4.0 or later. Firebird 3.0 has neither the Services API
+// option nor any other way to do it: confirmed against the actual 3.0.14
+// image, even SYSDBA gets "DELETE operation is not allowed for system
+// table RDB$BACKUP_HISTORY". Until the version is detected, the history is
+// left alone; detecting it updates status, whose reconcile then re-renders
+// the CronJob.
+func canCleanBackupHistory(instance *kubebirdv1.Instance) bool {
+	major, _, _ := strings.Cut(instance.Status.FirebirdVersion, ".")
+	n, err := strconv.Atoi(major)
+	return err == nil && n >= 4
+}
+
+// writeGzip appends gzip-compressing dst, an already-quoted shell word,
+// indented by indent, when spec.backup.compress is true.
+func writeGzip(b *strings.Builder, instance *kubebirdv1.Instance, indent, dst string) {
+	if instance.Spec.Backup.Compress {
+		fmt.Fprintf(b, "%sgzip -f %s\n", indent, dst)
+	}
+}
+
+// incrementalBackupScript renders the part of scheduledBackupScript that
+// takes spec.backup.mode.incremental's nbackup backups into the
+// frequency's current pool, "<dir>/pool-<timestamp>" (the newest one by
+// name): a database with no level 0 there yet ("<database>-level0.nbk")
+// gets one, every other database a level 1 backup relative to it
+// ("<database>-level1-$TS.nbk"). A new pool, "<dir>/pool-$TS", is started
+// instead when there is none yet, when the current one's level 0 is
+// older than retention, or when a database's latest level 0 in its own
+// RDB$BACKUP_HISTORY (queried with isql) isn't the one in the pool:
+// Firebird always bases a level 1 backup on that latest level 0, so the
+// level 1 backup would be useless with the pool's own (e.g. after the
+// database was restored from a gbak backup, which has no backup history,
+// so a level 1 backup would even fail outright). Only once every backup of
+// the run has succeeded are all other pools deleted; under set -e, a
+// failed run leaves them alone, and the next run carries on with whatever
+// the new pool already holds. On Firebird 4.0 and later, every level 0
+// backup also prunes the database's backup history down to itself (see
+// nbackupCleanHistoryArgs). Expects $TS and $SYSDBA_PASSWORD to be set.
+func incrementalBackupScript(instance *kubebirdv1.Instance, dir string, retention retentionDuration) string {
+	conn := backupServiceConnection(instance)
+	port := instance.Spec.Service.Port
+	if port == 0 {
+		port = firebirdPort
+	}
+	level0Extra := ""
+	if canCleanBackupHistory(instance) {
+		level0Extra = nbackupCleanHistoryArgs
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "POOL_CUTOFF=$(date -u -d %q %s)\n", retention.dateAgo(), scheduledBackupTimestampDate)
+	b.WriteString("POOL=\n")
+	b.WriteString("POOL_TS=\n")
+	fmt.Fprintf(&b, "for p in %q/%s*; do\n", dir, scheduledBackupPoolPrefix)
+	b.WriteString("  [ -d \"$p\" ] || continue\n")
+	fmt.Fprintf(&b, "  PTS=$(basename \"$p\" | sed -n 's/^%s\\([0-9]\\{8\\}T[0-9]\\{6\\}Z\\)$/\\1/p')\n", scheduledBackupPoolPrefix)
+	b.WriteString("  [ -n \"$PTS\" ] || continue\n")
+	b.WriteString("  POOL=$p\n")
+	b.WriteString("  POOL_TS=$PTS\n")
+	b.WriteString("done\n")
+	b.WriteString("NEW=\n")
+	b.WriteString("if [ -z \"$POOL\" ] || expr \"$POOL_TS\" \\< \"$POOL_CUTOFF\" >/dev/null; then\n")
+	b.WriteString("  NEW=1\n")
+	b.WriteString("fi\n")
+	for _, name := range instance.Status.Databases {
+		level0 := fmt.Sprintf("\"$POOL\"/%q", strings.TrimSuffix(name, ".fdb")+"-level0.nbk")
+		dbConn := fmt.Sprintf("%s/%d:%s", instance.Name, port, path.Join(primaryDataMountPath, name))
+		fmt.Fprintf(&b, "if [ -z \"$NEW\" ] && { [ -e %[1]s ] || [ -e %[1]s.gz ]; }; then\n", level0)
+		fmt.Fprintf(&b, "  LAST=$(printf '%%s\\n' 'SET HEADING OFF;' 'SELECT FIRST 1 RDB$FILE_NAME FROM RDB$BACKUP_HISTORY WHERE RDB$BACKUP_LEVEL = 0 ORDER BY RDB$BACKUP_ID DESC;' | %s -q %s %s %s \"$SYSDBA_PASSWORD\" %q | awk 'NF { print $1; exit }')\n",
+			binIsql, flagUser, sysdbaUsername, flagPassword, dbConn)
+		fmt.Fprintf(&b, "  [ \"$LAST\" = %s ] || NEW=1\n", level0)
+		b.WriteString("fi\n")
+	}
+	b.WriteString("if [ -n \"$NEW\" ]; then\n")
+	fmt.Fprintf(&b, "  POOL=%q/%s\"$TS\"\n", dir, scheduledBackupPoolPrefix)
+	b.WriteString("  mkdir \"$POOL\"\n")
+	b.WriteString("  echo \"Started backup pool $POOL\"\n")
+	b.WriteString("fi\n")
+	for _, name := range instance.Status.Databases {
+		db := strings.TrimSuffix(name, ".fdb")
+		serverDBPath := path.Join(primaryDataMountPath, name)
+		level0 := fmt.Sprintf("\"$POOL\"/%q", db+"-level0.nbk")
+		level1 := fmt.Sprintf("\"$POOL\"/%q\"$TS\".nbk", db+"-level1-")
+		fmt.Fprintf(&b, "if [ -e %[1]s ] || [ -e %[1]s.gz ]; then\n", level0)
+		b.WriteString("  " + nbackupCommand(conn, serverDBPath, 1, level1, ""))
+		writeGzip(&b, instance, "  ", level1)
+		b.WriteString("else\n")
+		b.WriteString("  " + nbackupCommand(conn, serverDBPath, 0, level0, level0Extra))
+		writeGzip(&b, instance, "  ", level0)
+		b.WriteString("fi\n")
+	}
+	fmt.Fprintf(&b, "for p in %q/%s*; do\n", dir, scheduledBackupPoolPrefix)
+	b.WriteString("  [ -d \"$p\" ] && [ \"$p\" != \"$POOL\" ] || continue\n")
+	b.WriteString("  rm -rf \"$p\"\n")
+	b.WriteString("  echo \"Deleted backup pool $p\"\n")
+	b.WriteString("done\n")
 	return b.String()
 }
 
@@ -458,9 +619,10 @@ func scheduledBackupScript(instance *kubebirdv1.Instance, freq backupFrequency) 
 // can be exercised directly against a real temporary directory in tests.
 // A run claims the current timestamp by creating dir/.claim-$TS with
 // mkdir, which is atomic, so of several runs starting within the same
-// second only one gets it. It also skips a timestamp a backup file in dir
-// already carries, left by a run that finished within the same second it
-// started and has dropped its claim since. Whenever either check fails,
+// second only one gets it. It also skips a timestamp a backup file (or
+// mode.incremental pool, or level 1 backup in one) in dir already carries,
+// left by a run that finished within the same second it started and has
+// dropped its claim since. Whenever either check fails,
 // it waits a second and tries the next timestamp. The claim is removed
 // when the script exits; one left behind by a killed run is pruned along
 // with expired backups (see pruneScheduledBackupsScript).
@@ -470,7 +632,11 @@ func scheduledBackupUniqueTimestampScript(dir string) string {
 	b.WriteString("while :; do\n")
 	fmt.Fprintf(&b, "  TS=$(date -u %s)\n", scheduledBackupTimestampDate)
 	fmt.Fprintf(&b, "  if mkdir %s 2>/dev/null; then\n", claim)
-	fmt.Fprintf(&b, "    ls %q/*-\"$TS\".fbk* >/dev/null 2>&1 || break\n", dir)
+	b.WriteString("    USED=\n")
+	fmt.Fprintf(&b, "    for f in %[1]q/*-\"$TS\".[fn]bk* %[1]q/%[2]s\"$TS\" %[1]q/%[2]s*/*-\"$TS\".nbk*; do\n", dir, scheduledBackupPoolPrefix)
+	b.WriteString("      if [ -e \"$f\" ]; then USED=1; fi\n")
+	b.WriteString("    done\n")
+	b.WriteString("    [ -n \"$USED\" ] || break\n")
 	fmt.Fprintf(&b, "    rmdir %s\n", claim)
 	b.WriteString("  fi\n")
 	b.WriteString("  sleep 1\n")
@@ -510,6 +676,26 @@ func pruneScheduledBackupsScript(dir string, retention retentionDuration) string
 	b.WriteString("  [ -n \"$FTS\" ] || continue\n")
 	b.WriteString("  if expr \"$FTS\" \\< \"$CUTOFF\" >/dev/null; then\n")
 	b.WriteString("    rmdir \"$d\"\n")
+	b.WriteString("  fi\n")
+	b.WriteString("done\n")
+	return b.String()
+}
+
+// pruneExpiredPoolsScript renders the shell snippet that deletes every
+// mode.incremental pool directory in dir whose timestamp is older than
+// $CUTOFF (see pruneScheduledBackupsScript), so pools left behind after
+// switching away from mode.incremental expire under the same retention as
+// any other backup. Never used with mode.incremental itself, which
+// replaces its pools as a whole instead (see incrementalBackupScript).
+func pruneExpiredPoolsScript(dir string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "for p in %q/%s*; do\n", dir, scheduledBackupPoolPrefix)
+	b.WriteString("  [ -d \"$p\" ] || continue\n")
+	fmt.Fprintf(&b, "  PTS=$(basename \"$p\" | sed -n 's/^%s\\([0-9]\\{8\\}T[0-9]\\{6\\}Z\\)$/\\1/p')\n", scheduledBackupPoolPrefix)
+	b.WriteString("  [ -n \"$PTS\" ] || continue\n")
+	b.WriteString("  if expr \"$PTS\" \\< \"$CUTOFF\" >/dev/null; then\n")
+	b.WriteString("    rm -rf \"$p\"\n")
+	b.WriteString("    echo \"Deleted expired backup pool $p\"\n")
 	b.WriteString("  fi\n")
 	b.WriteString("done\n")
 	return b.String()

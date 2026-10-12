@@ -343,6 +343,17 @@ var _ = Describe("Manager", Ordered, func() {
 		// distinct backup each, every one of which restores to the
 		// database's content.
 		instanceScheduledBackupConcurrencySpecs()
+
+		// instanceScheduledBackupIncrementalSpecs
+		// (test/e2e/instance_scheduled_backup_incremental_test.go)
+		// exercises spec.backup.mode's physical, incremental
+		// scheduled backups: a pool's first run takes a level 0
+		// nbackup, later runs level 1 ones restoring together with
+		// it, and a run after the pool's level 0 expires starts a new
+		// pool, deletes the old one and prunes the backup history. Run
+		// on every Firebird major version that can prune it.
+		instanceScheduledBackupIncrementalSpecs("4.0.3")
+		instanceScheduledBackupIncrementalSpecs("5.0.4")
 	})
 })
 
