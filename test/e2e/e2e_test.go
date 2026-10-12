@@ -313,6 +313,15 @@ var _ = Describe("Manager", Ordered, func() {
 		instanceVersionUpgradeSpecs("3.0.14", "4.0.3")
 		instanceVersionUpgradeSpecs("4.0.3", "5.0.4")
 
+		// instanceInPlaceUpgradeSpecs
+		// (test/e2e/instance_inplace_upgrade_test.go) exercises changing
+		// spec.version on a live Instance: major upgrades (3 to 4, 4 to
+		// 5) back up, release the storage and restore onto the new
+		// version, keeping the data and a regular user's login; a move
+		// within a major version just restarts the pod; a major
+		// downgrade is refused.
+		instanceInPlaceUpgradeSpecs()
+
 		// instanceSecurityDatabaseSpecs
 		// (test/e2e/instance_security_database_test.go) exercises the
 		// security-database-init init container's backup/restore path for

@@ -485,9 +485,37 @@ spec:
                   phase is a high-level summary of the Instance's lifecycle state:
                   "Provisioning" while the StatefulSet or its databases aren't ready
                   yet, "Ready" once the pod is ready and every database in
-                  spec.databases has been created, or "Deleting" while owned
-                  resources are being garbage collected.
+                  spec.databases has been created, "Upgrading" while spec.version is
+                  being upgraded to a new Firebird major version (see upgrade), or
+                  "Deleting" while owned resources are being garbage collected.
                 type: string
+              upgrade:
+                description: |-
+                  upgrade tracks an upgrade of spec.version to a new Firebird major
+                  version while it's in progress; cleared once the Instance is Ready
+                  on the new version. A change within the same major version (e.g.
+                  4.0.3 to 4.0.5, or back) needs no tracking: the StatefulSet just
+                  restarts its pod on the new image.
+                properties:
+                  fromVersion:
+                    description: fromVersion is the version running when the upgrade
+                      started.
+                    type: string
+                  stage:
+                    description: stage is the step the upgrade is at.
+                    enum:
+                    - BackingUp
+                    - Releasing
+                    - Restoring
+                    type: string
+                  toVersion:
+                    description: toVersion is the spec.version being upgraded to.
+                    type: string
+                required:
+                - fromVersion
+                - stage
+                - toVersion
+                type: object
               warning:
                 description: |-
                   warning is a non-fatal notice from the most recent reconcile that

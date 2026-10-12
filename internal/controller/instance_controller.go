@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -66,6 +68,29 @@ const phaseReady = "Ready"
 // phaseDeleting is the value Reconcile reports in status.phase while an
 // Instance's owned resources are being garbage collected.
 const phaseDeleting = "Deleting"
+
+// phaseUpgrading is the value Reconcile reports in status.phase while
+// spec.version is being upgraded to a new Firebird major version (see
+// reconcileMajorUpgrade).
+const phaseUpgrading = "Upgrading"
+
+// waitRequeueInterval is how soon Reconcile runs again after a step that
+// is waiting on the cluster (see waitingError) rather than failing.
+const waitRequeueInterval = 5 * time.Second
+
+// waitingError reports that a reconcile step can't go further until the
+// cluster catches up (e.g. a pod stopping, or a backup Pod finishing),
+// rather than that it failed: reconcileInstance's caller records it in
+// status.message, not status.error, and requeues. reconcileDeletion
+// returns it like any other error, as before.
+type waitingError struct{ msg string }
+
+func (e *waitingError) Error() string { return e.msg }
+
+// waiting returns a waitingError with a fmt.Sprintf-formatted message.
+func waiting(format string, args ...any) error {
+	return &waitingError{msg: fmt.Sprintf(format, args...)}
+}
 
 // InstanceReconciler reconciles a Instance object
 type InstanceReconciler struct {
@@ -119,6 +144,12 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	reconcileErr := r.reconcileInstance(ctx, instance)
+	if wait := (*waitingError)(nil); errors.As(reconcileErr, &wait) {
+		if err := r.setProgress(ctx, instance, wait.Error()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: waitRequeueInterval}, nil
+	}
 	if err := r.setError(ctx, instance, reconcileErr); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -132,6 +163,13 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // each one's actual schedule from there, not Reconcile itself.
 func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *kubebirdv1.Instance) error {
 	if err := r.reconcileSysdbaSecret(ctx, instance); err != nil {
+		return err
+	}
+
+	// A major version upgrade takes over until its backups are taken and
+	// the old storage is released; only then does the rest of this
+	// function start spec.version on fresh storage, restoring them.
+	if handled, err := r.reconcileMajorUpgrade(ctx, instance); handled || err != nil {
 		return err
 	}
 
@@ -174,6 +212,9 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 	}
 
 	if sts.Status.ReadyReplicas > 0 && len(instance.Status.Databases) >= len(instance.Spec.Databases) {
+		if err := r.finishMajorUpgrade(ctx, instance); err != nil {
+			return err
+		}
 		if err := r.setPhase(ctx, instance, phaseReady); err != nil {
 			return err
 		}
@@ -183,7 +224,11 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 		}
 		return nil
 	}
-	if err := r.setPhase(ctx, instance, phaseProvisioning); err != nil {
+	phase := phaseProvisioning
+	if instance.Status.Upgrade != nil {
+		phase = phaseUpgrading
+	}
+	if err := r.setPhase(ctx, instance, phase); err != nil {
 		return err
 	}
 	if err := r.setAvailable(ctx, instance, metav1.ConditionFalse,
@@ -221,8 +266,19 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 		return err
 	}
 
-	if backupVolumeSpec(instance) != nil && backupOnDelete(instance) {
-		if err := r.backupDatabases(ctx, instance); err != nil {
+	// Once a major version upgrade is past BackingUp, the backup volume
+	// already holds the backup it took of the version it's upgrading
+	// from, and the primary storage holds nothing (yet) worth backing up
+	// over it: until the upgrade finishes, it's at most partly restored.
+	upgrade := instance.Status.Upgrade
+	backedUp := upgrade != nil && upgrade.Stage != kubebirdv1.UpgradeStageBackingUp
+	if backupVolumeSpec(instance) != nil && backupOnDelete(instance) && !backedUp {
+		version := instance.Spec.Version
+		if upgrade != nil {
+			// Still BackingUp: the databases are the old version's.
+			version = upgrade.FromVersion
+		}
+		if err := r.backupDatabases(ctx, instance, version); err != nil {
 			return err
 		}
 	}
@@ -237,6 +293,21 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 	controllerutil.RemoveFinalizer(instance, finalizerName)
 	if err := r.Update(ctx, instance); err != nil {
 		return fmt.Errorf("failed to remove finalizer: %w", err)
+	}
+	return nil
+}
+
+// setProgress records message, describing what Reconcile is waiting on
+// (see waitingError), in status.message and clears status.error, skipping
+// the write when nothing changed.
+func (r *InstanceReconciler) setProgress(ctx context.Context, instance *kubebirdv1.Instance, message string) error {
+	if instance.Status.Message == message && instance.Status.Error == "" {
+		return nil
+	}
+	instance.Status.Message = message
+	instance.Status.Error = ""
+	if err := r.Status().Update(ctx, instance); err != nil {
+		return fmt.Errorf("failed to report progress: %w", err)
 	}
 	return nil
 }
@@ -287,7 +358,11 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 // spec.Replicas still non-zero means the pod hasn't been asked to stop
 // yet; spec.Replicas zero but status.Replicas still non-zero means it
 // hasn't fully stopped yet; both zero means it's safe to back up.
-func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kubebirdv1.Instance) error {
+//
+// version is the Firebird version that wrote the databases: spec.version,
+// except while a major version upgrade backs up the version it's
+// upgrading from (see reconcileMajorUpgrade), which also calls this.
+func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kubebirdv1.Instance, version string) error {
 	sts := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, sts)
 	switch {
@@ -305,17 +380,17 @@ func (r *InstanceReconciler) backupDatabases(ctx context.Context, instance *kube
 		if err := r.Update(ctx, sts); err != nil {
 			return fmt.Errorf("failed to stop the Firebird pod: %w", err)
 		}
-		return fmt.Errorf("stopping the Firebird pod before backing up its databases")
+		return waiting("stopping the Firebird pod before backing up its databases")
 	case sts.Status.Replicas != 0:
 		if err := r.setDeletionMessage(ctx, instance, "Stopping the Firebird pod to back up its databases"); err != nil {
 			return err
 		}
-		return fmt.Errorf("waiting for the Firebird pod to stop before backing up its databases")
+		return waiting("waiting for the Firebird pod to stop before backing up its databases")
 	default:
 		if err := r.setDeletionMessage(ctx, instance, "Backing up databases into the backup volume"); err != nil {
 			return err
 		}
-		if err := r.backupDatabasesOffline(ctx, instance); err != nil {
+		if err := r.backupDatabasesOffline(ctx, instance, version); err != nil {
 			return err
 		}
 	}
