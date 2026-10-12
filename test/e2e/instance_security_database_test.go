@@ -31,6 +31,10 @@ import (
 	"github.com/henryx/kubebird/test/utils"
 )
 
+// securityDBPath is firebirdVersion's security database, as relocated to
+// the primary PVC by Kubebird.
+var securityDBPath = "/var/lib/firebird/data/" + securityDatabaseFile(".fdb")
+
 const (
 	securityDBInstanceName = "e2e-security-db"
 	securityDBSecretName   = securityDBInstanceName + "-sysdba"
@@ -38,8 +42,6 @@ const (
 	securityDBPrimaryPVC   = securityDBInstanceName + "-primary"
 	securityDBBackupPVC    = securityDBInstanceName + "-backup"
 	securityDBPodName      = securityDBInstanceName + "-0"
-	securityDBVersion      = "3.0.14"
-	securityDBPath         = "/var/lib/firebird/data/security3.fdb"
 	securityDBAppDBPath    = "/var/lib/firebird/data/" + securityDBDatabaseName
 	securityDBMarkerUser   = "MARKERUSER"
 
@@ -135,7 +137,7 @@ spec:
       - local:
           storage:
             size: 1Gi
-`, securityDBInstanceName, namespace, securityDBVersion, securityDBDatabaseName)
+`, securityDBInstanceName, namespace, firebirdVersion, securityDBDatabaseName)
 
 	Context("Instance security database content survives a delete/recreate via a local backup volume", Ordered, func() {
 		AfterAll(func() {
@@ -202,7 +204,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("having actually backed up the security database, marker user included, before releasing the primary PVC")
-			verifyBackupFiles(securityDBBackupPVC, backupBaseDir+"/security3.fbk")
+			verifyBackupFiles(securityDBBackupPVC, backupBaseDir+"/"+securityDatabaseFile(".fbk"))
 
 			By("re-applying the identical Instance CR")
 			cmd = exec.Command("kubectl", "apply", "-f", "-")

@@ -22,6 +22,7 @@ package e2e
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -32,6 +33,28 @@ import (
 )
 
 const firebirdContainer = "firebird"
+
+// firebirdVersion is the Firebird version (the firebirdsql/firebird image
+// tag) the e2e specs deploy, from the FIREBIRD_VERSION environment
+// variable, e.g. "FIREBIRD_VERSION=5.0.4 make test-e2e"; defaults to
+// 3.0.14. Specs testing a specific version, or a move between versions
+// (instanceVersionUpgradeSpecs, instanceScheduledBackupIncrementalSpecs),
+// pick their own instead.
+var firebirdVersion = func() string {
+	if v := os.Getenv("FIREBIRD_VERSION"); v != "" {
+		return v
+	}
+	return "3.0.14"
+}()
+
+// securityDatabaseFile returns the file name of firebirdVersion's security
+// database with the given extension, e.g. "security3.fdb" for 3.0.14 or
+// "security5.fbk" for a backup of 5.0.4's (see securityDatabasePath in
+// internal/controller).
+func securityDatabaseFile(ext string) string {
+	major, _, _ := strings.Cut(firebirdVersion, ".")
+	return "security" + major + ext
+}
 
 // backupBaseDir is the backup volume's fixed subdirectory for an instance's
 // own backups (see instanceBackupDir in internal/controller), replacing

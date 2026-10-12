@@ -59,7 +59,7 @@ metadata:
   namespace: %s
 spec:
   image: firebirdsql/firebird
-  version: 3.0.14
+  version: `+firebirdVersion+`
   databases:
     - name: "%s"
   storage:

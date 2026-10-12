@@ -32,18 +32,16 @@ import (
 )
 
 const (
-	versionUpgradeInstanceName = "e2e-version-upgrade"
-	versionUpgradeSecretName   = versionUpgradeInstanceName + "-sysdba"
 	versionUpgradeDatabaseName = "versionupgrade.fdb"
 	versionUpgradeDBPath       = "/var/lib/firebird/data/" + versionUpgradeDatabaseName
-	versionUpgradePodName      = versionUpgradeInstanceName + "-0"
-	versionUpgradeFromVersion  = "3.0.14"
-	versionUpgradeToVersion    = "4.0.3"
 )
 
 // instanceVersionUpgradeSpecs exercises deleting and recreating an
-// Instance under the same name with spec.version bumped to a new Firebird
-// major version: the backup taken on delete (with the old version's gbak)
+// Instance under the same name with spec.version bumped from
+// versionUpgradeFromVersion to a newer Firebird major version,
+// versionUpgradeToVersion, in an Instance named after both majors
+// ("e2e-version-upgrade-<from>-<to>"), so it can be called once per
+// upgrade path: the backup taken on delete (with the old version's gbak)
 // must restore cleanly under the new version's gbak and server, carrying
 // user data across the major-version upgrade, the recreated StatefulSet
 // must run the new image tag, and SYSDBA must authenticate against the
@@ -54,7 +52,13 @@ const (
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, after instanceTableRestoreSpecs, and before that Describe's
 // AfterAll tears down the manager.
-func instanceVersionUpgradeSpecs() {
+func instanceVersionUpgradeSpecs(versionUpgradeFromVersion, versionUpgradeToVersion string) {
+	fromMajor, _, _ := strings.Cut(versionUpgradeFromVersion, ".")
+	toMajor, _, _ := strings.Cut(versionUpgradeToVersion, ".")
+	versionUpgradeInstanceName := fmt.Sprintf("e2e-version-upgrade-%s-%s", fromMajor, toMajor)
+	versionUpgradeSecretName := versionUpgradeInstanceName + "-sysdba"
+	versionUpgradePodName := versionUpgradeInstanceName + "-0"
+
 	manifest := func(version string) string {
 		return fmt.Sprintf(`
 apiVersion: kubebird.github.io/v1
@@ -79,9 +83,9 @@ spec:
 `, versionUpgradeInstanceName, namespace, version, versionUpgradeDatabaseName)
 	}
 
-	Context("Instance version upgrade across delete/recreate", Ordered, func() {
+	Context(fmt.Sprintf("Instance version upgrade from %s to %s across delete/recreate", versionUpgradeFromVersion, versionUpgradeToVersion), Ordered, func() {
 		AfterAll(func() {
-			By("deleting the e2e-version-upgrade Instance, if it still exists")
+			By("deleting the " + versionUpgradeInstanceName + " Instance, if it still exists")
 			cmd := exec.Command("kubectl", "delete", "instance", versionUpgradeInstanceName,
 				"-n", namespace, "--ignore-not-found", "--timeout=2m")
 			_, _ = utils.Run(cmd)
@@ -114,7 +118,7 @@ spec:
 			expectFirebirdVersionLabel(versionUpgradeInstanceName, versionUpgradePodName, versionUpgradeFromVersion)
 
 			By("creating a marker table to prove data survives the upgrade")
-			_, err = versionUpgradeRunIsql(versionUpgradeSecretName, "CREATE TABLE PRE_UPGRADE (ID INTEGER);\nCOMMIT;\nQUIT;\n")
+			_, err = versionUpgradeRunIsql(versionUpgradePodName, versionUpgradeSecretName, "CREATE TABLE PRE_UPGRADE (ID INTEGER);\nCOMMIT;\nQUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
 		})
 
@@ -162,48 +166,48 @@ spec:
 			expectFirebirdVersionLabel(versionUpgradeInstanceName, versionUpgradePodName, versionUpgradeToVersion)
 
 			By("matching the version the server itself reports over SQL")
-			output, err = versionUpgradeRunIsql(versionUpgradeSecretName,
+			output, err = versionUpgradeRunIsql(versionUpgradePodName, versionUpgradeSecretName,
 				"SET HEADING OFF;\nSELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') FROM rdb$database;\nQUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(strings.TrimSpace(output)).To(Equal(versionUpgradeToVersion))
 
 			By("finding the marker table created before the upgrade")
-			schema, err := versionUpgradeExtractSchema(versionUpgradeSecretName)
+			schema, err := versionUpgradeExtractSchema(versionUpgradePodName, versionUpgradeSecretName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(schema).To(ContainSubstring("PRE_UPGRADE"))
 
 			By("authenticating as SYSDBA against the upgraded server with the Secret's (unchanged) password")
-			_, err = versionUpgradeRunIsql(versionUpgradeSecretName, "QUIT;\n")
+			_, err = versionUpgradeRunIsql(versionUpgradePodName, versionUpgradeSecretName, "QUIT;\n")
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 }
 
-// versionUpgradeRunIsql execs isql against the e2e-version-upgrade
-// Instance's database, authenticating as SYSDBA with the password read
+// versionUpgradeRunIsql execs isql against the database of the
+// e2e-version-upgrade Instance whose pod is podName, authenticating as SYSDBA with the password read
 // from secretName, and feeds it script over stdin. Used to run DDL that
 // changes the database rather than just read from it.
-func versionUpgradeRunIsql(secretName, script string) (string, error) {
+func versionUpgradeRunIsql(podName, secretName, script string) (string, error) {
 	password, err := getSecretField(secretName, "password")
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command("kubectl", "exec", "-i", versionUpgradePodName, "-n", namespace, "-c", firebirdContainer,
+	cmd := exec.Command("kubectl", "exec", "-i", podName, "-n", namespace, "-c", firebirdContainer,
 		"--", "isql", "-user", "SYSDBA", "-password", password, versionUpgradeDBPath)
 	cmd.Stdin = strings.NewReader(script)
 	return utils.Run(cmd)
 }
 
-// versionUpgradeExtractSchema returns the full DDL of the
-// e2e-version-upgrade Instance's database via isql -x, used to confirm the
+// versionUpgradeExtractSchema returns the full DDL of the database of the
+// e2e-version-upgrade Instance whose pod is podName via isql -x, used to confirm the
 // marker table survived the backup/restore across the version upgrade
 // without depending on isql's exit code for a SQL-level error.
-func versionUpgradeExtractSchema(secretName string) (string, error) {
+func versionUpgradeExtractSchema(podName, secretName string) (string, error) {
 	password, err := getSecretField(secretName, "password")
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command("kubectl", "exec", versionUpgradePodName, "-n", namespace, "-c", firebirdContainer,
+	cmd := exec.Command("kubectl", "exec", podName, "-n", namespace, "-c", firebirdContainer,
 		"--", "isql", "-x", "-user", "SYSDBA", "-password", password, versionUpgradeDBPath)
 	return utils.Run(cmd)
 }

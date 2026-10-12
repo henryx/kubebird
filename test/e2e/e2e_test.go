@@ -302,13 +302,16 @@ var _ = Describe("Manager", Ordered, func() {
 		// second round.
 		instanceTableRestoreSpecs()
 
-		// instanceVersionUpgradeSpecs (test/e2e/instance_test.go)
-		// exercises deleting and recreating an Instance under the
-		// same name with spec.version bumped to a new Firebird major
-		// version: the backup taken with the old version's gbak
-		// restores cleanly under the new version's gbak and server,
-		// carrying user data across the upgrade.
-		instanceVersionUpgradeSpecs()
+		// instanceVersionUpgradeSpecs
+		// (test/e2e/instance_version_upgrade_test.go) exercises
+		// deleting and recreating an Instance under the same name
+		// with spec.version bumped to a new Firebird major version:
+		// the backup taken with the old version's gbak restores
+		// cleanly under the new version's gbak and server, carrying
+		// user data across the upgrade. Run for every major upgrade
+		// path, 3 to 4 and 4 to 5.
+		instanceVersionUpgradeSpecs("3.0.14", "4.0.3")
+		instanceVersionUpgradeSpecs("4.0.3", "5.0.4")
 
 		// instanceSecurityDatabaseSpecs
 		// (test/e2e/instance_security_database_test.go) exercises the

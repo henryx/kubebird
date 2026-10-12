@@ -76,7 +76,7 @@ metadata:
   namespace: %s
 spec:
   image: firebirdsql/firebird
-  version: 3.0.14
+  version: `+firebirdVersion+`
   databases:
     - name: %q
   storage:
@@ -147,7 +147,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("labelling the generated objects, the CronJob included, with the version the running server reports")
-			expectFirebirdVersionLabel(scheduledBackupInstanceName, scheduledBackupPodName, "3.0.14",
+			expectFirebirdVersionLabel(scheduledBackupInstanceName, scheduledBackupPodName, firebirdVersion,
 				"cronjob/"+scheduledBackupCronJob)
 		})
 

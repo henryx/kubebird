@@ -77,7 +77,7 @@ metadata:
   namespace: %s
 spec:
   image: firebirdsql/firebird
-  version: 3.0.14
+  version: `+firebirdVersion+`
   databases:
     - name: "invalid.fdb"
       shadow: true
@@ -102,7 +102,7 @@ metadata:
   namespace: %s
 spec:
   image: firebirdsql/firebird
-  version: 3.0.14
+  version: `+firebirdVersion+`
   databases:
     - name: "instance.fdb"
     - name: "shadowed.fdb"
@@ -217,7 +217,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("labelling the generated objects with the version the running server reports")
-			expectFirebirdVersionLabel(instanceName, instancePod(), "3.0.14", "pvc/"+instanceName+"-shadow")
+			expectFirebirdVersionLabel(instanceName, instancePod(), firebirdVersion, "pvc/"+instanceName+"-shadow")
 		})
 
 		It("should provision a newly added database without disturbing existing ones", func() {
@@ -385,7 +385,7 @@ spec:
 			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/instance.fbk", backupBaseDir+"/shadowed.fbk")
 
 			By("also backing up the security database itself, since the primary PVC carrying it is about to be released")
-			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/security3.fbk")
+			verifyBackupFiles(instanceBackupPVCName, backupBaseDir+"/"+securityDatabaseFile(".fbk"))
 		})
 
 		It("should restore databases from their backups when the Instance is recreated", func() {
@@ -398,7 +398,7 @@ metadata:
   namespace: %s
 spec:
   image: firebirdsql/firebird
-  version: 3.0.14
+  version: `+firebirdVersion+`
   databases:
     - name: "instance.fdb"
     - name: "shadowed.fdb"
@@ -449,7 +449,7 @@ spec:
 
 			By("restoring the security database from its backup via the security-database-init initContainer, instead of seeding the image's stock default")
 			cmd = exec.Command("kubectl", "exec", instancePod(), "-n", namespace, "-c", firebirdContainer,
-				"--", "test", "-f", "/var/lib/firebird/data/security3.fdb")
+				"--", "test", "-f", "/var/lib/firebird/data/"+securityDatabaseFile(".fdb"))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 

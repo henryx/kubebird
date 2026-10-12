@@ -84,7 +84,7 @@ var concurrentBackupFrequencies = []string{"hour", "day", "week", "month", "year
 // e2e_test.go, after the CRDs are installed and the controller-manager is
 // deployed, and before that Describe's AfterAll tears them down.
 func instanceScheduledBackupConcurrencySpecs() {
-	const manifestTemplate = `
+	manifestTemplate := `
 apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
@@ -92,7 +92,7 @@ metadata:
   namespace: %s
 spec:
   image: firebirdsql/firebird
-  version: 3.0.14
+  version: ` + firebirdVersion + `
   databases:
     - name: %q
   storage:

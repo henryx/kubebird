@@ -11,8 +11,17 @@ jobs:
   test-e2e:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: Run on Ubuntu (Firebird ${{ matrix.firebird-version }})
     runs-on: ubuntu-latest
+    strategy:
+      # Run every version to completion, so one version's failure doesn't
+      # hide whether the others pass.
+      fail-fast: false
+      matrix:
+        # The version most e2e specs deploy (FIREBIRD_VERSION, see
+        # test/e2e/instance_helpers_test.go). Specs pinning their own
+        # versions (version upgrades, incremental backups) run on every leg.
+        firebird-version: ["3.0.14", "4.0.3", "5.0.4"]
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -26,7 +35,7 @@ jobs:
 
       - name: Install the latest version of kind
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
@@ -34,6 +43,8 @@ jobs:
         run: kind version
 
       - name: Running Test e2e
+        env:
+          FIREBIRD_VERSION: ${{ matrix.firebird-version }}
         run: |
           go mod tidy
           make test-e2e
