@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 ### Added
 
@@ -52,6 +52,7 @@
   the old version's label until the new server's version is detected, then switch to it. This
   needs the new `patch` verb on `persistentvolumeclaims` and `secrets` in the manager's Role, so
   apply the new RBAC along with the new image.
+
 ### Changed
 
 - The e2e suite runs against Firebird `3.0.14`, `4.0.3` and `5.0.4`: the version most specs deploy
