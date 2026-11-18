@@ -144,7 +144,10 @@ func TestPruneScheduledBackupsScript(t *testing.T) {
 		"instance-" + stamp(5*24*time.Hour) + ".nbk.gz", // Kubebird 0.3.1 and earlier
 		"instance-" + stamp(5*24*time.Hour) + ".nbk",
 	}
-	expiredClaims := []string{scheduledBackupClaimPrefix + stamp(4*24*time.Hour)}
+	expiredClaims := []string{
+		scheduledBackupClaimPrefix + stamp(4*24*time.Hour),
+		scheduledBackupClaimPrefix + stamp(5*24*time.Hour), // a directory, as Kubebird 0.4.0 and earlier claimed
+	}
 	kept := []string{
 		"instance-" + stamp(3*24*time.Hour-time.Hour) + ".fbk.gz",
 		"instance-" + stamp(time.Hour) + ".fbk",
@@ -158,10 +161,13 @@ func TestPruneScheduledBackupsScript(t *testing.T) {
 			t.Fatalf("failed to create fixture file: %v", err)
 		}
 	}
-	for _, name := range append(slices.Clone(expiredClaims), keptClaims...) {
-		if err := os.Mkdir(filepath.Join(dir, name), 0o700); err != nil {
+	for _, name := range append(slices.Clone(expiredClaims[:1]), keptClaims...) {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
 			t.Fatalf("failed to create fixture claim: %v", err)
 		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, expiredClaims[1]), 0o700); err != nil {
+		t.Fatalf("failed to create fixture claim directory: %v", err)
 	}
 
 	script := "set -e\n" + pruneScheduledBackupsScript(dir, retention)
@@ -232,7 +238,7 @@ func TestScheduledBackupUniqueTimestampScript(t *testing.T) {
 	}
 	claimed := now.Add(3 * time.Second).Format("20060102T150405Z")
 	taken[claimed] = true
-	if err := os.Mkdir(filepath.Join(dir, scheduledBackupClaimPrefix+claimed), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, scheduledBackupClaimPrefix+claimed), nil, 0o600); err != nil {
 		t.Fatalf("failed to create fixture claim: %v", err)
 	}
 
@@ -386,9 +392,9 @@ func TestScheduledBackupScript(t *testing.T) {
 
 	for _, want := range []string{
 		"TS=$(date -u +%Y%m%dT%H%M%SZ)",
-		`if mkdir "/var/lib/firebird/backup/hour"/.claim-"$TS" 2>/dev/null; then`,
+		`if (set -C; : > "/var/lib/firebird/backup/hour"/.claim-"$TS") 2>/dev/null; then`,
 		`for f in "/var/lib/firebird/backup/hour"/*-"$TS".[fn]bk* "/var/lib/firebird/backup/hour"/pool-"$TS" "/var/lib/firebird/backup/hour"/pool-*/*-"$TS".nbk*; do`,
-		`trap 'rmdir "/var/lib/firebird/backup/hour"/.claim-"$TS"' EXIT`,
+		`trap 'rm -f "/var/lib/firebird/backup/hour"/.claim-"$TS"' EXIT`,
 		"fbsvcmgr",
 		"test/3050:service_mgr",
 		"-action_backup",

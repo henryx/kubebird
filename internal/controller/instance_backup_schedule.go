@@ -92,10 +92,11 @@ var scheduledBackupLockPath = path.Join(backupDataMountPath, ".scheduled-backup.
 // is the time the pool's first run started (see incrementalBackupScript).
 const scheduledBackupPoolPrefix = "pool-"
 
-// scheduledBackupClaimPrefix names the directory a scheduled backup run
+// scheduledBackupClaimPrefix names the empty file a scheduled backup run
 // creates in its frequency's backup directory, ".claim-<timestamp>", to
 // claim its timestamp before using it (see
-// scheduledBackupUniqueTimestampScript).
+// scheduledBackupUniqueTimestampScript). Kubebird 0.4.0 and earlier
+// created it as a directory instead; pruning removes either.
 const scheduledBackupClaimPrefix = ".claim-"
 
 // scheduledBackupActiveDeadline bounds how long a scheduled backup Job may
@@ -617,9 +618,13 @@ func incrementalBackupScript(instance *kubebirdv1.Instance, dir string, retentio
 // $TS to a UTC timestamp (scheduledBackupTimestampDate) no other run of
 // the same frequency uses — factored out of scheduledBackupScript so it
 // can be exercised directly against a real temporary directory in tests.
-// A run claims the current timestamp by creating dir/.claim-$TS with
-// mkdir, which is atomic, so of several runs starting within the same
-// second only one gets it. It also skips a timestamp a backup file (or
+// A run claims the current timestamp by creating the file dir/.claim-$TS
+// with a noclobber ("set -C") redirection, which the shell itself opens
+// with O_EXCL, so of several runs starting within the same second only one
+// gets it. It deliberately doesn't use "mkdir": the uutils coreutils
+// mkdir (Ubuntu 26.04's default) reports success to every one of several
+// processes racing to create the same directory, letting two runs share a
+// timestamp and one's EXIT trap remove the other's claim. It also skips a timestamp a backup file (or
 // mode.incremental pool, or level 1 backup in one) in dir already carries,
 // left by a run that finished within the same second it started and has
 // dropped its claim since. Whenever either check fails,
@@ -631,17 +636,17 @@ func scheduledBackupUniqueTimestampScript(dir string) string {
 	var b strings.Builder
 	b.WriteString("while :; do\n")
 	fmt.Fprintf(&b, "  TS=$(date -u %s)\n", scheduledBackupTimestampDate)
-	fmt.Fprintf(&b, "  if mkdir %s 2>/dev/null; then\n", claim)
+	fmt.Fprintf(&b, "  if (set -C; : > %s) 2>/dev/null; then\n", claim)
 	b.WriteString("    USED=\n")
 	fmt.Fprintf(&b, "    for f in %[1]q/*-\"$TS\".[fn]bk* %[1]q/%[2]s\"$TS\" %[1]q/%[2]s*/*-\"$TS\".nbk*; do\n", dir, scheduledBackupPoolPrefix)
 	b.WriteString("      if [ -e \"$f\" ]; then USED=1; fi\n")
 	b.WriteString("    done\n")
 	b.WriteString("    [ -n \"$USED\" ] || break\n")
-	fmt.Fprintf(&b, "    rmdir %s\n", claim)
+	fmt.Fprintf(&b, "    rm -f %s\n", claim)
 	b.WriteString("  fi\n")
 	b.WriteString("  sleep 1\n")
 	b.WriteString("done\n")
-	fmt.Fprintf(&b, "trap 'rmdir %s' EXIT\n", claim)
+	fmt.Fprintf(&b, "trap 'rm -f %s' EXIT\n", claim)
 	return b.String()
 }
 
@@ -670,12 +675,12 @@ func pruneScheduledBackupsScript(dir string, retention retentionDuration) string
 	b.WriteString("  fi\n")
 	b.WriteString("done\n")
 	fmt.Fprintf(&b, "for d in %q/%s*; do\n", dir, scheduledBackupClaimPrefix)
-	b.WriteString("  [ -d \"$d\" ] || continue\n")
+	b.WriteString("  [ -e \"$d\" ] || continue\n")
 	fmt.Fprintf(&b, "  FTS=$(basename \"$d\" | sed -n 's/^%s\\([0-9]\\{8\\}T[0-9]\\{6\\}Z\\)$/\\1/p')\n",
 		strings.ReplaceAll(scheduledBackupClaimPrefix, ".", "\\."))
 	b.WriteString("  [ -n \"$FTS\" ] || continue\n")
 	b.WriteString("  if expr \"$FTS\" \\< \"$CUTOFF\" >/dev/null; then\n")
-	b.WriteString("    rmdir \"$d\"\n")
+	b.WriteString("    rm -rf \"$d\"\n")
 	b.WriteString("  fi\n")
 	b.WriteString("done\n")
 	return b.String()
