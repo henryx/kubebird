@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Regular Firebird users. `spec.authentication` now maps each user name to its credentials: `sysdba`
+  configures SYSDBA as before, and any other key declares a regular user, whose password comes from
+  `secretRef`, or from a generated `<name>-<user>` Secret (lowercased, underscores turned into
+  dashes) when it's empty. Kubebird creates each user in the security database once the pod is
+  ready, applies a changed Secret's password on the running server without restarting the pod, and
+  deletes a user removed from `spec.authentication` (only users it created itself). The users it
+  manages are listed in the new `status.users`. Existing manifests with only `authentication.sysdba`
+  keep working unchanged.
+- `spec.databases[].owner` creates a database, and restores it from its backup, as `sysdba` (the
+  default) or one of the regular users, which then owns it. Firebird can't change a database's
+  owner, so the CRD rejects changing `owner` on a database already declared.
+
+### Changed
+
+- In the Go API (`api/v1`), `AuthenticationSpec` is now a `map[string]UserAuthSpec` keyed by user
+  name (`SysdbaUserName`, `"sysdba"`, for SYSDBA), replacing the `Sysdba SysdbaAuthSpec` field. The
+  YAML shape of `authentication.sysdba` is unchanged.
+
 ## 0.4.0
 
 ### Added
@@ -75,7 +97,7 @@
   run side by side instead of waiting for each other. The lock file left on the backup volume by
   0.3.1 is no longer used and can be deleted. Two runs of the same frequency starting within the
   same second still never share a file name: each run claims its timestamp with a
-  `.claim-<timestamp>` directory, created atomically, before using it. The 6-hour
+  `.claim-<timestamp>` file, created exclusively (`set -C`), before using it. The 6-hour
   `activeDeadlineSeconds` stays, so a hung backup still can't stop its frequency's backups for good.
 
 ## 0.3.1

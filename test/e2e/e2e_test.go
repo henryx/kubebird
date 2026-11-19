@@ -332,6 +332,14 @@ var _ = Describe("Manager", Ordered, func() {
 		// from the backup taken before the primary PVC was released.
 		instanceSecurityDatabaseSpecs()
 
+		// instanceUserSpecs (test/e2e/instance_users_test.go)
+		// exercises regular users in spec.authentication and
+		// databases[].owner: generated Secrets, users created in the
+		// security database, a database created and, after a
+		// delete/recreate, restored as its owner, a rotated password
+		// applied without a pod restart, and a removed user deleted.
+		instanceUserSpecs()
+
 		// instanceScheduledBackupSpecs
 		// (test/e2e/instance_scheduled_backup_test.go) exercises
 		// spec.backup.retention's CronJob-driven scheduled backups:

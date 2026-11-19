@@ -171,10 +171,15 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 			}
 		}
 
-		if err := r.execInPod(ctx, instance.Namespace, podName, sysdbaCommand, databaseCreateScript(db)); err != nil {
+		owner, ownerPassword, err := r.databaseOwnerCredentials(ctx, instance, db, password)
+		if err != nil {
+			return err
+		}
+		createCommand := []string{binIsql, flagUser, owner, flagPassword, ownerPassword}
+		if err := r.execInPod(ctx, instance.Namespace, podName, createCommand, databaseCreateScript(db)); err != nil {
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
-		logf.FromContext(ctx).Info("Created database", "database", db.Name)
+		logf.FromContext(ctx).Info("Created database", "database", db.Name, "owner", owner)
 	}
 
 	removedSet := make(map[string]bool, len(removed))
@@ -598,8 +603,14 @@ func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, inst
 		return false, nil
 	}
 
+	// gbak's restore makes the user it runs as the restored database's
+	// owner, whoever owned it when it was backed up.
+	owner, ownerPassword, err := r.databaseOwnerCredentials(ctx, instance, db, password)
+	if err != nil {
+		return false, err
+	}
 	dbPath := path.Join(primaryDataMountPath, db.Name)
-	restoreCommand := []string{binGbak, "-create", flagVerify, flagUser, sysdbaUsername, flagPassword, password, backupPath, dbPath}
+	restoreCommand := []string{binGbak, "-create", flagVerify, flagUser, owner, flagPassword, ownerPassword, backupPath, dbPath}
 	if err := r.execInPod(ctx, instance.Namespace, podName, restoreCommand, ""); err != nil {
 		return false, fmt.Errorf("gbak restore failed: %w", err)
 	}

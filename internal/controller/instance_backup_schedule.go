@@ -95,8 +95,9 @@ const scheduledBackupPoolPrefix = "pool-"
 // scheduledBackupClaimPrefix names the empty file a scheduled backup run
 // creates in its frequency's backup directory, ".claim-<timestamp>", to
 // claim its timestamp before using it (see
-// scheduledBackupUniqueTimestampScript). Kubebird 0.4.0 and earlier
-// created it as a directory instead; pruning removes either.
+// scheduledBackupUniqueTimestampScript). Development builds before
+// 0.4.0 (the :dev image) created it as a directory instead; pruning
+// removes either.
 const scheduledBackupClaimPrefix = ".claim-"
 
 // scheduledBackupActiveDeadline bounds how long a scheduled backup Job may

@@ -26,6 +26,7 @@ import (
 // InstanceSpec defines the desired state of Instance
 // +kubebuilder:validation:XValidation:rule="!self.databases.exists(d, d.shadow) || has(self.storage.shadow)",message="storage.shadow is required when any database has shadow enabled"
 // +kubebuilder:validation:XValidation:rule="!has(self.backup) || !self.backup.enabled || size(self.backup.destinations) > 0",message="backup.destinations must contain at least one entry when backup.enabled is true"
+// +kubebuilder:validation:XValidation:rule="self.databases.all(d, !has(d.owner) || d.owner == 'sysdba' || d.owner == 'SYSDBA' || (has(self.authentication) && d.owner in self.authentication))",message="databases[].owner must be sysdba or a user declared in authentication"
 type InstanceSpec struct {
 	// image is the container image used to run the Firebird instance.
 	// +kubebuilder:validation:Required
@@ -52,9 +53,12 @@ type InstanceSpec struct {
 	// +kubebuilder:validation:Required
 	Storage StorageSpec `json:"storage"`
 
-	// authentication configures credentials for the instance.
+	// authentication configures the instance's Firebird users, keyed by
+	// user name: "sysdba" for SYSDBA itself, any other key for a regular
+	// user Kubebird creates (and keeps the password of) in the security
+	// database.
 	// +optional
-	Authentication AuthenticationSpec `json:"authentication,omitzero"`
+	Authentication AuthenticationSpec `json:"authentication,omitempty"`
 
 	// backup configures backing up the instance's databases.
 	// +optional
@@ -62,6 +66,7 @@ type InstanceSpec struct {
 }
 
 // DatabaseSpec defines a single database to create on the instance.
+// +kubebuilder:validation:XValidation:rule="has(self.owner) == has(oldSelf.owner) && (!has(self.owner) || self.owner == oldSelf.owner)",message="owner can't be changed: Firebird can't change a database's owner"
 type DatabaseSpec struct {
 	// name is the database file name, e.g. "instance.fdb".
 	// +kubebuilder:validation:Required
@@ -94,6 +99,16 @@ type DatabaseSpec struct {
 	// +kubebuilder:default="UTF8"
 	// +optional
 	Collation string `json:"collation,omitempty"`
+
+	// owner is the user the database is created (or restored from its
+	// backup) as, and so owned by: "sysdba" (or "SYSDBA"), or a user
+	// declared in authentication, spelled exactly as its key. Defaults to
+	// SYSDBA. Firebird can't change a database's owner afterwards, so it
+	// can't be set, changed or unset once the database is declared.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z][A-Za-z0-9_]*$`
+	// +kubebuilder:validation:MaxLength=31
+	// +optional
+	Owner string `json:"owner,omitempty"`
 }
 
 // ServiceSpec configures the Service exposing the instance.
@@ -314,19 +329,27 @@ type StorageVolumeSpec struct {
 	Size resource.Quantity `json:"size"`
 }
 
-// AuthenticationSpec configures credentials for the instance.
-type AuthenticationSpec struct {
-	// sysdba configures the SYSDBA account credentials.
-	// +optional
-	Sysdba SysdbaAuthSpec `json:"sysdba,omitzero"`
-}
+// SysdbaUserName is the authentication key configuring SYSDBA itself;
+// every other key names a regular user.
+const SysdbaUserName = "sysdba"
 
-// SysdbaAuthSpec configures the SYSDBA account credentials.
-type SysdbaAuthSpec struct {
-	// secretRef is the name of the Secret containing the SYSDBA
-	// credentials. Defaults to "<instance-name>-sysdba" if not specified;
-	// that Secret is created automatically with a generated password if
-	// it doesn't already exist.
+// AuthenticationSpec maps a Firebird user name to its credentials. The
+// "sysdba" key configures SYSDBA; any other key a regular user. Firebird
+// user names are case-insensitive, so two keys differing only in case
+// would name the same user and are rejected.
+// +kubebuilder:validation:MaxProperties=32
+// +kubebuilder:validation:XValidation:rule="self.all(u, u.matches('^[A-Za-z][A-Za-z0-9_]{0,30}$'))",message="authentication keys must be Firebird user names: a letter, then letters, digits or underscores, at most 31 characters"
+// +kubebuilder:validation:XValidation:rule="self.all(u, u.lowerAscii() != 'sysdba' || u == 'sysdba')",message="SYSDBA must be configured with the lowercase key sysdba"
+// +kubebuilder:validation:XValidation:rule="self.all(u, self.filter(v, v.lowerAscii() == u.lowerAscii()).size() == 1)",message="authentication keys must differ in more than letter case: Firebird user names are case-insensitive"
+type AuthenticationSpec map[string]UserAuthSpec
+
+// UserAuthSpec configures one Firebird user's credentials.
+type UserAuthSpec struct {
+	// secretRef is the name of the Secret holding the user's password
+	// under its "password" key. Defaults to "<instance-name>-<user>" (the
+	// user name lowercased, underscores turned into dashes), created with
+	// a generated password if it doesn't exist yet. When set, the Secret
+	// must already exist.
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
 }
@@ -409,6 +432,27 @@ type InstanceStatus struct {
 	// restarts its pod on the new image.
 	// +optional
 	Upgrade *UpgradeStatus `json:"upgrade,omitempty"`
+
+	// users lists the regular users (every authentication key but sysdba)
+	// Kubebird has created in the security database, with the version of
+	// the Secret whose password each was last given: a user whose Secret
+	// changed gets the new password, and one no longer in authentication
+	// is deleted.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Users []UserStatus `json:"users,omitempty"`
+}
+
+// UserStatus records a regular user Kubebird manages in the security
+// database.
+type UserStatus struct {
+	// name is the user's authentication key.
+	Name string `json:"name"`
+
+	// secretVersion is the resourceVersion of the user's Secret when its
+	// password was last applied.
+	SecretVersion string `json:"secretVersion"`
 }
 
 // UpgradeStage is the step an in-progress major version upgrade is at.

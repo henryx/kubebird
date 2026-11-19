@@ -10,9 +10,11 @@ spec:
   version: 3.0.14
   databases:
     - name: "instance.fdb"
+      owner: exampleUser
   storage:
     primary:
       size: 3Gi
   authentication:
     sysdba:
       secretRef: instance-sample-sysdba
+    exampleUser: {}

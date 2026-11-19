@@ -118,10 +118,7 @@ func firebirdPodSelector(name string) map[string]string {
 // spec.authentication.sysdba, defaulting to "<instance-name>-sysdba" when
 // spec.authentication.sysdba.secretRef isn't specified.
 func sysdbaSecretRefName(instance *kubebirdv1.Instance) string {
-	if ref := instance.Spec.Authentication.Sysdba.SecretRef; ref != "" {
-		return ref
-	}
-	return instance.Name + "-sysdba"
+	return userSecretName(instance, kubebirdv1.SysdbaUserName)
 }
 
 // aliasesConfigMapName returns the name of the ConfigMap registering
@@ -256,37 +253,43 @@ func (r *InstanceReconciler) deletePVC(ctx context.Context, instance *kubebirdv1
 }
 
 // reconcileSysdbaSecret ensures the Secret backing spec.authentication.sysdba
-// exists. When spec.authentication.sysdba.secretRef is set, that Secret must
-// already exist (it's the user's responsibility to have created it) and
-// reconciliation fails if it doesn't; when unset, the default
-// "<instance-name>-sysdba" Secret is created with a freshly generated random
+// exists (see reconcileUserSecret), its username key being SYSDBA.
+func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance *kubebirdv1.Instance) error {
+	return r.reconcileUserSecret(ctx, instance, kubebirdv1.SysdbaUserName, sysdbaUsername)
+}
+
+// reconcileUserSecret ensures the Secret backing spec.authentication[user]
+// exists. When its secretRef is set, that Secret must already exist (it's
+// the user's responsibility to have created it) and reconciliation fails
+// if it doesn't; when unset, the default Secret (see userSecretName) is
+// created with username as its username key and a freshly generated random
 // password if missing. An existing Secret, whether created by a previous
 // reconcile or supplied by the user ahead of time, is left untouched, apart
 // from its firebirdVersionLabelKey label (see syncFirebirdVersionLabel). The
 // Secret is deliberately never owner-referenced to the Instance, so it
 // survives deleting the Instance rather than being garbage collected along
 // with it.
-func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance *kubebirdv1.Instance) error {
-	secretRef := sysdbaSecretRefName(instance)
+func (r *InstanceReconciler) reconcileUserSecret(ctx context.Context, instance *kubebirdv1.Instance, user, username string) error {
+	secretRef := userSecretName(instance, user)
 	nsName := types.NamespacedName{Name: secretRef, Namespace: instance.Namespace}
 
 	existing := &corev1.Secret{}
 	if err := r.Get(ctx, nsName, existing); err == nil {
 		if err := r.syncFirebirdVersionLabel(ctx, instance, existing); err != nil {
-			return fmt.Errorf("failed to label SYSDBA Secret %q with the Firebird version: %w", secretRef, err)
+			return fmt.Errorf("failed to label Secret %q of user %s with the Firebird version: %w", secretRef, user, err)
 		}
 		return nil
 	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to get SYSDBA Secret %q: %w", secretRef, err)
+		return fmt.Errorf("failed to get Secret %q of user %s: %w", secretRef, user, err)
 	}
 
-	if instance.Spec.Authentication.Sysdba.SecretRef != "" {
-		return fmt.Errorf("SYSDBA Secret %q specified in spec.authentication.sysdba.secretRef not found", secretRef)
+	if instance.Spec.Authentication[user].SecretRef != "" {
+		return fmt.Errorf("secret %q specified in spec.authentication.%s.secretRef not found", secretRef, user)
 	}
 
 	password, err := generateRandomPassword()
 	if err != nil {
-		return fmt.Errorf("failed to generate SYSDBA password: %w", err)
+		return fmt.Errorf("failed to generate password for user %s: %w", user, err)
 	}
 
 	secret := &corev1.Secret{
@@ -296,15 +299,15 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 			Labels:    withFirebirdVersionLabel(instance, labelsForInstance(instance.Name)),
 		},
 		StringData: map[string]string{
-			sysdbaSecretUsernameKey: sysdbaUsername,
+			sysdbaSecretUsernameKey: username,
 			sysdbaSecretPasswordKey: password,
 		},
 	}
 
 	if err := r.Create(ctx, secret); err != nil {
-		return fmt.Errorf("failed to create SYSDBA Secret %q: %w", secretRef, err)
+		return fmt.Errorf("failed to create Secret %q of user %s: %w", secretRef, user, err)
 	}
-	logf.FromContext(ctx).Info("Created SYSDBA Secret with a generated password", "name", secretRef)
+	logf.FromContext(ctx).Info("Created user Secret with a generated password", "name", secretRef, "user", user)
 	return nil
 }
 

@@ -53,20 +53,35 @@ spec:
             description: spec defines the desired state of Instance
             properties:
               authentication:
-                description: authentication configures credentials for the instance.
-                properties:
-                  sysdba:
-                    description: sysdba configures the SYSDBA account credentials.
-                    properties:
-                      secretRef:
-                        description: |-
-                          secretRef is the name of the Secret containing the SYSDBA
-                          credentials. Defaults to "<instance-name>-sysdba" if not specified;
-                          that Secret is created automatically with a generated password if
-                          it doesn't already exist.
-                        type: string
-                    type: object
+                additionalProperties:
+                  description: UserAuthSpec configures one Firebird user's credentials.
+                  properties:
+                    secretRef:
+                      description: |-
+                        secretRef is the name of the Secret holding the user's password
+                        under its "password" key. Defaults to "<instance-name>-<user>" (the
+                        user name lowercased, underscores turned into dashes), created with
+                        a generated password if it doesn't exist yet. When set, the Secret
+                        must already exist.
+                      type: string
+                  type: object
+                description: |-
+                  authentication configures the instance's Firebird users, keyed by
+                  user name: "sysdba" for SYSDBA itself, any other key for a regular
+                  user Kubebird creates (and keeps the password of) in the security
+                  database.
+                maxProperties: 32
                 type: object
+                x-kubernetes-validations:
+                - message: 'authentication keys must be Firebird user names: a letter,
+                    then letters, digits or underscores, at most 31 characters'
+                  rule: self.all(u, u.matches('^[A-Za-z][A-Za-z0-9_]{0,30}$'))
+                - message: SYSDBA must be configured with the lowercase key sysdba
+                  rule: self.all(u, u.lowerAscii() != 'sysdba' || u == 'sysdba')
+                - message: 'authentication keys must differ in more than letter case:
+                    Firebird user names are case-insensitive'
+                  rule: self.all(u, self.filter(v, v.lowerAscii() == u.lowerAscii()).size()
+                    == 1)
               backup:
                 description: backup configures backing up the instance's databases.
                 properties:
@@ -262,6 +277,16 @@ spec:
                       description: name is the database file name, e.g. "instance.fdb".
                       minLength: 1
                       type: string
+                    owner:
+                      description: |-
+                        owner is the user the database is created (or restored from its
+                        backup) as, and so owned by: "sysdba" (or "SYSDBA"), or a user
+                        declared in authentication, spelled exactly as its key. Defaults to
+                        SYSDBA. Firebird can't change a database's owner afterwards, so it
+                        can't be set, changed or unset once the database is declared.
+                      maxLength: 31
+                      pattern: ^[A-Za-z][A-Za-z0-9_]*$
+                      type: string
                     pageSize:
                       default: 8192
                       description: pageSize is the database page size in bytes.
@@ -280,6 +305,11 @@ spec:
                   required:
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: 'owner can''t be changed: Firebird can''t change a database''s
+                      owner'
+                    rule: has(self.owner) == has(oldSelf.owner) && (!has(self.owner)
+                      || self.owner == oldSelf.owner)
                 minItems: 1
                 type: array
                 x-kubernetes-list-map-keys:
@@ -374,6 +404,9 @@ spec:
                 is true
               rule: '!has(self.backup) || !self.backup.enabled || size(self.backup.destinations)
                 > 0'
+            - message: databases[].owner must be sysdba or a user declared in authentication
+              rule: self.databases.all(d, !has(d.owner) || d.owner == 'sysdba' ||
+                d.owner == 'SYSDBA' || (has(self.authentication) && d.owner in self.authentication))
           status:
             description: status defines the observed state of Instance
             properties:
@@ -516,6 +549,34 @@ spec:
                 - stage
                 - toVersion
                 type: object
+              users:
+                description: |-
+                  users lists the regular users (every authentication key but sysdba)
+                  Kubebird has created in the security database, with the version of
+                  the Secret whose password each was last given: a user whose Secret
+                  changed gets the new password, and one no longer in authentication
+                  is deleted.
+                items:
+                  description: |-
+                    UserStatus records a regular user Kubebird manages in the security
+                    database.
+                  properties:
+                    name:
+                      description: name is the user's authentication key.
+                      type: string
+                    secretVersion:
+                      description: |-
+                        secretVersion is the resourceVersion of the user's Secret when its
+                        password was last applied.
+                      type: string
+                  required:
+                  - name
+                  - secretVersion
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               warning:
                 description: |-
                   warning is a non-fatal notice from the most recent reconcile that

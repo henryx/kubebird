@@ -15,6 +15,9 @@
   collation, and shadow files) as the list changes, without requiring a pod restart.
 - Registers a Firebird alias per database automatically, so clients can connect by alias instead of
   in-pod filesystem path.
+- Creates regular Firebird users declared in `spec.authentication`, each with its own generated (or
+  supplied) password Secret, applies password changes without restarting the pod, and deletes a user
+  once it's removed. A database can be owned by one of them (`spec.databases[].owner`).
 - Generates a SYSDBA credentials Secret (or uses one you supply) and restarts the pod to apply the
   password whenever the Secret changes. The Secret is never removed when the `Instance` is deleted,
   so it (and its password) survive and are reused if an `Instance` with the same name is recreated.
@@ -139,6 +142,7 @@ spec:
   databases:
     - name: "instance.fdb"
       shadow: false
+      owner: exampleUser # need to be declared in authentication section. use sysdba as default value
       pageSize: 8192 # defaults to 8192; one of 4096, 8192, 16384
       charset: UTF8 # defaults to UTF8
       collation: UTF8 # defaults to UTF8
@@ -158,6 +162,8 @@ spec:
   authentication:
     sysdba:
       secretRef: "" # if empty, password is generated randomically
+    exampleUser: # any other key is a regular user
+      secretRef: "" # if empty, defaults to "<name>-exampleuser", generated
   backup: # backup section
     enabled: true # enable or disable backup
     image: firebirdsql/firebird:3.0.14 # uses a specific image (default is the same image used for instance)
@@ -187,9 +193,11 @@ With this CR, Kubebird can:
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
 - Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart. A `security-database-init` init container seeds it there — on every fresh primary PVC, since Kubebird always deletes the previous one on `Instance` deletion — before the `firebird` container starts, either restoring it from a backup or seeding the image's own default (see "Backup and restore" below); the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
-- Authentication is optional. If `authentication.sysdba.secretRef` is specified, that Secret must already exist — Kubebird uses it for the SYSDBA password as-is (only adding the `kubebird.github.io/firebird-version` label described below) and fails reconciliation if it's missing, rather than creating it; if it isn't specified, Kubebird creates a `<instance-name>-sysdba` secret with a random password if one doesn't already exist. Either way, the secret has `username` (always `SYSDBA`) and `password` keys, and Kubebird never deletes it, whether on its own or when the `Instance` is deleted — see "Deleting an Instance" below.
-- Label every object it creates (PVCs, Service, StatefulSet, the aliases ConfigMap, the SYSDBA secret, the scheduled backup CronJobs with their Jobs' pods, and the delete-time backup Pod) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets,configmaps,cronjobs -l kubebird.github.io/instance=<name>` finds everything for one `Instance`. The `Service` only ever routes traffic to the `StatefulSet`'s own pod, never to a short-lived backup helper Pod/Job (scheduled or deletion-time) that happens to share that label, since its selector also requires a second `app.kubernetes.io/component: firebird` label that only the real pod carries.
-- Label the Firebird server pod, the `StatefulSet`, the `Service`, the aliases ConfigMap, the PVCs, the SYSDBA secret, the scheduled backup CronJobs and the delete-time backup Pod with `kubebird.github.io/firebird-version: <version>`, the version the running server itself reports (e.g. `3.0.14`), also recorded in `status.firebirdVersion`. It's detected once per server pod, through the Services API (`fbsvcmgr -info_server_version`), so an `Instance` with no databases gets it too, and detected again whenever the pod is recreated (e.g. after changing `spec.version`). The PVCs and the SYSDBA secret (including one you supply via `authentication.sysdba.secretRef`) are created before the server runs and survive deleting the `Instance`, so Kubebird patches just this label onto them once the version is known and keeps it up to date: after recreating an `Instance` with a new `spec.version`, the retained backup PVC and secret keep the old version's label until the new server's version is detected, then switch to it. That's the only change Kubebird ever makes to an existing PVC or secret.
+- Authentication is optional. `authentication` maps each Firebird user name to its credentials: the `sysdba` key configures SYSDBA itself, and any other key (a letter, then letters, digits or underscores, at most 31 characters) declares a regular user. Firebird user names are case-insensitive, so keys differing only in case are rejected. If a user's `secretRef` is specified, that Secret must already exist — Kubebird reads the password from its `password` key as-is (only adding the `kubebird.github.io/firebird-version` label described below) and fails reconciliation if it's missing, rather than creating it; if it isn't specified, Kubebird creates a `<instance-name>-<user>` secret (the user name lowercased, underscores turned into dashes, e.g. `<instance-name>-sysdba` or `<instance-name>-exampleuser`) with a random password if one doesn't already exist. A generated secret has `username` (`SYSDBA`, or the user's key) and `password` keys, and Kubebird never deletes a user's secret, whether on its own or when the `Instance` is deleted — see "Deleting an Instance" below.
+- Create each regular user in the security database once the Firebird pod is ready, through the server's Services API (`fbsvcmgr`), so it works on an `Instance` with no databases too. Changing a regular user's secret applies the new password on the running server, without restarting the pod (unlike SYSDBA's, see below); a password changed by other means is only put back the next time the secret changes. Removing a user from `authentication` deletes it from the security database; Kubebird only ever deletes users it created itself (recorded in `status.users`), never ones created by other means.
+- Create each database as its `owner`: `sysdba` (the default) or a regular user declared in `authentication`, spelled exactly as its key. The database is created, and restored from its backup after a delete/recreate or an upgrade, as that user, so it's owned by it and the user has full rights on it. Firebird can't change a database's owner afterwards, so `owner` can't be set, changed or removed on a database already declared; to change it, remove the database and add it again (which drops it), or delete and recreate the `Instance` with the new owner, which restores it from its backup as the new owner.
+- Label every object it creates (PVCs, Service, StatefulSet, the aliases ConfigMap, the user secrets, the scheduled backup CronJobs with their Jobs' pods, and the delete-time backup Pod) with `kubebird.github.io/instance: <name>`, so `kubectl get all,pvc,secrets,configmaps,cronjobs -l kubebird.github.io/instance=<name>` finds everything for one `Instance`. The `Service` only ever routes traffic to the `StatefulSet`'s own pod, never to a short-lived backup helper Pod/Job (scheduled or deletion-time) that happens to share that label, since its selector also requires a second `app.kubernetes.io/component: firebird` label that only the real pod carries.
+- Label the Firebird server pod, the `StatefulSet`, the `Service`, the aliases ConfigMap, the PVCs, the user secrets, the scheduled backup CronJobs and the delete-time backup Pod with `kubebird.github.io/firebird-version: <version>`, the version the running server itself reports (e.g. `3.0.14`), also recorded in `status.firebirdVersion`. It's detected once per server pod, through the Services API (`fbsvcmgr -info_server_version`), so an `Instance` with no databases gets it too, and detected again whenever the pod is recreated (e.g. after changing `spec.version`). The PVCs and the user secrets (including ones you supply via `secretRef`) are created before the server runs and survive deleting the `Instance`, so Kubebird patches just this label onto them once the version is known and keeps it up to date: after recreating an `Instance` with a new `spec.version`, the retained backup PVC and secrets keep the old version's label until the new server's version is detected, then switch to it. That's the only change Kubebird ever makes to an existing PVC or secret.
 - Report the most recent error, if any, in `status.error` — surfaced without needing to check the operator's own logs, via the `MESSAGE` column below. It's cleared automatically once the `Instance` reconciles successfully again.
 - Warn, in `status.warning`, when a database that's provisioned or restored (i.e. `spec.databases` has a pending entry) leaves behind an orphaned backup: a `.fbk` file in the backup volume's `base/` subdirectory whose database is no longer in `spec.databases` — typically because the `Instance` was recreated with a different database list, or a database was dropped after its backup was taken. The security database's own backup (`securityN.fbk`) is never reported this way, even though it sits in that same directory. Cleared automatically once no orphaned backup remains.
 - Surface `kubectl get instances` columns beyond the default `NAME`/`AGE`: `VERSION` (the Firebird version deployed, from `spec.version`), `STATUS` (`Provisioning`, `Ready`, or `Deleting`), `DATABASES` (the number of databases currently provisioned, i.e. `len(status.databases)`), and `MESSAGE` (the reconcile error if the last reconcile failed; otherwise `status.warning` if one is set; otherwise, while `Provisioning`/`Ready`, why it's currently in that phase; while `Deleting`, the specific operation deletion is currently performing, e.g. "Backing up databases into the backup volume" — see "Deleting an Instance" below).
@@ -197,17 +205,17 @@ With this CR, Kubebird can:
 ### Object creation flow
 
 When an `Instance` is created, Kubebird creates the objects below in order (steps 1-7); every one
-except the primary/backup/shadow PVCs and the SYSDBA Secret is owned by the `Instance` and removed
+except the primary/backup/shadow PVCs and the user Secrets is owned by the `Instance` and removed
 automatically when the `Instance` is deleted (see "Deleting an Instance" below). Kubernetes then creates the Pod from the
-`StatefulSet`'s template, and once the Pod becomes ready Kubebird creates the requested databases
-inside it (steps 8-9):
+`StatefulSet`'s template, and once the Pod becomes ready Kubebird creates the regular users and the
+requested databases inside it (steps 8-9):
 
 ```mermaid
 flowchart TD
     User(["kubectl apply -f cr.yaml"]) --> CR[/"Instance"/]
     CR --> Kubebird["Kubebird"]
 
-    Kubebird -->|"1"| Secret["Secret<br/>&lt;name&gt;-sysdba"]
+    Kubebird -->|"1"| Secret["Secrets<br/>&lt;name&gt;-sysdba, &lt;name&gt;-&lt;user&gt;"]
     Kubebird -->|"2"| CM["ConfigMap<br/>&lt;name&gt;-aliases"]
     Kubebird -->|"3"| Service["Service<br/>&lt;name&gt;"]
     Kubebird -->|"4"| PVCPrimary["PVC<br/>&lt;name&gt;-primary"]
@@ -225,7 +233,7 @@ flowchart TD
     STS -->|Kubernetes creates| Pod["Pod<br/>&lt;name&gt;-0"]
 
     Kubebird -->|"8: waits for readiness"| Pod
-    Kubebird -->|"9: creates the databases"| Pod
+    Kubebird -->|"9: creates the users and databases"| Pod
 
     classDef owned fill:#e6ecff,stroke:#3355ff,color:#000
     class CM,Service,STS owned
@@ -253,6 +261,8 @@ Kubebird also reacts to updates on an existing `Instance`:
 - Removing an entry from `spec.databases` runs `DROP DATABASE` for just that database (Firebird
   removes its shadow file, if any, along with it), drops it from `status.databases`, and removes
   its alias from `databases.conf` — again without a pod restart.
+- Adding a user to `authentication` creates it, rotating a regular user's secret changes its
+  password, and removing a user deletes it, all on the running server without a pod restart.
 - Rotating the SYSDBA secret's password (the auto-generated one, or a user-provided
   `authentication.sysdba.secretRef`) restarts the pod: the `StatefulSet`'s pod template carries an
   annotation hashing the secret's current password, so a rotation changes the template and the
@@ -286,7 +296,8 @@ does depends on how the version changes, compared with the version the `Stateful
   [Firebird 4.0 migration guide](https://ib-aid.com/download/docs/fb4migrationguide.html#_migrating_user_list),
   the new version starts from its own default security database, and the users of the 3.0 one
   (Srp and Legacy_UserManager alike, passwords included) are copied into it, all but SYSDBA, whose
-  password always comes from the SYSDBA Secret. From Firebird 4 on, the security database is restored
+  password always comes from the SYSDBA Secret; regular users from `authentication` are among those
+  copied, keeping their passwords. From Firebird 4 on, the security database is restored
   from its backup like every other database. Keep `spec.version` at the new version until the
   upgrade finishes; changing it meanwhile is refused.
 - **To an older major version** (e.g. `4.0.3` to `3.0.14`): refused, since a database, or a backup,
@@ -308,13 +319,14 @@ it (the aliases ConfigMap, Service and StatefulSet are all owned by the `Instanc
 operator itself just logs the deletion, reports `status.phase: Deleting`, and updates
 `status.message` with the specific operation it's currently performing (e.g. "Deleting Instance",
 or one of the backup-related steps described in "Backup and restore" below), while that garbage
-collection runs. The SYSDBA Secret is **not** removed with it — Kubebird deliberately never sets an
-owner reference on it, so an `Instance`'s SYSDBA credentials survive its deletion. The primary and
+collection runs. The user Secrets (SYSDBA's and the regular users') are **not** removed with it —
+Kubebird deliberately never sets an owner reference on them, so an `Instance`'s credentials survive
+its deletion, and are reused, passwords included, if it's recreated. The primary and
 shadow PVCs aren't owner-referenced either, but Kubebird explicitly deletes both of them itself as
 part of every deletion, regardless of `spec.backup` — **without a local backup volume configured,
 deleting an `Instance` permanently destroys its data.** The backup PVC, when it exists, is always
 left behind rather than being deleted along with the primary/shadow storage — see "Backup and
-restore" below. Delete it and the Secret yourself once you're sure you no longer need them:
+restore" below. Delete it and the Secrets yourself once you're sure you no longer need them:
 ```bash
 kubectl delete pvc,secret -l kubebird.github.io/instance=<name>
 ```
@@ -380,6 +392,13 @@ Without a backup volume, there is nothing to restore from: a recreated `Instance
 primary/shadow storage and a brand-new security database, just like a first-time `Instance` of that
 name.
 
+Regular users from `authentication` live in the security database, so they come back with it.
+Either way, since their secrets survive the deletion, a recreated `Instance` applies every user's
+password from its secret again: with a backup volume, to the users restored with the security
+database; without one, to users created afresh in the brand-new security database (so they can log
+in again, though the databases they owned start empty). A database with an `owner` is restored as
+that user, so it's owned by it even if the backup was taken with a different owner.
+
 ### Scheduled backups (`backup.retention`)
 
 `backup.retention` runs recurring backups independently of `backupOnDelete` and the deletion flow
@@ -423,7 +442,7 @@ CronJob (`kubectl create job --from=cronjob/<name>-backup-<frequency> <job-name>
 out-of-band backup) can start while that CronJob's own scheduled run is still going. These runs simply
 proceed side by side: `gbak` backups of the same database don't conflict with each other. Two runs of
 the same frequency starting within the same second would pick the same file name, so each run first
-claims its timestamp with a `.claim-<timestamp>` directory in the frequency's directory, moving on to
+claims its timestamp with an empty `.claim-<timestamp>` file in the frequency's directory, moving on to
 the next second if another run already has it. The claim is removed when the run ends; one left
 behind by a killed run is removed once it's older than the retention.
 

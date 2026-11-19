@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -253,7 +254,7 @@ var _ = Describe("Instance Controller", func() {
 						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
 					},
 					Authentication: kubebirdv1.AuthenticationSpec{
-						Sysdba: kubebirdv1.SysdbaAuthSpec{SecretRef: "does-not-exist-sysdba"},
+						kubebirdv1.SysdbaUserName: {SecretRef: "does-not-exist-sysdba"},
 					},
 				},
 			}
@@ -304,7 +305,7 @@ var _ = Describe("Instance Controller", func() {
 						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
 					},
 					Authentication: kubebirdv1.AuthenticationSpec{
-						Sysdba: kubebirdv1.SysdbaAuthSpec{SecretRef: presetSecretName.Name},
+						kubebirdv1.SysdbaUserName: {SecretRef: presetSecretName.Name},
 					},
 				},
 			}
@@ -995,6 +996,124 @@ var _ = Describe("Instance Controller", func() {
 				Expect(k8sClient.Create(ctx, instance)).To(Succeed(), name)
 				Expect(k8sClient.Delete(ctx, instance)).To(Succeed(), name)
 			}
+		})
+	})
+
+	Context("When spec.authentication declares regular users", func() {
+		ctx := context.Background()
+
+		instanceWithUsers := func(name string, auth kubebirdv1.AuthenticationSpec, owner string) *kubebirdv1.Instance {
+			return &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: resourceNamespace},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:     testImage,
+					Version:   testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{{Name: testDatabaseName, Owner: owner}},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Authentication: auth,
+				},
+			}
+		}
+
+		DescribeTable("rejects an invalid authentication or owner",
+			func(name string, auth kubebirdv1.AuthenticationSpec, owner, message string) {
+				err := k8sClient.Create(ctx, instanceWithUsers(name, auth, owner))
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring(message))
+			},
+			Entry("an owner not declared in authentication", "test-users-undeclared",
+				kubebirdv1.AuthenticationSpec{testUserName: {}}, "otherUser",
+				"databases[].owner must be sysdba or a user declared in authentication"),
+			Entry("an owner spelled differently from its key", "test-users-recased",
+				kubebirdv1.AuthenticationSpec{testUserName: {}}, strings.ToUpper(testUserName),
+				"databases[].owner must be sysdba or a user declared in authentication"),
+			Entry("an owner with no authentication at all", "test-users-no-auth",
+				nil, testUserName,
+				"databases[].owner must be sysdba or a user declared in authentication"),
+			Entry("a key that isn't a Firebird user name", "test-users-bad-key",
+				kubebirdv1.AuthenticationSpec{"bad-name": {}}, "",
+				"authentication keys must be Firebird user names"),
+			Entry("SYSDBA under a key other than sysdba", "test-users-upper-sysdba",
+				kubebirdv1.AuthenticationSpec{sysdbaUsername: {}}, "",
+				"SYSDBA must be configured with the lowercase key sysdba"),
+			Entry("two keys differing only in case", "test-users-case-dup",
+				kubebirdv1.AuthenticationSpec{testUserName: {}, strings.ToUpper(testUserName): {}}, "",
+				"authentication keys must differ in more than letter case"),
+		)
+
+		It("accepts sysdba or a declared user as owner", func() {
+			for name, instance := range map[string]*kubebirdv1.Instance{
+				"test-users-owner-sysdba": instanceWithUsers("test-users-owner-sysdba", nil, sysdbaUsername),
+				"test-users-owner-user": instanceWithUsers("test-users-owner-user",
+					kubebirdv1.AuthenticationSpec{testUserName: {}}, testUserName),
+			} {
+				Expect(k8sClient.Create(ctx, instance)).To(Succeed(), name)
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed(), name)
+			}
+		})
+
+		It("refuses to change a database's owner", func() {
+			instance := instanceWithUsers("test-users-owner-change",
+				kubebirdv1.AuthenticationSpec{testUserName: {}}, "")
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			DeferCleanup(func() { Expect(k8sClient.Delete(ctx, instance)).To(Succeed()) })
+
+			instance.Spec.Databases[0].Owner = testUserName
+			err := k8sClient.Update(ctx, instance)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("owner can't be changed"))
+
+			By("still allowing a new database with an owner")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+			instance.Spec.Databases = append(instance.Spec.Databases,
+				kubebirdv1.DatabaseSpec{Name: "owned.fdb", Owner: testUserName})
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+		})
+
+		It("creates a Secret with a generated password for a regular user, and requires a referenced one to exist", func() {
+			const name = "test-users-secrets"
+			key := types.NamespacedName{Name: name, Namespace: resourceNamespace}
+			instance := instanceWithUsers(name, kubebirdv1.AuthenticationSpec{
+				testReportUserName: {},
+				"external":         {SecretRef: name + "-external-preset"},
+			}, testReportUserName)
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			controllerReconciler := &InstanceReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				for _, secret := range []string{name + "-sysdba", name + "-report-reader", name + "-external-preset"} {
+					Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &corev1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Name: secret, Namespace: resourceNamespace},
+					}))).To(Succeed())
+				}
+			})
+
+			By("failing while the referenced Secret is missing")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(name + "-external-preset"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-external-preset", Namespace: resourceNamespace},
+				&corev1.Secret{})).To(HaveOccurred(), "a referenced Secret must never be auto-created")
+
+			By("generating the regular user's Secret, named after the user")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-report-reader", Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(secret.Data).To(HaveKeyWithValue("username", []byte(testReportUserName)))
+			Expect(secret.Data["password"]).NotTo(BeEmpty())
+			Expect(secret.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", name))
+			Expect(secret.OwnerReferences).To(BeEmpty(), "a user Secret must not be owned by the Instance, so it survives deletion")
+
+			By("succeeding once the referenced Secret exists")
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-external-preset", Namespace: resourceNamespace},
+				StringData: map[string]string{"password": "preset-password"},
+			})).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 

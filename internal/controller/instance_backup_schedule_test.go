@@ -146,7 +146,7 @@ func TestPruneScheduledBackupsScript(t *testing.T) {
 	}
 	expiredClaims := []string{
 		scheduledBackupClaimPrefix + stamp(4*24*time.Hour),
-		scheduledBackupClaimPrefix + stamp(5*24*time.Hour), // a directory, as Kubebird 0.4.0 and earlier claimed
+		scheduledBackupClaimPrefix + stamp(5*24*time.Hour), // a directory, as :dev builds before 0.4.0 claimed
 	}
 	kept := []string{
 		"instance-" + stamp(3*24*time.Hour-time.Hour) + ".fbk.gz",

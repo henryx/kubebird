@@ -46,10 +46,10 @@ import (
 // serving connections.
 const conditionTypeAvailable = "Available"
 
-// secretRefIndexField indexes Instances by the Secret their SYSDBA
-// credentials are read from, so a Secret change can be mapped back to the
-// Instances that depend on it.
-const secretRefIndexField = ".spec.authentication.sysdba.secretRef"
+// secretRefIndexField indexes Instances by the Secrets their users'
+// (SYSDBA and regular ones) credentials are read from, so a Secret change
+// can be mapped back to the Instances that depend on it.
+const secretRefIndexField = ".spec.authentication.secretRef"
 
 // finalizerName lets Reconcile observe and log an Instance's deletion,
 // and report status.phase=Deleting, before the owned resources are
@@ -165,6 +165,9 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 	if err := r.reconcileSysdbaSecret(ctx, instance); err != nil {
 		return err
 	}
+	if err := r.reconcileRegularUserSecrets(ctx, instance); err != nil {
+		return err
+	}
 
 	// A major version upgrade takes over until its backups are taken and
 	// the old storage is released; only then does the rest of this
@@ -196,6 +199,12 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 		return r.mutateStatefulSet(ctx, sts, instance)
 	}); err != nil {
 		return fmt.Errorf("failed to reconcile StatefulSet: %w", err)
+	}
+
+	if sts.Status.ReadyReplicas > 0 {
+		if err := r.reconcileUsers(ctx, instance); err != nil {
+			return err
+		}
 	}
 
 	if err := r.reconcileDatabases(ctx, instance, sts); err != nil {
@@ -477,7 +486,7 @@ func (r *InstanceReconciler) setAvailable(ctx context.Context, instance *kubebir
 }
 
 // findInstancesForSecret maps a Secret to the Instances that reference it
-// as their SYSDBA credentials, so Reconcile runs as soon as the Secret
+// as the credentials of SYSDBA or of a regular user, so Reconcile runs as soon as the Secret
 // appears or changes instead of waiting for a poll.
 func (r *InstanceReconciler) findInstancesForSecret(ctx context.Context, secret client.Object) []reconcile.Request {
 	var list kubebirdv1.InstanceList
@@ -506,9 +515,9 @@ func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return nil
 			}
-			return []string{sysdbaSecretRefName(instance)}
+			return userSecretNames(instance)
 		}); err != nil {
-		return fmt.Errorf("failed to index Instance by SYSDBA secretRef: %w", err)
+		return fmt.Errorf("failed to index Instance by user secretRef: %w", err)
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
