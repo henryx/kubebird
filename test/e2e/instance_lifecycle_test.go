@@ -33,7 +33,7 @@ import (
 
 const (
 	instanceName           = "e2e-instance"
-	instanceSecretName     = instanceName + "-sysdba"
+	instanceSecretName     = instanceName + "-user-sysdba"
 	instanceAliasesCMName  = instanceName + "-aliases"
 	instancePrimaryPVCName = instanceName + "-primary"
 	instanceBackupPVCName  = instanceName + "-backup"

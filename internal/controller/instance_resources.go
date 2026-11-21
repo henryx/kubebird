@@ -115,7 +115,7 @@ func firebirdPodSelector(name string) map[string]string {
 }
 
 // sysdbaSecretRefName returns the Secret name backing
-// spec.authentication.sysdba, defaulting to "<instance-name>-sysdba" when
+// spec.authentication.sysdba, defaulting to "<instance-name>-user-sysdba" when
 // spec.authentication.sysdba.secretRef isn't specified.
 func sysdbaSecretRefName(instance *kubebirdv1.Instance) string {
 	return userSecretName(instance, kubebirdv1.SysdbaUserName)
@@ -263,7 +263,11 @@ func (r *InstanceReconciler) reconcileSysdbaSecret(ctx context.Context, instance
 // the user's responsibility to have created it) and reconciliation fails
 // if it doesn't; when unset, the default Secret (see userSecretName) is
 // created with username as its username key and a freshly generated random
-// password if missing. An existing Secret, whether created by a previous
+// password if missing — except SYSDBA's, which, when the legacy
+// "<instance-name>-sysdba" Secret of Kubebird 0.4.0 and earlier exists
+// (see legacySysdbaSecretName), is created as a copy of it instead, keeping
+// SYSDBA's password across the operator upgrade; the legacy Secret itself
+// is left alone. An existing Secret, whether created by a previous
 // reconcile or supplied by the user ahead of time, is left untouched, apart
 // from its firebirdVersionLabelKey label (see syncFirebirdVersionLabel). The
 // Secret is deliberately never owner-referenced to the Instance, so it
@@ -287,21 +291,38 @@ func (r *InstanceReconciler) reconcileUserSecret(ctx context.Context, instance *
 		return fmt.Errorf("secret %q specified in spec.authentication.%s.secretRef not found", secretRef, user)
 	}
 
-	password, err := generateRandomPassword()
-	if err != nil {
-		return fmt.Errorf("failed to generate password for user %s: %w", user, err)
-	}
-
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretRef,
 			Namespace: instance.Namespace,
 			Labels:    withFirebirdVersionLabel(instance, labelsForInstance(instance.Name)),
 		},
-		StringData: map[string]string{
-			sysdbaSecretUsernameKey: username,
-			sysdbaSecretPasswordKey: password,
-		},
+	}
+
+	legacy, err := r.legacySysdbaSecret(ctx, instance, user)
+	if err != nil {
+		return err
+	}
+	if legacy != nil {
+		secret.Data = map[string][]byte{
+			sysdbaSecretUsernameKey: []byte(username),
+			sysdbaSecretPasswordKey: legacy.Data[sysdbaSecretPasswordKey],
+		}
+		if err := r.Create(ctx, secret); err != nil {
+			return fmt.Errorf("failed to create Secret %q of user %s: %w", secretRef, user, err)
+		}
+		logf.FromContext(ctx).Info("Created user Secret from the legacy SYSDBA Secret",
+			"name", secretRef, "legacy", legacy.Name, "user", user)
+		return nil
+	}
+
+	password, err := generateRandomPassword()
+	if err != nil {
+		return fmt.Errorf("failed to generate password for user %s: %w", user, err)
+	}
+	secret.StringData = map[string]string{
+		sysdbaSecretUsernameKey: username,
+		sysdbaSecretPasswordKey: password,
 	}
 
 	if err := r.Create(ctx, secret); err != nil {
@@ -309,6 +330,27 @@ func (r *InstanceReconciler) reconcileUserSecret(ctx context.Context, instance *
 	}
 	logf.FromContext(ctx).Info("Created user Secret with a generated password", "name", secretRef, "user", user)
 	return nil
+}
+
+// legacySysdbaSecret returns the legacy "<instance-name>-sysdba" Secret
+// (see legacySysdbaSecretName) when user is SYSDBA and that Secret exists
+// with a password, or nil otherwise.
+func (r *InstanceReconciler) legacySysdbaSecret(ctx context.Context, instance *kubebirdv1.Instance, user string) (*corev1.Secret, error) {
+	if user != kubebirdv1.SysdbaUserName {
+		return nil, nil
+	}
+	name := legacySysdbaSecretName(instance)
+	legacy := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: instance.Namespace}, legacy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get legacy SYSDBA Secret %q: %w", name, err)
+	}
+	if len(legacy.Data[sysdbaSecretPasswordKey]) == 0 {
+		return nil, nil
+	}
+	return legacy, nil
 }
 
 // generateRandomPassword returns a cryptographically random, URL-safe

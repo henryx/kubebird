@@ -63,14 +63,22 @@ func regularUsers(instance *kubebirdv1.Instance) []string {
 
 // userSecretName returns the name of the Secret holding the credentials of
 // spec.authentication[user]: its secretRef when set, otherwise
-// "<instance-name>-<user>", the user name lowercased and its underscores
-// turned into dashes so it's a valid Secret name (e.g. "test-sysdba", or
-// "test-report-reader" for "Report_Reader").
+// "<instance-name>-user-<user>", the user name lowercased and its
+// underscores turned into dashes so it's a valid Secret name (e.g.
+// "test-user-sysdba", or "test-user-report-reader" for "Report_Reader").
 func userSecretName(instance *kubebirdv1.Instance, user string) string {
 	if ref := instance.Spec.Authentication[user].SecretRef; ref != "" {
 		return ref
 	}
-	return instance.Name + "-" + strings.ReplaceAll(strings.ToLower(user), "_", "-")
+	return instance.Name + "-user-" + strings.ReplaceAll(strings.ToLower(user), "_", "-")
+}
+
+// legacySysdbaSecretName returns the name Kubebird 0.4.0 and earlier gave
+// the generated SYSDBA Secret, "<instance-name>-sysdba". reconcileUserSecret
+// copies it into the current default Secret (see userSecretName) when only
+// the legacy one exists, so upgrading the operator keeps SYSDBA's password.
+func legacySysdbaSecretName(instance *kubebirdv1.Instance) string {
+	return instance.Name + "-sysdba"
 }
 
 // userSecretNames returns the names of every Secret the instance reads

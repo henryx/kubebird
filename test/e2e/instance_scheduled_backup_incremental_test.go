@@ -63,7 +63,7 @@ func instanceScheduledBackupIncrementalSpecs(version string) {
 	major, _, _ := strings.Cut(version, ".")
 	incrementalBackupInstanceName := "e2e-incremental-backup-" + major
 	incrementalBackupPodName := incrementalBackupInstanceName + "-0"
-	incrementalBackupSecretName := incrementalBackupInstanceName + "-sysdba"
+	incrementalBackupSecretName := incrementalBackupInstanceName + "-user-sysdba"
 	incrementalBackupCronJob := incrementalBackupInstanceName + "-backup-hour"
 
 	manifest := fmt.Sprintf(`

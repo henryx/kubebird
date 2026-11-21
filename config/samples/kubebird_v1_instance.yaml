@@ -16,5 +16,5 @@ spec:
       size: 3Gi
   authentication:
     sysdba:
-      secretRef: instance-sample-sysdba
+      secretRef: instance-sample-user-sysdba
     exampleUser: {}

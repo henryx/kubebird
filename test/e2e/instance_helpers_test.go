@@ -153,7 +153,7 @@ func expectFirebirdVersionLabel(instanceName, podName, version string, extraObje
 			"configmap/" + instanceName + "-aliases",
 			"pvc/" + instanceName + "-primary",
 			"pvc/" + instanceName + "-backup",
-			"secret/" + instanceName + "-sysdba",
+			"secret/" + instanceName + "-user-sysdba",
 		}, extraObjects...) {
 			cmd := exec.Command("kubectl", "get", obj, "-n", namespace, "-o", labelPath)
 			output, err := utils.Run(cmd)

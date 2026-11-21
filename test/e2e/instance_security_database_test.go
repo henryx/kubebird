@@ -37,7 +37,7 @@ var securityDBPath = "/var/lib/firebird/data/" + securityDatabaseFile(".fdb")
 
 const (
 	securityDBInstanceName = "e2e-security-db"
-	securityDBSecretName   = securityDBInstanceName + "-sysdba"
+	securityDBSecretName   = securityDBInstanceName + "-user-sysdba"
 	securityDBDatabaseName = "securitydb.fdb"
 	securityDBPrimaryPVC   = securityDBInstanceName + "-primary"
 	securityDBBackupPVC    = securityDBInstanceName + "-backup"

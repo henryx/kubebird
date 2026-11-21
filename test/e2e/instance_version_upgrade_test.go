@@ -56,7 +56,7 @@ func instanceVersionUpgradeSpecs(versionUpgradeFromVersion, versionUpgradeToVers
 	fromMajor, _, _ := strings.Cut(versionUpgradeFromVersion, ".")
 	toMajor, _, _ := strings.Cut(versionUpgradeToVersion, ".")
 	versionUpgradeInstanceName := fmt.Sprintf("e2e-version-upgrade-%s-%s", fromMajor, toMajor)
-	versionUpgradeSecretName := versionUpgradeInstanceName + "-sysdba"
+	versionUpgradeSecretName := versionUpgradeInstanceName + "-user-sysdba"
 	versionUpgradePodName := versionUpgradeInstanceName + "-0"
 
 	manifest := func(version string) string {

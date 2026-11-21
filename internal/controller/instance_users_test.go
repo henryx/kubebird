@@ -56,8 +56,8 @@ func TestUserSecretName(t *testing.T) {
 		"custom":           {SecretRef: testUserSecretRef},
 	})
 	cases := map[string]string{
-		kubebirdv1.SysdbaUserName: "test-sysdba", // no sysdba key at all: the default
-		testReportUserName:        "test-report-reader",
+		kubebirdv1.SysdbaUserName: "test-user-sysdba", // no sysdba key at all: the default
+		testReportUserName:        "test-user-report-reader",
 		"custom":                  testUserSecretRef,
 	}
 	for user, want := range cases {
@@ -66,7 +66,7 @@ func TestUserSecretName(t *testing.T) {
 		}
 	}
 
-	if got, want := userSecretNames(instance), []string{"test-sysdba", "test-report-reader", testUserSecretRef}; !slices.Equal(got, want) {
+	if got, want := userSecretNames(instance), []string{"test-user-sysdba", "test-user-report-reader", testUserSecretRef}; !slices.Equal(got, want) {
 		t.Errorf("userSecretNames() = %v, want %v", got, want)
 	}
 }
@@ -103,7 +103,7 @@ func TestDisplayedUserExists(t *testing.T) {
 
 func TestDatabaseOwnerCredentials(t *testing.T) {
 	instance := usersTestInstance(kubebirdv1.AuthenticationSpec{testUserName: {}})
-	r := &InstanceReconciler{Client: versionTestClient(t, usersTestSecret("test-exampleuser", "user-pw"))}
+	r := &InstanceReconciler{Client: versionTestClient(t, usersTestSecret("test-user-exampleuser", "user-pw"))}
 	ctx := context.Background()
 
 	for _, owner := range []string{"", kubebirdv1.SysdbaUserName, sysdbaUsername} {
@@ -129,9 +129,9 @@ func TestDatabaseOwnerCredentials(t *testing.T) {
 // status write.
 func TestReconcileUsersUpToDate(t *testing.T) {
 	ctx := context.Background()
-	c := versionTestClient(t, usersTestSecret("test-exampleuser", "user-pw"))
+	c := versionTestClient(t, usersTestSecret("test-user-exampleuser", "user-pw"))
 	secret := &corev1.Secret{}
-	if err := c.Get(ctx, types.NamespacedName{Name: "test-exampleuser", Namespace: resourceNamespace}, secret); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-user-exampleuser", Namespace: resourceNamespace}, secret); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,5 +144,46 @@ func TestReconcileUsersUpToDate(t *testing.T) {
 
 	if err := r.reconcileUsers(ctx, usersTestInstance(nil)); err != nil {
 		t.Fatalf("reconcileUsers() with no users at all failed: %v", err)
+	}
+}
+
+// TestReconcileSysdbaSecretFromLegacy checks that an Instance created by
+// Kubebird 0.4.0 or earlier, whose generated SYSDBA Secret is still named
+// "<instance>-sysdba", gets its new "<instance>-user-sysdba" Secret with
+// the same password instead of a generated one, leaving the legacy Secret
+// alone, while a regular user's Secret is never copied from it.
+func TestReconcileSysdbaSecretFromLegacy(t *testing.T) {
+	ctx := context.Background()
+	c := versionTestClient(t, usersTestSecret("test-sysdba", "legacy-pw"))
+	r := &InstanceReconciler{Client: c}
+	instance := usersTestInstance(kubebirdv1.AuthenticationSpec{testUserName: {}})
+
+	if err := r.reconcileSysdbaSecret(ctx, instance); err != nil {
+		t.Fatalf("reconcileSysdbaSecret() failed: %v", err)
+	}
+	if err := r.reconcileRegularUserSecrets(ctx, instance); err != nil {
+		t.Fatalf("reconcileRegularUserSecrets() failed: %v", err)
+	}
+
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-user-sysdba", Namespace: resourceNamespace}, secret); err != nil {
+		t.Fatalf("new SYSDBA Secret not created: %v", err)
+	}
+	if got := string(secret.Data[sysdbaSecretPasswordKey]); got != "legacy-pw" {
+		t.Errorf("new SYSDBA Secret password = %q, want the legacy one", got)
+	}
+	if got := string(secret.Data[sysdbaSecretUsernameKey]); got != sysdbaUsername {
+		t.Errorf("new SYSDBA Secret username = %q, want %q", got, sysdbaUsername)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-sysdba", Namespace: resourceNamespace}, &corev1.Secret{}); err != nil {
+		t.Errorf("legacy SYSDBA Secret must be left alone: %v", err)
+	}
+
+	user := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "test-user-exampleuser", Namespace: resourceNamespace}, user); err != nil {
+		t.Fatalf("regular user Secret not created: %v", err)
+	}
+	if got := user.StringData[sysdbaSecretPasswordKey] + string(user.Data[sysdbaSecretPasswordKey]); got == "" || got == "legacy-pw" {
+		t.Errorf("regular user Secret password = %q, want a generated one", got)
 	}
 }

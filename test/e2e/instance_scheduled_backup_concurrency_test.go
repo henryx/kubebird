@@ -35,7 +35,7 @@ import (
 const (
 	concurrentBackupInstanceName = "e2e-concurrent-backup"
 	concurrentBackupPodName      = concurrentBackupInstanceName + "-0"
-	concurrentBackupSecretName   = concurrentBackupInstanceName + "-sysdba"
+	concurrentBackupSecretName   = concurrentBackupInstanceName + "-user-sysdba"
 	concurrentBackupDatabaseName = "concurrent.fdb"
 	concurrentBackupDBPath       = "/var/lib/firebird/data/" + concurrentBackupDatabaseName
 	// concurrentBackupDBConn reaches the database through the live server.

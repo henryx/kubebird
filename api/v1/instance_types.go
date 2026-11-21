@@ -346,8 +346,8 @@ type AuthenticationSpec map[string]UserAuthSpec
 // UserAuthSpec configures one Firebird user's credentials.
 type UserAuthSpec struct {
 	// secretRef is the name of the Secret holding the user's password
-	// under its "password" key. Defaults to "<instance-name>-<user>" (the
-	// user name lowercased, underscores turned into dashes), created with
+	// under its "password" key. Defaults to "<instance-name>-user-<user>"
+	// (the user name lowercased, underscores turned into dashes), created with
 	// a generated password if it doesn't exist yet. When set, the Secret
 	// must already exist.
 	// +optional

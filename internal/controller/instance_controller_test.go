@@ -59,7 +59,7 @@ var _ = Describe("Instance Controller", func() {
 			Namespace: resourceNamespace,
 		}
 		instance := &kubebirdv1.Instance{}
-		secretName := types.NamespacedName{Name: resourceName + "-sysdba", Namespace: resourceNamespace}
+		secretName := types.NamespacedName{Name: resourceName + "-user-sysdba", Namespace: resourceNamespace}
 		aliasesConfigMapNameNN := types.NamespacedName{Name: resourceName + "-aliases", Namespace: resourceNamespace}
 		var controllerReconciler *InstanceReconciler
 
@@ -335,7 +335,7 @@ var _ = Describe("Instance Controller", func() {
 	Context("When deleting an Instance with a local backup volume configured", func() {
 		const (
 			backupResourceName = "test-backup-resource"
-			backupSecretName   = backupResourceName + "-sysdba"
+			backupSecretName   = backupResourceName + "-user-sysdba"
 		)
 
 		ctx := context.Background()
@@ -536,7 +536,7 @@ var _ = Describe("Instance Controller", func() {
 	Context("When deleting an Instance with a local backup volume configured but backupOnDelete disabled", func() {
 		const (
 			noBackupOnDeleteResourceName = "test-no-backup-on-delete-resource"
-			noBackupOnDeleteSecretName   = noBackupOnDeleteResourceName + "-sysdba"
+			noBackupOnDeleteSecretName   = noBackupOnDeleteResourceName + "-user-sysdba"
 		)
 
 		ctx := context.Background()
@@ -638,7 +638,7 @@ var _ = Describe("Instance Controller", func() {
 	Context("When deleting an Instance without backup enabled", func() {
 		const (
 			noBackupResourceName = "test-no-backup-resource"
-			noBackupSecretName   = noBackupResourceName + "-sysdba"
+			noBackupSecretName   = noBackupResourceName + "-user-sysdba"
 		)
 
 		ctx := context.Background()
@@ -712,7 +712,7 @@ var _ = Describe("Instance Controller", func() {
 	Context("When backup is enabled but spec.backup.destinations has no local entry", func() {
 		const (
 			noLocalResourceName = "test-backup-no-local-resource"
-			noLocalSecretName   = noLocalResourceName + "-sysdba"
+			noLocalSecretName   = noLocalResourceName + "-user-sysdba"
 		)
 
 		ctx := context.Background()
@@ -776,7 +776,7 @@ var _ = Describe("Instance Controller", func() {
 	Context("When spec.backup.retention has a frequency enabled", func() {
 		const (
 			retentionResourceName = "test-retention-resource"
-			retentionSecretName   = retentionResourceName + "-sysdba"
+			retentionSecretName   = retentionResourceName + "-user-sysdba"
 		)
 
 		ctx := context.Background()
@@ -1085,7 +1085,7 @@ var _ = Describe("Instance Controller", func() {
 				Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
 				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 				Expect(err).NotTo(HaveOccurred())
-				for _, secret := range []string{name + "-sysdba", name + "-report-reader", name + "-external-preset"} {
+				for _, secret := range []string{name + "-user-sysdba", name + "-user-report-reader", name + "-external-preset"} {
 					Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &corev1.Secret{
 						ObjectMeta: metav1.ObjectMeta{Name: secret, Namespace: resourceNamespace},
 					}))).To(Succeed())
@@ -1101,7 +1101,7 @@ var _ = Describe("Instance Controller", func() {
 
 			By("generating the regular user's Secret, named after the user")
 			secret := &corev1.Secret{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-report-reader", Namespace: resourceNamespace}, secret)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-user-report-reader", Namespace: resourceNamespace}, secret)).To(Succeed())
 			Expect(secret.Data).To(HaveKeyWithValue("username", []byte(testReportUserName)))
 			Expect(secret.Data["password"]).NotTo(BeEmpty())
 			Expect(secret.Labels).To(HaveKeyWithValue("kubebird.github.io/instance", name))
@@ -1192,7 +1192,7 @@ var _ = Describe("Instance Controller", func() {
 				&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName, Namespace: resourceNamespace}},
 				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-0", Namespace: resourceNamespace}},
 				&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-database-backup", Namespace: resourceNamespace}},
-				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-sysdba", Namespace: resourceNamespace}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: upgradeResourceName + "-user-sysdba", Namespace: resourceNamespace}},
 			} {
 				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, obj))).To(Succeed())
 			}

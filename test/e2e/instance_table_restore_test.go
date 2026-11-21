@@ -33,7 +33,7 @@ import (
 
 const (
 	tableRestoreInstanceName = "e2e-table-restore"
-	tableRestoreSecretName   = tableRestoreInstanceName + "-sysdba"
+	tableRestoreSecretName   = tableRestoreInstanceName + "-user-sysdba"
 	tableRestoreDatabaseName = "tablerestore.fdb"
 	tableRestoreDBPath       = "/var/lib/firebird/data/" + tableRestoreDatabaseName
 	tableRestorePodName      = tableRestoreInstanceName + "-0"

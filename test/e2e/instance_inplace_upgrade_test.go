@@ -34,7 +34,7 @@ import (
 const (
 	inPlaceUpgradeInstanceName = "e2e-inplace-upgrade"
 	inPlaceUpgradePodName      = inPlaceUpgradeInstanceName + "-0"
-	inPlaceUpgradeSecretName   = inPlaceUpgradeInstanceName + "-sysdba"
+	inPlaceUpgradeSecretName   = inPlaceUpgradeInstanceName + "-user-sysdba"
 	inPlaceUpgradeDatabaseName = "inplace.fdb"
 	inPlaceUpgradeDBPath       = "/var/lib/firebird/data/" + inPlaceUpgradeDatabaseName
 	// inPlaceUpgradeUser is a regular Firebird user, created on 3.0, whose

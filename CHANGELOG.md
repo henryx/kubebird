@@ -6,8 +6,8 @@
 
 - Regular Firebird users. `spec.authentication` now maps each user name to its credentials: `sysdba`
   configures SYSDBA as before, and any other key declares a regular user, whose password comes from
-  `secretRef`, or from a generated `<name>-<user>` Secret (lowercased, underscores turned into
-  dashes) when it's empty. Kubebird creates each user in the security database once the pod is
+  `secretRef`, or from a generated `<name>-user-<user>` Secret (lowercased, underscores turned
+  into dashes) when it's empty. Kubebird creates each user in the security database once the pod is
   ready, applies a changed Secret's password on the running server without restarting the pod, and
   deletes a user removed from `spec.authentication` (only users it created itself). The users it
   manages are listed in the new `status.users`. Existing manifests with only `authentication.sysdba`
@@ -18,6 +18,11 @@
 
 ### Changed
 
+- The generated SYSDBA Secret is now named `<name>-user-sysdba` instead of `<name>-sysdba`, like
+  every other user's. For an existing `Instance`, the new Secret is created with the old one's
+  password, so SYSDBA's password doesn't change; the old `<name>-sysdba` Secret is left in place and
+  can be deleted once the upgraded operator has created the new one. Clients reading the password
+  from the old Secret should switch to the new one.
 - In the Go API (`api/v1`), `AuthenticationSpec` is now a `map[string]UserAuthSpec` keyed by user
   name (`SysdbaUserName`, `"sysdba"`, for SYSDBA), replacing the `Sysdba SysdbaAuthSpec` field. The
   YAML shape of `authentication.sysdba` is unchanged.
@@ -77,6 +82,11 @@
 
 ### Changed
 
+- The generated SYSDBA Secret is now named `<name>-user-sysdba` instead of `<name>-sysdba`, like
+  every other user's. For an existing `Instance`, the new Secret is created with the old one's
+  password, so SYSDBA's password doesn't change; the old `<name>-sysdba` Secret is left in place and
+  can be deleted once the upgraded operator has created the new one. Clients reading the password
+  from the old Secret should switch to the new one.
 - The e2e suite runs against Firebird `3.0.14`, `4.0.3` and `5.0.4`: the version most specs deploy
   now comes from `FIREBIRD_VERSION` (default `3.0.14`, e.g. `FIREBIRD_VERSION=5.0.4 make test-e2e`),
   and the CI `test-e2e` workflow runs one job per version, all of which must pass before an image is
@@ -256,6 +266,11 @@
 
 ### Changed
 
+- The generated SYSDBA Secret is now named `<name>-user-sysdba` instead of `<name>-sysdba`, like
+  every other user's. For an existing `Instance`, the new Secret is created with the old one's
+  password, so SYSDBA's password doesn't change; the old `<name>-sysdba` Secret is left in place and
+  can be deleted once the upgraded operator has created the new one. Clients reading the password
+  from the old Secret should switch to the new one.
 - The SYSDBA Secret is no longer owner-referenced to the `Instance`, so it now survives deleting
   the `Instance` — like the backup PVC, but unlike the primary/shadow PVCs, which are never
   owner-referenced either but are explicitly deleted by the controller itself on every deletion —
