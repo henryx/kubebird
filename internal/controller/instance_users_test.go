@@ -34,6 +34,7 @@ const (
 	testUserSecretRef  = "my-secret"
 	testOwnedDatabase  = "a.fdb"
 	testUsersInstance  = "test"
+	testSysdbaSecret   = "test-user-sysdba"
 )
 
 func usersTestInstance(auth kubebirdv1.AuthenticationSpec) *kubebirdv1.Instance {
@@ -56,7 +57,7 @@ func TestUserSecretName(t *testing.T) {
 		"custom":           {SecretRef: testUserSecretRef},
 	})
 	cases := map[string]string{
-		kubebirdv1.SysdbaUserName: "test-user-sysdba", // no sysdba key at all: the default
+		kubebirdv1.SysdbaUserName: testSysdbaSecret, // no sysdba key at all: the default
 		testReportUserName:        "test-user-report-reader",
 		"custom":                  testUserSecretRef,
 	}
@@ -66,7 +67,7 @@ func TestUserSecretName(t *testing.T) {
 		}
 	}
 
-	if got, want := userSecretNames(instance), []string{"test-user-sysdba", "test-user-report-reader", testUserSecretRef}; !slices.Equal(got, want) {
+	if got, want := userSecretNames(instance), []string{testSysdbaSecret, "test-user-report-reader", testUserSecretRef}; !slices.Equal(got, want) {
 		t.Errorf("userSecretNames() = %v, want %v", got, want)
 	}
 }
@@ -166,7 +167,7 @@ func TestReconcileSysdbaSecretFromLegacy(t *testing.T) {
 	}
 
 	secret := &corev1.Secret{}
-	if err := c.Get(ctx, types.NamespacedName{Name: "test-user-sysdba", Namespace: resourceNamespace}, secret); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: testSysdbaSecret, Namespace: resourceNamespace}, secret); err != nil {
 		t.Fatalf("new SYSDBA Secret not created: %v", err)
 	}
 	if got := string(secret.Data[sysdbaSecretPasswordKey]); got != "legacy-pw" {
