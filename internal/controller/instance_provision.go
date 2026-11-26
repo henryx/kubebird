@@ -608,8 +608,7 @@ func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, 
 	if err == nil {
 		return true, nil
 	}
-	var exitErr utilexec.CodeExitError
-	if errors.As(err, &exitErr) {
+	if _, ok := errors.AsType[utilexec.CodeExitError](err); ok {
 		return false, nil
 	}
 	return false, err
