@@ -817,6 +817,16 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 		})
 	}
 
+	backup := corev1.Container{
+		Name:  containerName,
+		Image: databaseBackupImage(instance, version),
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Command:      []string{"sh", "-c", databaseBackupScript(instance, version)},
+		VolumeMounts: mounts,
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      databaseBackupPodName(instance),
@@ -825,20 +835,20 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
-			Containers: []corev1.Container{
-				{
-					Name:  containerName,
-					Image: databaseBackupImage(instance, version),
-					SecurityContext: &corev1.SecurityContext{
-						AllowPrivilegeEscalation: ptr.To(false),
-						SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-					},
-					Command:      []string{"sh", "-c", databaseBackupScript(instance, version)},
-					VolumeMounts: mounts,
-				},
-			},
-			Volumes: volumes,
+			Containers:    []corev1.Container{backup},
+			Volumes:       volumes,
 		},
+	}
+	if s3 := s3Destination(instance); s3 != nil {
+		// gbak runs first, as an initContainer, then restic copies the
+		// base directory to the S3 repository, best effort (see
+		// resticBaseUploadScript): its Secrets are optional too, so a
+		// missing one can't keep the Pod from starting either.
+		pod.Spec.InitContainers = []corev1.Container{backup}
+		pod.Spec.Containers = []corev1.Container{
+			resticContainer(instance, s3, uploadContainerName, resticBaseUploadScript(instance, s3), false, true),
+		}
+		pod.Spec.Volumes = append(pod.Spec.Volumes, resticPasswordVolume(instance, s3, true))
 	}
 	if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set owner reference on database backup Pod: %w", err)
@@ -849,14 +859,15 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 	return waiting("waiting for database backup Pod %q to start", pod.Name)
 }
 
-// podFailureReason returns a human-readable reason pod's single container
-// failed, preferring its own terminated reason/message — where a command's
+// podFailureReason returns a human-readable reason one of pod's containers
+// (initContainers first: with an s3 destination, gbak runs as one) failed,
+// preferring its own terminated reason/message — where a command's
 // actual failure (e.g. gbak's stderr, surfaced via Terminated.Message when
 // the container runtime captures it) shows up — over the Pod-level
 // status.Reason, which is typically only set for pod-level failures like
 // eviction or scheduling, not a plain non-zero exit code.
 func podFailureReason(pod *corev1.Pod) string {
-	for _, cs := range pod.Status.ContainerStatuses {
+	for _, cs := range slices.Concat(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses) {
 		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
 			if t.Message != "" {
 				return t.Message

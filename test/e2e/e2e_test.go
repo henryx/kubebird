@@ -374,6 +374,15 @@ var _ = Describe("Manager", Ordered, func() {
 		// on every Firebird major version that can prune it.
 		instanceScheduledBackupIncrementalSpecs("4.0.3")
 		instanceScheduledBackupIncrementalSpecs("5.0.4")
+
+		// instanceS3BackupSpecs (test/e2e/instance_s3_backup_test.go)
+		// exercises the s3 backup destination against Silo, started
+		// through testcontainers on the Kind network: a scheduled
+		// backup and the delete-time backup reach the restic
+		// repository, and, with the backup PVC deleted too, a
+		// recreated Instance restores its database and users from the
+		// repository alone.
+		instanceS3BackupSpecs()
 	})
 })
 

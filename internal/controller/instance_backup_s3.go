@@ -1,0 +1,398 @@
+/*
+Copyright 2026 Enrico Bianchi.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	kubebirdv1 "github.com/henryx/kubebird/api/v1"
+)
+
+// The local backup volume stays the staging area for every backup: the
+// Firebird server (scheduled backups) and gbak (delete-time and upgrade
+// backups) only write to a filesystem, and the firebirdsql/firebird image
+// ships no S3 client. An s3 destination adds a restic container, running
+// spec.backup.destinations[].s3.image, after each of them, that copies the
+// directory just written into a restic repository in the bucket, and a
+// restic initContainer to the StatefulSet that restores the "base"
+// directory from it when the backup volume comes up empty.
+const (
+	// defaultResticImage is the restic image used when the s3 destination
+	// doesn't set one.
+	defaultResticImage = "restic/restic:0.19.1"
+
+	// binRestic is restic's binary in its image.
+	binRestic = "restic"
+
+	// resticPasswordVolumeName, resticPasswordMountPath and
+	// resticPasswordFile mount the repository password Secret's "password"
+	// key as a file, which every restic command reads with --password-file,
+	// so the password never shows up in an environment variable or in a
+	// command line.
+	resticPasswordVolumeName = "restic-password"
+	resticPasswordMountPath  = "/etc/kubebird/restic"
+	resticPasswordKey        = "password"
+
+	// s3AccessKeyIDKey and s3SecretAccessKeyKey are the keys of
+	// spec.backup.destinations[].s3.credentials.secretRef, exposed under
+	// the same names as environment variables, which restic reads.
+	s3AccessKeyIDKey     = "AWS_ACCESS_KEY_ID"
+	s3SecretAccessKeyKey = "AWS_SECRET_ACCESS_KEY"
+
+	// uploadContainerName names the restic container that copies a
+	// backup into the repository, in the scheduled backup Jobs and the
+	// delete-time backup Pod.
+	uploadContainerName = "upload"
+
+	// backupRestoreInitContainerName names the StatefulSet's restic
+	// initContainer that restores the base directory from the repository
+	// (see resticBootstrapScript), before security-database-init.
+	backupRestoreInitContainerName = "backup-restore"
+
+	// resticBaseTag tags the snapshots of the base directory: the
+	// delete-time and upgrade backups (see resticBaseUploadScript).
+	// Scheduled backups' snapshots are tagged with their frequency instead.
+	resticBaseTag = backupBaseDirName
+
+	// resticLockWait is how long a restic command waits for another one's
+	// exclusive repository lock (a forget --prune of another frequency)
+	// instead of failing.
+	resticLockWait = "1h"
+
+	// resticBaseUploadTimeout bounds resticBaseUploadScript: restic retries
+	// an unreachable endpoint, bad credentials or a missing bucket for
+	// about 15 minutes per request, and the delete-time upload must not
+	// keep the Instance's deletion waiting much longer than that.
+	resticBaseUploadTimeout = 30 * time.Minute
+)
+
+// resticPasswordFile is where the repository password is mounted.
+var resticPasswordFile = path.Join(resticPasswordMountPath, resticPasswordKey)
+
+// s3Destination returns the instance's s3 backup destination, or nil when
+// it has none or has no local backup volume (see backupVolumeSpec) to
+// stage its backups in. The CRD only allows a single s3 entry, and only
+// next to a local one.
+func s3Destination(instance *kubebirdv1.Instance) *kubebirdv1.S3BackupSpec {
+	if backupVolumeSpec(instance) == nil {
+		return nil
+	}
+	for _, d := range instance.Spec.Backup.Destinations {
+		if d.S3 != nil {
+			return d.S3
+		}
+	}
+	return nil
+}
+
+// resticSecretName returns the name of the Secret holding the restic
+// repository's password: spec.backup.destinations[].s3.repository.secretRef,
+// or "<instance-name>-restic".
+func resticSecretName(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) string {
+	if s3.Repository.SecretRef != "" {
+		return s3.Repository.SecretRef
+	}
+	return instance.Name + "-restic"
+}
+
+// s3SecretNames returns the Secrets the instance's s3 destination reads,
+// so the Secret watch (see SetupWithManager) reconciles the Instance once
+// one of them is created or changed.
+func s3SecretNames(instance *kubebirdv1.Instance) []string {
+	s3 := s3Destination(instance)
+	if s3 == nil {
+		return nil
+	}
+	names := []string{resticSecretName(instance, s3)}
+	if s3.Credentials.SecretRef != "" {
+		names = append(names, s3.Credentials.SecretRef)
+	}
+	return names
+}
+
+// resticImage returns the image of the restic containers.
+func resticImage(s3 *kubebirdv1.S3BackupSpec) string {
+	if s3.Image != "" {
+		return s3.Image
+	}
+	return defaultResticImage
+}
+
+// resticRepository returns the restic repository URL of the s3
+// destination, e.g. "s3:s3.amazonaws.com/bucket/namespace/name" or
+// "s3:http://silo:9000/bucket/namespace/name"; restic uses HTTPS unless
+// the endpoint says http://.
+func resticRepository(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) string {
+	endpoint := strings.TrimSuffix(s3.Endpoint, "/")
+	if endpoint == "" {
+		endpoint = "s3.amazonaws.com"
+	}
+	prefix := strings.Trim(s3.Prefix, "/")
+	if prefix == "" {
+		prefix = instance.Namespace + "/" + instance.Name
+	}
+	return fmt.Sprintf("s3:%s/%s/%s", endpoint, s3.Bucket, prefix)
+}
+
+// resticCommand returns the restic command line every script below runs,
+// before its subcommand: the repository comes from RESTIC_REPOSITORY (see
+// resticEnv), the password from the mounted Secret.
+func resticCommand(s3 *kubebirdv1.S3BackupSpec) string {
+	cmd := fmt.Sprintf("%s --password-file %s", binRestic, resticPasswordFile)
+	if s3.ForcePathStyle {
+		cmd += " -o s3.bucket-lookup=path"
+	}
+	if s3.Region != "" {
+		cmd += " -o s3.region=" + s3.Region
+	}
+	return cmd
+}
+
+// resticEnv returns the restic containers' environment: the repository
+// and, when credentials.secretRef is set, the S3 credentials from it.
+// Without it, restic falls back to the pod's ambient credentials (IAM
+// roles for service accounts and the like). optional makes the
+// credentials Secret's keys optional, for the delete-time backup Pod,
+// whose upload is best effort and so must never keep it from starting.
+func resticEnv(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, optional bool) []corev1.EnvVar {
+	env := []corev1.EnvVar{{Name: "RESTIC_REPOSITORY", Value: resticRepository(instance, s3)}}
+	if s3.Credentials.SecretRef == "" {
+		return env
+	}
+	for _, key := range []string{s3AccessKeyIDKey, s3SecretAccessKeyKey} {
+		env = append(env, corev1.EnvVar{
+			Name: key,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s3.Credentials.SecretRef},
+					Key:                  key,
+					Optional:             ptr.To(optional),
+				},
+			},
+		})
+	}
+	return env
+}
+
+// resticPasswordVolume returns the volume mounting the repository password
+// Secret (see resticPasswordFile). optional is as for resticEnv.
+func resticPasswordVolume(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, optional bool) corev1.Volume {
+	return corev1.Volume{
+		Name: resticPasswordVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  resticSecretName(instance, s3),
+				Items:       []corev1.KeyToPath{{Key: resticPasswordKey, Path: resticPasswordKey}},
+				DefaultMode: ptr.To(int32(0o400)),
+				Optional:    ptr.To(optional),
+			},
+		},
+	}
+}
+
+// resticContainer returns a restic container running script, with the
+// backup volume mounted at backupDataMountPath (read-only unless
+// writable) and the repository password at resticPasswordMountPath.
+func resticContainer(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, name, script string, writable, optional bool) corev1.Container {
+	return corev1.Container{
+		Name:  name,
+		Image: resticImage(s3),
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Command: []string{"sh", "-c", script},
+		Env:     resticEnv(instance, s3, optional),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: backupVolumeName, MountPath: backupDataMountPath, ReadOnly: !writable},
+			{Name: resticPasswordVolumeName, MountPath: resticPasswordMountPath, ReadOnly: true},
+		},
+	}
+}
+
+// resticEnsureRepositoryScript renders a shell snippet that initializes
+// the repository unless it already is: restic init creates the bucket
+// too when it's missing, and fails fast, with "already initialized", on
+// an existing repository, while "restic cat config" retries a missing
+// bucket for about 15 minutes. Two runs initializing at once are fine:
+// the loser sees "already initialized" too.
+func resticEnsureRepositoryScript(s3 *kubebirdv1.S3BackupSpec) string {
+	return fmt.Sprintf(`if ! OUT=$(%s init 2>&1); then
+	case "$OUT" in
+	*"already initialized"*|*"already exists"*) ;;
+	*) echo "$OUT" >&2; exit 1 ;;
+	esac
+fi
+`, resticCommand(s3))
+}
+
+// resticDuration renders the retention as a restic duration for forget's
+// --keep-within, which knows y, m, d and h but not weeks.
+func (d retentionDuration) resticDuration() string {
+	if d.unit == 'w' {
+		return fmt.Sprintf("%dd", d.amount*7)
+	}
+	return fmt.Sprintf("%d%c", d.amount, d.unit)
+}
+
+// resticUploadScript renders the scheduled backup Jobs' upload container
+// script: a snapshot of the frequency's directory, tagged with the
+// frequency (the directory's state after the backup container's own
+// pruning, so the latest snapshot always mirrors it), then a forget of
+// the frequency's snapshots older than its retention, relative to the
+// latest one, pruning the data only they referenced. A file pruned locally
+// therefore stays in the repository until the last snapshot holding it is
+// forgotten, up to twice the retention: in exchange, a backup volume that
+// was lost or emptied doesn't take the repository's copies with it on the
+// next run. Any failure fails the Job, so it shows up like a failed
+// backup. Snapshots are grouped by tag alone, since the host name is the
+// Instance's and the path the frequency's anyway.
+func resticUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, frequency string, retention retentionDuration) string {
+	restic := resticCommand(s3)
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	b.WriteString(resticEnsureRepositoryScript(s3))
+	fmt.Fprintf(&b, "%s backup --retry-lock %s --host %q --tag %q --exclude %q %q\n",
+		restic, resticLockWait, instance.Name, frequency, scheduledBackupClaimPrefix+"*", scheduledBackupDir(frequency))
+	fmt.Fprintf(&b, "%s forget --retry-lock %s --tag %q --group-by tags --keep-within %s --prune\n",
+		restic, resticLockWait, frequency, retention.resticDuration())
+	return b.String()
+}
+
+// resticBaseUploadScript renders the delete-time backup Pod's upload
+// container script: a snapshot of the base directory, tagged
+// resticBaseTag, never forgotten, so the security database backups of
+// older Firebird versions stay in it too. Best effort: the backup itself
+// already sits on the backup volume, which deleting the Instance always
+// keeps, so a failed or timed out (resticBaseUploadTimeout) upload is only
+// logged, and the Pod still succeeds rather than holding up the deletion
+// or a major version upgrade.
+func resticBaseUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) string {
+	upload := "set -e\n" + resticEnsureRepositoryScript(s3) +
+		fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q %q\n",
+			resticCommand(s3), resticLockWait, instance.Name, resticBaseTag, instanceBackupDir())
+	return fmt.Sprintf(`if timeout %d sh -c %s; then
+	echo "Uploaded the backup to the S3 repository"
+else
+	echo "Warning: failed to upload the backup to the S3 repository; it is still on the backup volume" >&2
+fi
+exit 0
+`, int(resticBaseUploadTimeout.Seconds()), shellQuote(upload))
+}
+
+// resticBootstrapScript renders the StatefulSet's backup-restore
+// initContainer script: when the backup volume's base directory is empty
+// or missing (a new Instance, or the backup volume was lost), it restores
+// the latest snapshot tagged resticBaseTag, if any, into it, so
+// security-database-init and restoreDatabaseIfBackedUp find the backups as
+// if they had been there all along. It never touches a base directory
+// that already holds something, which is always at least as recent as the
+// repository's copy of it. Failing here (e.g. the endpoint is unreachable)
+// fails the pod's start, rather than starting fresh databases where a
+// restore was due. The snapshot is restored at its own absolute path, the
+// base directory, whatever Instance took it (see S3BackupSpec.Prefix).
+func resticBootstrapScript(s3 *kubebirdv1.S3BackupSpec) string {
+	restic := resticCommand(s3)
+	return fmt.Sprintf(`set -e
+if [ -n "$(ls -A %[1]q 2>/dev/null)" ]; then
+	echo "The backup volume already holds backups; not restoring from the S3 repository"
+	exit 0
+fi
+%[2]sSNAPSHOTS=$(%[3]s snapshots --tag %[4]q --latest 1 --json)
+case "$SNAPSHOTS" in
+*'"id"'*)
+	echo "Restoring the backups from the S3 repository"
+	%[3]s restore latest --tag %[4]q --target /
+	;;
+*)
+	echo "The S3 repository holds no backup to restore"
+	;;
+esac
+`, instanceBackupDir(), resticEnsureRepositoryScript(s3), restic, resticBaseTag)
+}
+
+// reconcileS3Secrets ensures the Secrets the s3 destination reads exist:
+// the credentials Secret, when set, must already exist; the repository
+// password Secret is created with a generated password when unset and
+// missing (see reconcileResticSecret).
+func (r *InstanceReconciler) reconcileS3Secrets(ctx context.Context, instance *kubebirdv1.Instance) error {
+	s3 := s3Destination(instance)
+	if s3 == nil {
+		return nil
+	}
+	if name := s3.Credentials.SecretRef; name != "" {
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: instance.Namespace}, &corev1.Secret{}); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("secret %q specified in spec.backup.destinations[].s3.credentials.secretRef not found", name)
+			}
+			return fmt.Errorf("failed to get S3 credentials Secret %q: %w", name, err)
+		}
+	}
+	return r.reconcileResticSecret(ctx, instance, s3)
+}
+
+// reconcileResticSecret ensures the restic repository password Secret
+// exists, the same way reconcileUserSecret does a user's: a secretRef must
+// name an existing Secret, otherwise "<instance-name>-restic" is created
+// with a generated password if missing. Never owner-referenced, so it
+// survives deleting the Instance: a recreated Instance needs the same
+// password to read the repository.
+func (r *InstanceReconciler) reconcileResticSecret(ctx context.Context, instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) error {
+	name := resticSecretName(instance, s3)
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: instance.Namespace}, existing); err == nil {
+		if err := r.syncFirebirdVersionLabel(ctx, instance, existing); err != nil {
+			return fmt.Errorf("failed to label restic repository Secret %q with the Firebird version: %w", name, err)
+		}
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get restic repository Secret %q: %w", name, err)
+	}
+
+	if s3.Repository.SecretRef != "" {
+		return fmt.Errorf("secret %q specified in spec.backup.destinations[].s3.repository.secretRef not found", name)
+	}
+
+	password, err := generateRandomPassword()
+	if err != nil {
+		return fmt.Errorf("failed to generate the restic repository password: %w", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: instance.Namespace,
+			Labels:    withFirebirdVersionLabel(instance, labelsForInstance(instance.Name)),
+		},
+		StringData: map[string]string{resticPasswordKey: password},
+	}
+	if err := r.Create(ctx, secret); err != nil {
+		return fmt.Errorf("failed to create restic repository Secret %q: %w", name, err)
+	}
+	logf.FromContext(ctx).Info("Created restic repository Secret with a generated password", "name", name)
+	return nil
+}

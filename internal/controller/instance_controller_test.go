@@ -999,6 +999,63 @@ var _ = Describe("Instance Controller", func() {
 		})
 	})
 
+	Context("When validating an s3 backup destination", func() {
+		ctx := context.Background()
+
+		local := kubebirdv1.BackupDestinationSpec{Local: &kubebirdv1.LocalBackupSpec{
+			Storage: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+		}}
+		s3 := func(bucket string) kubebirdv1.BackupDestinationSpec {
+			return kubebirdv1.BackupDestinationSpec{S3: &kubebirdv1.S3BackupSpec{Bucket: bucket}}
+		}
+		instanceWithDestinations := func(name string, destinations ...kubebirdv1.BackupDestinationSpec) *kubebirdv1.Instance {
+			return &kubebirdv1.Instance{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: resourceNamespace},
+				Spec: kubebirdv1.InstanceSpec{
+					Image:     testImage,
+					Version:   testVersion,
+					Databases: []kubebirdv1.DatabaseSpec{{Name: testDatabaseName}},
+					Storage: kubebirdv1.StorageSpec{
+						Primary: kubebirdv1.StorageVolumeSpec{Size: apiresource.MustParse("1Gi")},
+					},
+					Backup: kubebirdv1.BackupSpec{Enabled: true, Destinations: destinations},
+				},
+			}
+		}
+
+		It("rejects an s3 destination without a local one", func() {
+			err := k8sClient.Create(ctx, instanceWithDestinations("test-s3-no-local", s3("kubebird")))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("an s3 destination requires a local destination"))
+		})
+
+		It("rejects two s3 destinations", func() {
+			err := k8sClient.Create(ctx, instanceWithDestinations("test-s3-two", local, s3("kubebird"), s3("other")))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("at most one s3 destination can be configured"))
+		})
+
+		It("rejects a bucket name S3 doesn't allow", func() {
+			for _, bucket := range []string{"kb", "Kubebird", "-kubebird"} {
+				err := k8sClient.Create(ctx, instanceWithDestinations("test-s3-bucket", local, s3(bucket)))
+				Expect(err).To(HaveOccurred(), bucket)
+				Expect(err.Error()).To(ContainSubstring("bucket"), bucket)
+			}
+		})
+
+		It("accepts an s3 destination next to a local one", func() {
+			instance := instanceWithDestinations("test-s3-valid", local, kubebirdv1.BackupDestinationSpec{S3: &kubebirdv1.S3BackupSpec{
+				Endpoint:       "http://silo.example.com:9000",
+				Bucket:         "kubebird-backups",
+				Prefix:         "prod/test",
+				Region:         "eu-west-1",
+				ForcePathStyle: true,
+			}})
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+		})
+	})
+
 	Context("When spec.authentication declares regular users", func() {
 		ctx := context.Background()
 

@@ -47,8 +47,9 @@ import (
 const conditionTypeAvailable = "Available"
 
 // secretRefIndexField indexes Instances by the Secrets their users'
-// (SYSDBA and regular ones) credentials are read from, so a Secret change
-// can be mapped back to the Instances that depend on it.
+// (SYSDBA and regular ones) credentials, and their s3 backup destination's
+// credentials and repository password (see s3SecretNames), are read from,
+// so a Secret change can be mapped back to the Instances that depend on it.
 const secretRefIndexField = ".spec.authentication.secretRef"
 
 // finalizerName lets Reconcile observe and log an Instance's deletion,
@@ -166,6 +167,9 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 		return err
 	}
 	if err := r.reconcileRegularUserSecrets(ctx, instance); err != nil {
+		return err
+	}
+	if err := r.reconcileS3Secrets(ctx, instance); err != nil {
 		return err
 	}
 
@@ -486,8 +490,9 @@ func (r *InstanceReconciler) setAvailable(ctx context.Context, instance *kubebir
 }
 
 // findInstancesForSecret maps a Secret to the Instances that reference it
-// as the credentials of SYSDBA or of a regular user, so Reconcile runs as soon as the Secret
-// appears or changes instead of waiting for a poll.
+// as the credentials of SYSDBA or of a regular user, or from their s3
+// backup destination, so Reconcile runs as soon as the Secret appears or
+// changes instead of waiting for a poll.
 func (r *InstanceReconciler) findInstancesForSecret(ctx context.Context, secret client.Object) []reconcile.Request {
 	var list kubebirdv1.InstanceList
 	if err := r.List(ctx, &list,
@@ -515,7 +520,7 @@ func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return nil
 			}
-			return userSecretNames(instance)
+			return append(userSecretNames(instance), s3SecretNames(instance)...)
 		}); err != nil {
 		return fmt.Errorf("failed to index Instance by user secretRef: %w", err)
 	}

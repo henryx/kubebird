@@ -315,6 +315,61 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 	failedHistory := int32(3)
 	backoffLimit := int32(0)
 
+	backup := corev1.Container{
+		Name:  containerName,
+		Image: backupImage(instance),
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Command:      []string{"sh", "-c", scheduledBackupScript(instance, freq)},
+		VolumeMounts: []corev1.VolumeMount{{Name: backupVolumeName, MountPath: backupDataMountPath}},
+		Env: []corev1.EnvVar{
+			{
+				Name: "SYSDBA_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: sysdbaSecretRefName(instance)},
+						Key:                  sysdbaSecretPasswordKey,
+					},
+				},
+			},
+		},
+	}
+	podSpec := corev1.PodSpec{
+		RestartPolicy: corev1.RestartPolicyNever,
+		Affinity: &corev1.Affinity{
+			PodAffinity: &corev1.PodAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+					{
+						LabelSelector: &metav1.LabelSelector{MatchLabels: firebirdPodSelector(instance.Name)},
+						TopologyKey:   firebirdNodeTopologyKey,
+					},
+				},
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: backupVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)},
+				},
+			},
+		},
+		Containers: []corev1.Container{backup},
+	}
+	if s3 := s3Destination(instance); s3 != nil {
+		// The backup runs first, as an initContainer, so the upload only
+		// starts once it succeeded, and a failed backup fails the Job
+		// without uploading anything (see resticUploadScript).
+		podSpec.InitContainers = []corev1.Container{backup}
+		podSpec.Containers = []corev1.Container{
+			resticContainer(instance, s3, uploadContainerName,
+				resticUploadScript(instance, s3, freq.name, frequencyRetention(instance, freq)), false, false),
+		}
+		podSpec.Volumes = append(podSpec.Volumes, resticPasswordVolume(instance, s3, false))
+	}
+
 	cronJob.Labels = withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))
 	cronJob.Spec = batchv1.CronJobSpec{
 		Schedule:                   freq.schedule,
@@ -328,50 +383,7 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 				ActiveDeadlineSeconds: ptr.To(int64(scheduledBackupActiveDeadline.Seconds())),
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))},
-					Spec: corev1.PodSpec{
-						RestartPolicy: corev1.RestartPolicyNever,
-						Affinity: &corev1.Affinity{
-							PodAffinity: &corev1.PodAffinity{
-								RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
-									{
-										LabelSelector: &metav1.LabelSelector{MatchLabels: firebirdPodSelector(instance.Name)},
-										TopologyKey:   firebirdNodeTopologyKey,
-									},
-								},
-							},
-						},
-						Volumes: []corev1.Volume{
-							{
-								Name: backupVolumeName,
-								VolumeSource: corev1.VolumeSource{
-									PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)},
-								},
-							},
-						},
-						Containers: []corev1.Container{
-							{
-								Name:  containerName,
-								Image: backupImage(instance),
-								SecurityContext: &corev1.SecurityContext{
-									AllowPrivilegeEscalation: ptr.To(false),
-									SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-								},
-								Command:      []string{"sh", "-c", scheduledBackupScript(instance, freq)},
-								VolumeMounts: []corev1.VolumeMount{{Name: backupVolumeName, MountPath: backupDataMountPath}},
-								Env: []corev1.EnvVar{
-									{
-										Name: "SYSDBA_PASSWORD",
-										ValueFrom: &corev1.EnvVarSource{
-											SecretKeyRef: &corev1.SecretKeySelector{
-												LocalObjectReference: corev1.LocalObjectReference{Name: sysdbaSecretRefName(instance)},
-												Key:                  sysdbaSecretPasswordKey,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
+					Spec:       podSpec,
 				},
 			},
 		},

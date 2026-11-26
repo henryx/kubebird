@@ -4,6 +4,16 @@
 
 ### Added
 
+- An `s3` backup destination, next to `local`, copying the local backup volume's backups to an
+  encrypted [restic](https://restic.net) repository in an S3-compatible bucket (AWS S3, MinIO, Silo,
+  Ceph, R2, ...). Scheduled backups upload a snapshot of their frequency's directory after every run
+  and forget snapshots older than the frequency's retention; the delete-time and major upgrade
+  backups upload `base/`, best effort. When an `Instance` starts with an empty backup volume, a new
+  `backup-restore` init container restores `base/` from the repository first, so a lost backup PVC
+  (or cluster) can be recovered from S3 alone. The repository password comes from a Secret
+  (`<name>-restic`, generated when not given) mounted into the restic containers and read with
+  `--password-file`; the S3 credentials from a Secret's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+  keys, or the pod's ambient credentials. Adding an `s3` entry restarts the Firebird pod once.
 - Regular Firebird users. `spec.authentication` now maps each user name to its credentials: `sysdba`
   configures SYSDBA as before, and any other key declares a regular user, whose password comes from
   `secretRef`, or from a generated `<name>-user-<user>` Secret (lowercased, underscores turned

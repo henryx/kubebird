@@ -520,6 +520,15 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 			VolumeMounts: initVolumeMounts,
 		},
 	}
+	if s3 := s3Destination(instance); s3 != nil {
+		// Restores the backup volume's base directory from the S3
+		// repository when it comes up empty, before
+		// security-database-init looks for a security database backup in
+		// it (see resticBootstrapScript).
+		sts.Spec.Template.Spec.InitContainers = append([]corev1.Container{
+			resticContainer(instance, s3, backupRestoreInitContainerName, resticBootstrapScript(s3), true, false),
+		}, sts.Spec.Template.Spec.InitContainers...)
+	}
 	sts.Spec.Template.Spec.Volumes = []corev1.Volume{
 		{
 			Name: primaryVolumeName,
@@ -551,6 +560,9 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: shadowPVCName(instance)},
 			},
 		})
+	}
+	if s3 := s3Destination(instance); s3 != nil {
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, resticPasswordVolume(instance, s3, false))
 	}
 
 	return controllerutil.SetControllerReference(instance, sts, r.Scheme)

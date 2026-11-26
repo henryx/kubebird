@@ -152,11 +152,15 @@ type BackupSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// destinations lists the backup destinations to configure. Only a
-	// "local" destination (a dedicated PVC) is currently implemented;
-	// required to be non-empty when enabled is true.
+	// destinations lists the backup destinations to configure: "local" (a
+	// dedicated PVC, where every backup is taken) and "s3" (a restic
+	// repository the local backups are copied to, which requires a local
+	// destination too). Required to be non-empty when enabled is true.
 	// +optional
 	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:XValidation:rule="!self.exists(d, has(d.s3)) || self.exists(d, has(d.local))",message="an s3 destination requires a local destination, which stages its backups"
+	// +kubebuilder:validation:XValidation:rule="self.filter(d, has(d.s3)).size() <= 1",message="at most one s3 destination can be configured"
 	Destinations []BackupDestinationSpec `json:"destinations,omitempty"`
 
 	// image is the container image (including tag) used to run the
@@ -303,6 +307,100 @@ type BackupDestinationSpec struct {
 	// /var/lib/firebird/backup.
 	// +optional
 	Local *LocalBackupSpec `json:"local,omitempty"`
+
+	// s3 copies the local backup volume's backups into a restic repository
+	// on an S3-compatible object store; see S3BackupSpec. Requires a local
+	// destination, which stays the staging area.
+	// +optional
+	S3 *S3BackupSpec `json:"s3,omitempty"`
+}
+
+// S3BackupSpec configures copying backups from the local backup volume to
+// a restic repository in an S3-compatible bucket (AWS S3, MinIO, Silo,
+// Ceph, R2, ...). Every scheduled backup run (see RetentionSpec) takes a
+// restic snapshot of its frequency's directory, tagged with the frequency,
+// and then forgets that frequency's snapshots older than its retention;
+// every delete-time or major upgrade backup takes a snapshot of the "base"
+// directory, tagged "base", which is never forgotten. When an Instance
+// starts with an empty backup volume (e.g. it was lost along with its
+// cluster) and the repository holds a "base" snapshot, that snapshot is
+// restored into the backup volume first, so the security database and
+// every database are restored from it as from a local backup.
+type S3BackupSpec struct {
+	// endpoint is the S3 endpoint, as host[:port] (HTTPS) or a full
+	// http:// or https:// URL. Defaults to AWS S3 (s3.amazonaws.com).
+	// +kubebuilder:validation:Pattern=`^((https?://)?[A-Za-z0-9.-]+(:[0-9]+)?)?$`
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// bucket is the bucket holding the restic repository; restic creates
+	// it when it doesn't exist yet.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`
+	Bucket string `json:"bucket"`
+
+	// prefix is the path of the restic repository inside the bucket.
+	// Defaults to "<namespace>/<name>" of the Instance. Point it at another
+	// Instance's repository to restore that Instance's backups into this
+	// one, e.g. in another cluster.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._/-]*$`
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+
+	// region is the bucket's region, e.g. "eu-west-1". Detected
+	// automatically when empty.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// forcePathStyle addresses the bucket as "<endpoint>/<bucket>" instead
+	// of "<bucket>.<endpoint>", as MinIO and Silo need. Defaults to false.
+	// +kubebuilder:default=false
+	// +optional
+	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+
+	// credentials configures the S3 credentials.
+	// +optional
+	Credentials S3CredentialsSpec `json:"credentials,omitzero"`
+
+	// repository configures the restic repository's password.
+	// +optional
+	Repository ResticRepositorySpec `json:"repository,omitzero"`
+
+	// image is the restic container image (including tag) that uploads
+	// and restores backups. Defaults to the restic version Kubebird was
+	// tested with.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Image string `json:"image,omitempty"`
+}
+
+// S3CredentialsSpec configures the credentials used to reach the bucket.
+type S3CredentialsSpec struct {
+	// secretRef is the name of a Secret holding the AWS_ACCESS_KEY_ID and
+	// AWS_SECRET_ACCESS_KEY keys. When empty, restic falls back to the
+	// pod's ambient credentials (IAM roles for service accounts, EC2
+	// instance profile, ...).
+	// +optional
+	SecretRef string `json:"secretRef,omitempty"`
+}
+
+// ResticRepositorySpec configures the restic repository's encryption.
+type ResticRepositorySpec struct {
+	// secretRef is the name of the Secret holding the repository password
+	// under its "password" key, mounted into the restic containers and
+	// passed with --password-file. Defaults to "<instance-name>-restic",
+	// created with a generated password if it doesn't exist yet. When set,
+	// the Secret must already exist. Like the users' Secrets, it's never
+	// deleted along with the Instance: without the password, the
+	// repository can't be read, so keep a copy of it outside the cluster.
+	// +optional
+	SecretRef string `json:"secretRef,omitempty"`
 }
 
 // LocalBackupSpec configures the dedicated PVC used to stage backups.
