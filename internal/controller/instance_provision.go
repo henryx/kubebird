@@ -114,7 +114,6 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 
 	podName := firebirdPodName(instance)
-	sysdbaCommand := []string{binIsql, flagUser, sysdbaUsername, flagPassword, password}
 
 	// Only worth checking when something in spec.databases is actually
 	// being created/restored: that's the event (an Instance recreated, or
@@ -136,8 +135,8 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 
 	for _, name := range removed {
-		dropCommand := append(append([]string{}, sysdbaCommand...), path.Join(primaryDataMountPath, name))
-		if err := r.execInPod(ctx, instance.Namespace, podName, dropCommand, databaseDropScript); err != nil {
+		if _, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, databaseDropScript,
+			binIsql, flagUser, sysdbaUsername, flagPassword, secret(password), path.Join(primaryDataMountPath, name)); err != nil {
 			return fmt.Errorf("failed to drop database %q: %w", name, err)
 		}
 		logf.FromContext(ctx).Info("Dropped database", "database", name)
@@ -175,8 +174,8 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 		if err != nil {
 			return err
 		}
-		createCommand := []string{binIsql, flagUser, owner, flagPassword, ownerPassword}
-		if err := r.execInPod(ctx, instance.Namespace, podName, createCommand, databaseCreateScript(db)); err != nil {
+		if _, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, databaseCreateScript(db),
+			binIsql, flagUser, owner, flagPassword, secret(ownerPassword)); err != nil {
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
 		logf.FromContext(ctx).Info("Created database", "database", db.Name, "owner", owner)
@@ -468,9 +467,16 @@ fi
 }
 
 // execInPod runs command inside the firebird container of podName,
-// piping stdin in as its stdin. Used both for isql invocations (stdin
-// carrying the script to run) and for gbak, which takes no stdin.
+// piping stdin in as its stdin, and discards its stdout. Never put a
+// password in command: use execInPodWithSecrets instead.
 func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName string, command []string, stdin string) error {
+	_, err := r.execInPodOutput(ctx, namespace, podName, command, stdin)
+	return err
+}
+
+// execInPodOutput behaves like execInPod, but returns the command's
+// stdout instead of discarding it.
+func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, podName string, command []string, stdin string) (string, error) {
 	req := r.ClientSet.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Namespace(namespace).
@@ -486,7 +492,7 @@ func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName s
 
 	executor, err := remotecommand.NewSPDYExecutor(r.RestConfig, http.MethodPost, req.URL())
 	if err != nil {
-		return fmt.Errorf("failed to create exec executor: %w", err)
+		return "", fmt.Errorf("failed to create exec executor: %w", err)
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -495,40 +501,62 @@ func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName s
 		Stdout: &stdout,
 		Stderr: &stderr,
 	}); err != nil {
-		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
-	}
-	return nil
-}
-
-// execInPodOutput behaves like execInPod, but returns the command's
-// stdout instead of discarding it — used by orphanedBackups to list the
-// backup directory's contents.
-func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, podName string, command []string) (string, error) {
-	req := r.ClientSet.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Namespace(namespace).
-		Name(podName).
-		SubResource("exec")
-	req.VersionedParams(&corev1.PodExecOptions{
-		Container: containerName,
-		Command:   command,
-		Stdout:    true,
-		Stderr:    true,
-	}, scheme.ParameterCodec)
-
-	executor, err := remotecommand.NewSPDYExecutor(r.RestConfig, http.MethodPost, req.URL())
-	if err != nil {
-		return "", fmt.Errorf("failed to create exec executor: %w", err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-	}); err != nil {
 		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 	return stdout.String(), nil
+}
+
+// secret is an exec argument, such as a password, that must not be sent as
+// part of the exec request (see secretCommand).
+type secret string
+
+// secretCommand renders args, each a string or a secret, as the command
+// and stdin prefix to exec. A pod exec's command travels in the request
+// URL's query string, which API server audit logs record from the Metadata
+// level up, so a password passed as a plain argument would end up there.
+// Each secret is instead written to stdin, one per line, read back by a
+// wrapping sh and passed on to the program as an argument from there. The
+// program's own stdin (e.g. an isql script) follows the secrets: sh's read
+// takes a pipe one byte at a time, so it stops right after the last
+// secret's line and leaves the rest to the program it execs.
+func secretCommand(args ...any) ([]string, string, error) {
+	var script, stdin strings.Builder
+	argv := make([]string, 0, len(args))
+	n := 0
+	for _, arg := range args {
+		switch v := arg.(type) {
+		case string:
+			argv = append(argv, shellQuote(v))
+		case secret:
+			if strings.ContainsAny(string(v), "\r\n") {
+				return nil, "", errors.New("a password can't contain a line break")
+			}
+			n++
+			fmt.Fprintf(&script, "IFS= read -r S%d || { echo 'failed to read a secret from stdin' >&2; exit 1; }\n", n)
+			stdin.WriteString(string(v) + "\n")
+			argv = append(argv, fmt.Sprintf(`"$S%d"`, n))
+		default:
+			return nil, "", fmt.Errorf("unsupported exec argument type %T", arg)
+		}
+	}
+	script.WriteString("exec " + strings.Join(argv, " ") + "\n")
+	return []string{"sh", "-c", script.String()}, stdin.String(), nil
+}
+
+// shellQuote single-quotes s for sh.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// execInPodWithSecrets runs args (see secretCommand) inside the firebird
+// container of podName, with stdin as the program's own stdin, and returns
+// its stdout.
+func (r *InstanceReconciler) execInPodWithSecrets(ctx context.Context, namespace, podName, stdin string, args ...any) (string, error) {
+	command, secrets, err := secretCommand(args...)
+	if err != nil {
+		return "", err
+	}
+	return r.execInPodOutput(ctx, namespace, podName, command, secrets+stdin)
 }
 
 // orphanedBackups lists the databases whose backup file sits in the
@@ -553,7 +581,7 @@ func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kube
 	// might not exist yet (e.g. no deletion has ever written a backup
 	// into it), in which case there's simply nothing orphaned to report.
 	output, err := r.execInPodOutput(ctx, instance.Namespace, podName,
-		[]string{"sh", "-c", fmt.Sprintf("ls -1 %s 2>/dev/null || true", dir)})
+		[]string{"sh", "-c", fmt.Sprintf("ls -1 %s 2>/dev/null || true", dir)}, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list backup directory %q: %w", dir, err)
 	}
@@ -610,16 +638,16 @@ func (r *InstanceReconciler) restoreDatabaseIfBackedUp(ctx context.Context, inst
 		return false, err
 	}
 	dbPath := path.Join(primaryDataMountPath, db.Name)
-	restoreCommand := []string{binGbak, "-create", flagVerify, flagUser, owner, flagPassword, ownerPassword, backupPath, dbPath}
-	if err := r.execInPod(ctx, instance.Namespace, podName, restoreCommand, ""); err != nil {
+	if _, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, "",
+		binGbak, "-create", flagVerify, flagUser, owner, flagPassword, secret(ownerPassword), backupPath, dbPath); err != nil {
 		return false, fmt.Errorf("gbak restore failed: %w", err)
 	}
 
 	if db.Shadow {
 		shadowPath := path.Join(shadowDataMountPath, db.Name)
-		connectCommand := []string{binIsql, flagUser, sysdbaUsername, flagPassword, password, dbPath}
 		script := fmt.Sprintf("CREATE SHADOW 1 '%s';\nQUIT;\n", shadowPath)
-		if err := r.execInPod(ctx, instance.Namespace, podName, connectCommand, script); err != nil {
+		if _, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, script,
+			binIsql, flagUser, sysdbaUsername, flagPassword, secret(password), dbPath); err != nil {
 			return false, fmt.Errorf("failed to recreate shadow file after restore: %w", err)
 		}
 	}

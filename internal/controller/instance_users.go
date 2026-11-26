@@ -238,9 +238,10 @@ func (r *InstanceReconciler) reconcileUsers(ctx context.Context, instance *kubeb
 }
 
 // serviceManagerCommand returns the fbsvcmgr command line running action
-// against the instance's own server as SYSDBA.
-func serviceManagerCommand(sysdbaPassword string, action ...string) []string {
-	return append([]string{binFbsvcmgr, serviceManagerConn, flagUser, sysdbaUsername, flagPassword, sysdbaPassword}, action...)
+// (strings, or a secret for a password) against the instance's own server
+// as SYSDBA, for execInPodWithSecrets.
+func serviceManagerCommand(sysdbaPassword string, action ...any) []any {
+	return append([]any{binFbsvcmgr, serviceManagerConn, flagUser, sysdbaUsername, flagPassword, secret(sysdbaPassword)}, action...)
 }
 
 // applyFirebirdUser creates user in the security database with password,
@@ -248,8 +249,8 @@ func serviceManagerCommand(sysdbaPassword string, action ...string) []string {
 // security database), gives it password instead: -action_add_user fails on
 // an existing user, so whether it exists is checked first.
 func (r *InstanceReconciler) applyFirebirdUser(ctx context.Context, instance *kubebirdv1.Instance, podName, sysdbaPassword, user, password string) error {
-	out, err := r.execInPodOutput(ctx, instance.Namespace, podName,
-		serviceManagerCommand(sysdbaPassword, actionDisplayUser, flagSecUsername, user))
+	out, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, "",
+		serviceManagerCommand(sysdbaPassword, actionDisplayUser, flagSecUsername, user)...)
 	if err != nil {
 		return fmt.Errorf("failed to look up Firebird user %s: %w", user, err)
 	}
@@ -258,8 +259,8 @@ func (r *InstanceReconciler) applyFirebirdUser(ctx context.Context, instance *ku
 	if displayedUserExists(out, user) {
 		action, verb = actionModifyUser, "Updated"
 	}
-	if err := r.execInPod(ctx, instance.Namespace, podName,
-		serviceManagerCommand(sysdbaPassword, action, flagSecUsername, user, flagSecPassword, password), ""); err != nil {
+	if _, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, "",
+		serviceManagerCommand(sysdbaPassword, action, flagSecUsername, user, flagSecPassword, secret(password))...); err != nil {
 		return fmt.Errorf("failed to apply Firebird user %s: %w", user, err)
 	}
 	logf.FromContext(ctx).Info(verb+" Firebird user from its Secret", "user", user)
@@ -269,16 +270,16 @@ func (r *InstanceReconciler) applyFirebirdUser(ctx context.Context, instance *ku
 // deleteFirebirdUser deletes user from the security database, if it's
 // still there.
 func (r *InstanceReconciler) deleteFirebirdUser(ctx context.Context, instance *kubebirdv1.Instance, podName, sysdbaPassword, user string) error {
-	out, err := r.execInPodOutput(ctx, instance.Namespace, podName,
-		serviceManagerCommand(sysdbaPassword, actionDisplayUser, flagSecUsername, user))
+	out, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, "",
+		serviceManagerCommand(sysdbaPassword, actionDisplayUser, flagSecUsername, user)...)
 	if err != nil {
 		return fmt.Errorf("failed to look up Firebird user %s: %w", user, err)
 	}
 	if !displayedUserExists(out, user) {
 		return nil
 	}
-	if err := r.execInPod(ctx, instance.Namespace, podName,
-		serviceManagerCommand(sysdbaPassword, actionDeleteUser, flagSecUsername, user), ""); err != nil {
+	if _, err := r.execInPodWithSecrets(ctx, instance.Namespace, podName, "",
+		serviceManagerCommand(sysdbaPassword, actionDeleteUser, flagSecUsername, user)...); err != nil {
 		return fmt.Errorf("failed to delete Firebird user %s: %w", user, err)
 	}
 	logf.FromContext(ctx).Info("Deleted Firebird user no longer in spec.authentication", "user", user)

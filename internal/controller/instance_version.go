@@ -111,9 +111,8 @@ func (r *InstanceReconciler) reconcileFirebirdVersion(ctx context.Context, insta
 		if err != nil {
 			return err
 		}
-		output, err := r.execInPodOutput(ctx, instance.Namespace, pod.Name, []string{
-			"fbsvcmgr", "localhost:service_mgr", flagUser, sysdbaUsername, flagPassword, password, "-info_server_version",
-		})
+		output, err := r.execInPodWithSecrets(ctx, instance.Namespace, pod.Name, "",
+			serviceManagerCommand(password, "-info_server_version")...)
 		if err != nil {
 			return fmt.Errorf("failed to query Firebird server version: %w", err)
 		}
