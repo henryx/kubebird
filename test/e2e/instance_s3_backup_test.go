@@ -20,21 +20,15 @@ limitations under the License.
 package e2e
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/network"
-	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/henryx/kubebird/test/silo"
 	"github.com/henryx/kubebird/test/utils"
 )
 
@@ -51,20 +45,100 @@ const (
 	s3BackupPVC        = s3InstanceName + "-backup"
 	s3CronJob          = s3InstanceName + "-backup-hour"
 	s3Bucket           = "kubebird-e2e"
+	s3ResticPod        = s3InstanceName + "-restic-check"
 
 	// s3ResticImage must match the operator's default restic image
 	// (defaultResticImage in internal/controller).
 	s3ResticImage = "restic/restic:0.19.1"
 )
 
-// kindNetwork returns the Docker network the Kind cluster's nodes run on,
-// which Silo joins so the cluster's pods can reach it by IP: "kind",
-// unless KIND_EXPERIMENTAL_DOCKER_NETWORK picks another one.
-func kindNetwork() string {
-	if n := os.Getenv("KIND_EXPERIMENTAL_DOCKER_NETWORK"); n != "" {
-		return n
+// s3Restic runs restic with args against the Instance's repository, from a
+// throwaway Pod mounting the Instance's repository password Secret and the
+// S3 credentials Secret the same way Kubebird's own restic containers do,
+// and returns its output once it exits.
+func s3Restic(args ...string) (string, error) {
+	overrides, err := json.Marshal(map[string]any{
+		"spec": map[string]any{
+			"restartPolicy": "Never",
+			"containers": []map[string]any{{
+				"name":  "restic",
+				"image": s3ResticImage,
+				"args": append([]string{"--password-file", "/etc/restic/password", "-o", "s3.bucket-lookup=path"},
+					args...),
+				"env": []map[string]any{
+					{"name": "RESTIC_REPOSITORY",
+						"value": fmt.Sprintf("s3:%s/%s/%s/%s", siloEndpoint, s3Bucket, namespace, s3InstanceName)},
+					{"name": "AWS_ACCESS_KEY_ID", "valueFrom": map[string]any{
+						"secretKeyRef": map[string]any{"name": s3CredentialSecret, "key": "AWS_ACCESS_KEY_ID"}}},
+					{"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": map[string]any{
+						"secretKeyRef": map[string]any{"name": s3CredentialSecret, "key": "AWS_SECRET_ACCESS_KEY"}}},
+				},
+				"volumeMounts": []map[string]any{{"name": "password", "mountPath": "/etc/restic", "readOnly": true}},
+			}},
+			"volumes": []map[string]any{{"name": "password", "secret": map[string]any{"secretName": s3ResticSecret}}},
+		},
+	})
+	if err != nil {
+		return "", err
 	}
-	return "kind"
+	cmd := exec.Command("kubectl", "run", s3ResticPod, "--restart=Never", "-n", namespace,
+		"--image="+s3ResticImage, "--overrides", string(overrides))
+	if _, err := utils.Run(cmd); err != nil {
+		return "", err
+	}
+	defer func() {
+		cmd := exec.Command("kubectl", "delete", "pod", s3ResticPod, "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+	}()
+
+	var phase string
+	deadline := time.Now().Add(3 * time.Minute)
+	for phase != "Succeeded" && phase != "Failed" {
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("restic %v didn't finish in time (phase %q)", args, phase)
+		}
+		time.Sleep(2 * time.Second)
+		cmd := exec.Command("kubectl", "get", "pod", s3ResticPod, "-n", namespace, "-o", "jsonpath={.status.phase}")
+		if phase, err = utils.Run(cmd); err != nil {
+			return "", err
+		}
+	}
+	cmd = exec.Command("kubectl", "logs", s3ResticPod, "-n", namespace)
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return "", err
+	}
+	if phase == "Failed" {
+		return output, fmt.Errorf("restic %v failed: %s", args, output)
+	}
+	return output, nil
+}
+
+// s3Snapshots returns the time of every snapshot tagged tag.
+func s3Snapshots(tag string) ([]string, error) {
+	output, err := s3Restic("snapshots", "--tag", tag, "--json")
+	if err != nil {
+		return nil, err
+	}
+	var snapshots []struct {
+		Time string `json:"time"`
+	}
+	if err := json.Unmarshal([]byte(output[strings.Index(output, "["):]), &snapshots); err != nil {
+		return nil, fmt.Errorf("unexpected restic snapshots output %q: %w", output, err)
+	}
+	times := make([]string, len(snapshots))
+	for i, s := range snapshots {
+		times[i] = s.Time
+	}
+	return times, nil
+}
+
+// applyS3Manifest applies the Instance manifest.
+func applyS3Manifest(manifest string) {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
 }
 
 // s3Login connects to the database through the instance's own server as
@@ -95,93 +169,17 @@ func waitForS3Instance() {
 }
 
 // instanceS3BackupSpecs exercises the s3 backup destination against Silo,
-// an S3-compatible object store started through testcontainers on the
-// Kind cluster's own Docker network: a scheduled backup Job uploads its
-// backup into the restic repository, deleting the Instance uploads the
-// delete-time backup, and, after the backup PVC is deleted too, a
-// recreated Instance restores its database and users from the repository
+// the S3-compatible object store the suite deploys into the Kind cluster
+// (see setupSilo): a scheduled backup Job uploads its backup into the
+// restic repository and forgets an expired snapshot, deleting the Instance
+// uploads the delete-time backup, and, after the backup PVC is deleted too,
+// a recreated Instance restores its database and users from the repository
 // alone.
 //
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, before that Describe's AfterAll tears down the manager.
 func instanceS3BackupSpecs() {
-	Context("Instance s3 backup destination", Ordered, func() {
-		var siloContainer *testcontainers.DockerContainer
-		var endpoint string
-		var manifest string
-
-		// restic runs restic subcommand args against the Instance's
-		// repository from a container on the Kind network, with the
-		// repository password from the Instance's generated Secret, and
-		// returns its output.
-		restic := func(args ...string) (string, error) {
-			password, err := getSecretField(s3ResticSecret, "password")
-			if err != nil {
-				return "", err
-			}
-			ctx := context.Background()
-			c, err := testcontainers.Run(ctx, s3ResticImage,
-				testcontainers.WithCmd(append([]string{"--password-file", "/password", "-o", "s3.bucket-lookup=path"}, args...)...),
-				testcontainers.WithEnv(map[string]string{
-					"RESTIC_REPOSITORY":     fmt.Sprintf("s3:%s/%s/%s/%s", endpoint, s3Bucket, namespace, s3InstanceName),
-					"AWS_ACCESS_KEY_ID":     silo.AccessKey,
-					"AWS_SECRET_ACCESS_KEY": silo.SecretKey,
-				}),
-				testcontainers.WithFiles(testcontainers.ContainerFile{
-					Reader: strings.NewReader(password), ContainerFilePath: "/password", FileMode: 0o400,
-				}),
-				network.WithNetworkName(nil, kindNetwork()),
-				testcontainers.WithWaitStrategy(wait.ForExit().WithExitTimeout(3*time.Minute)),
-			)
-			defer func() { _ = testcontainers.TerminateContainer(c) }()
-			if err != nil {
-				return "", err
-			}
-			state, err := c.State(ctx)
-			if err != nil {
-				return "", err
-			}
-			logs, err := c.Logs(ctx)
-			if err != nil {
-				return "", err
-			}
-			defer func() { _ = logs.Close() }()
-			out, err := io.ReadAll(logs)
-			if err != nil {
-				return "", err
-			}
-			if state.ExitCode != 0 {
-				return string(out), fmt.Errorf("restic %v exited with %d: %s", args, state.ExitCode, out)
-			}
-			return string(out), nil
-		}
-
-		applyManifest := func() {
-			cmd := exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(manifest)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-		}
-
-		BeforeAll(func() {
-			By("starting Silo on the Kind network")
-			var err error
-			siloContainer, err = silo.Run(context.Background(), network.WithNetworkName(nil, kindNetwork()))
-			Expect(err).NotTo(HaveOccurred())
-			inspect, err := siloContainer.Inspect(context.Background())
-			Expect(err).NotTo(HaveOccurred())
-			settings, ok := inspect.NetworkSettings.Networks[kindNetwork()]
-			Expect(ok).To(BeTrue(), "Silo isn't on the %s network", kindNetwork())
-			endpoint = fmt.Sprintf("http://%s:%d", settings.IPAddress, silo.Port)
-
-			By("creating the S3 credentials Secret")
-			cmd := exec.Command("kubectl", "create", "secret", "generic", s3CredentialSecret, "-n", namespace,
-				"--from-literal=AWS_ACCESS_KEY_ID="+silo.AccessKey,
-				"--from-literal=AWS_SECRET_ACCESS_KEY="+silo.SecretKey)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			manifest = fmt.Sprintf(`
+	manifest := fmt.Sprintf(`
 apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
@@ -212,7 +210,17 @@ spec:
             secretRef: %s
     retention:
       hour: "2h"
-`, s3InstanceName, namespace, firebirdVersion, s3DatabaseName, s3UserKey, s3UserKey, endpoint, s3Bucket, s3CredentialSecret)
+`, s3InstanceName, namespace, firebirdVersion, s3DatabaseName, s3UserKey, s3UserKey, siloEndpoint, s3Bucket,
+		s3CredentialSecret)
+
+	Context("Instance s3 backup destination", Ordered, func() {
+		BeforeAll(func() {
+			By("creating the S3 credentials Secret")
+			cmd := exec.Command("kubectl", "create", "secret", "generic", s3CredentialSecret, "-n", namespace,
+				"--from-literal=AWS_ACCESS_KEY_ID="+siloAccessKey,
+				"--from-literal=AWS_SECRET_ACCESS_KEY="+siloSecretKey)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		AfterAll(func() {
@@ -225,20 +233,22 @@ spec:
 			cmd = exec.Command("kubectl", "delete", "secret", s3SysdbaSecret, s3UserSecret, s3ResticSecret,
 				s3CredentialSecret, "-n", namespace, "--ignore-not-found")
 			_, _ = utils.Run(cmd)
-			if siloContainer != nil {
-				_ = testcontainers.TerminateContainer(siloContainer)
-			}
 		})
 
 		It("should upload a scheduled backup into the restic repository", func() {
 			By("applying the Instance CR")
-			applyManifest()
+			applyS3Manifest(manifest)
 			waitForS3Instance()
 
 			By("generating the restic repository password Secret")
 			password, err := getSecretField(s3ResticSecret, "password")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(password).NotTo(BeEmpty())
+
+			By("planting an hourly snapshot older than the 2h retention")
+			_, err = s3Restic("backup", "--host", s3InstanceName, "--tag", "hour",
+				"--time", "2000-01-01 00:00:00", "/etc/hostname")
+			Expect(err).NotTo(HaveOccurred())
 
 			By("running the hourly CronJob's backup and upload")
 			Eventually(func(g Gomega) {
@@ -263,8 +273,14 @@ spec:
 				g.Expect(output).To(Equal("1"))
 			}, 5*time.Minute, 2*time.Second).Should(Succeed())
 
+			By("forgetting the expired snapshot, keeping only the new one")
+			snapshots, err := s3Snapshots("hour")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(snapshots).To(HaveLen(1))
+			Expect(snapshots[0]).NotTo(HavePrefix("2000-"))
+
 			By("finding the backup in the repository's latest hourly snapshot")
-			output, err := restic("ls", "latest", "--tag", "hour")
+			output, err := s3Restic("ls", "latest", "--tag", "hour")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(MatchRegexp(`/var/lib/firebird/backup/hour/s3-[0-9]{8}T[0-9]{6}Z\.fbk`))
 		})
@@ -284,7 +300,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("finding the database and the security database in the repository's latest base snapshot")
-			output, err := restic("ls", "latest", "--tag", "base")
+			output, err := s3Restic("ls", "latest", "--tag", "base")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(ContainSubstring("/var/lib/firebird/backup/base/s3.fbk"))
 			Expect(output).To(ContainSubstring("/var/lib/firebird/backup/base/" + securityDatabaseFile(".fbk")))
@@ -304,7 +320,7 @@ spec:
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("re-applying the identical Instance CR")
-			applyManifest()
+			applyS3Manifest(manifest)
 			waitForS3Instance()
 
 			By("having restored the backup volume from the repository")
