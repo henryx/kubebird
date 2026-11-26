@@ -116,9 +116,10 @@ spec:
                     type: boolean
                   destinations:
                     description: |-
-                      destinations lists the backup destinations to configure. Only a
-                      "local" destination (a dedicated PVC) is currently implemented;
-                      required to be non-empty when enabled is true.
+                      destinations lists the backup destinations to configure: "local" (a
+                      dedicated PVC, where every backup is taken) and "s3" (a restic
+                      repository the local backups are copied to, which requires a local
+                      destination too). Required to be non-empty when enabled is true.
                     items:
                       description: BackupDestinationSpec selects one backup destination
                         for the instance.
@@ -149,9 +150,95 @@ spec:
                           required:
                           - storage
                           type: object
+                        s3:
+                          description: |-
+                            s3 copies the local backup volume's backups into a restic repository
+                            on an S3-compatible object store; see S3BackupSpec. Requires a local
+                            destination, which stays the staging area.
+                          properties:
+                            bucket:
+                              description: |-
+                                bucket is the bucket holding the restic repository; restic creates
+                                it when it doesn't exist yet.
+                              maxLength: 63
+                              minLength: 3
+                              pattern: ^[a-z0-9][a-z0-9.-]*[a-z0-9]$
+                              type: string
+                            credentials:
+                              description: credentials configures the S3 credentials.
+                              properties:
+                                secretRef:
+                                  description: |-
+                                    secretRef is the name of a Secret holding the AWS_ACCESS_KEY_ID and
+                                    AWS_SECRET_ACCESS_KEY keys. When empty, restic falls back to the
+                                    pod's ambient credentials (IAM roles for service accounts, EC2
+                                    instance profile, ...).
+                                  type: string
+                              type: object
+                            endpoint:
+                              description: |-
+                                endpoint is the S3 endpoint, as host[:port] (HTTPS) or a full
+                                http:// or https:// URL. Defaults to AWS S3 (s3.amazonaws.com).
+                              maxLength: 253
+                              pattern: ^((https?://)?[A-Za-z0-9.-]+(:[0-9]+)?)?$
+                              type: string
+                            forcePathStyle:
+                              default: false
+                              description: |-
+                                forcePathStyle addresses the bucket as "<endpoint>/<bucket>" instead
+                                of "<bucket>.<endpoint>", as MinIO and Silo need. Defaults to false.
+                              type: boolean
+                            image:
+                              description: |-
+                                image is the restic container image (including tag) that uploads
+                                and restores backups. Defaults to the restic version Kubebird was
+                                tested with.
+                              maxLength: 512
+                              type: string
+                            prefix:
+                              description: |-
+                                prefix is the path of the restic repository inside the bucket.
+                                Defaults to "<namespace>/<name>" of the Instance. Point it at another
+                                Instance's repository to restore that Instance's backups into this
+                                one, e.g. in another cluster.
+                              maxLength: 512
+                              pattern: ^[A-Za-z0-9._/-]*$
+                              type: string
+                            region:
+                              description: |-
+                                region is the bucket's region, e.g. "eu-west-1". Detected
+                                automatically when empty.
+                              maxLength: 64
+                              pattern: ^[A-Za-z0-9-]*$
+                              type: string
+                            repository:
+                              description: repository configures the restic repository's
+                                password.
+                              properties:
+                                secretRef:
+                                  description: |-
+                                    secretRef is the name of the Secret holding the repository password
+                                    under its "password" key, mounted into the restic containers and
+                                    passed with --password-file. Defaults to "<instance-name>-restic",
+                                    created with a generated password if it doesn't exist yet. When set,
+                                    the Secret must already exist. Like the users' Secrets, it's never
+                                    deleted along with the Instance: without the password, the
+                                    repository can't be read, so keep a copy of it outside the cluster.
+                                  type: string
+                              type: object
+                          required:
+                          - bucket
+                          type: object
                       type: object
+                    maxItems: 8
                     type: array
                     x-kubernetes-list-type: atomic
+                    x-kubernetes-validations:
+                    - message: an s3 destination requires a local destination, which
+                        stages its backups
+                      rule: '!self.exists(d, has(d.s3)) || self.exists(d, has(d.local))'
+                    - message: at most one s3 destination can be configured
+                      rule: self.filter(d, has(d.s3)).size() <= 1
                   enabled:
                     default: false
                     description: |-
