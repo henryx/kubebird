@@ -195,6 +195,14 @@ spec:
                                 tested with.
                               maxLength: 512
                               type: string
+                            insecureSkipTLSVerify:
+                              default: false
+                              description: |-
+                                insecureSkipTLSVerify skips verifying the endpoint's TLS certificate
+                                (restic's --insecure-tls), e.g. for a self-signed one. The connection
+                                is still encrypted, but open to man-in-the-middle attacks. Has no
+                                effect on a plain http:// endpoint. Defaults to false.
+                              type: boolean
                             prefix:
                               description: |-
                                 prefix is the path of the restic repository inside the bucket.

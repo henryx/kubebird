@@ -183,6 +183,7 @@ spec:
           prefix: "" # path of the repository in the bucket; defaults to "<namespace>/<name>"
           region: "" # detected automatically when empty
           forcePathStyle: false # true for MinIO, Silo and the like
+          insecureSkipTLSVerify: false # skip TLS certificate verification (e.g. self-signed); use an http:// endpoint for plain HTTP
           credentials:
             secretRef: "" # Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; empty means the pod's ambient credentials (e.g. IRSA)
           repository:

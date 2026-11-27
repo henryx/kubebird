@@ -364,6 +364,14 @@ type S3BackupSpec struct {
 	// +optional
 	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
 
+	// insecureSkipTLSVerify skips verifying the endpoint's TLS certificate
+	// (restic's --insecure-tls), e.g. for a self-signed one. The connection
+	// is still encrypted, but open to man-in-the-middle attacks. Has no
+	// effect on a plain http:// endpoint. Defaults to false.
+	// +kubebuilder:default=false
+	// +optional
+	InsecureSkipTLSVerify bool `json:"insecureSkipTLSVerify,omitempty"`
+
 	// credentials configures the S3 credentials.
 	// +optional
 	Credentials S3CredentialsSpec `json:"credentials,omitzero"`

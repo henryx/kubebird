@@ -170,6 +170,9 @@ func resticCommand(s3 *kubebirdv1.S3BackupSpec) string {
 	if s3.Region != "" {
 		cmd += " -o s3.region=" + s3.Region
 	}
+	if s3.InsecureSkipTLSVerify {
+		cmd += " --insecure-tls"
+	}
 	return cmd
 }
 

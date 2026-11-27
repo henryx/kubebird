@@ -112,8 +112,8 @@ func TestResticCommand(t *testing.T) {
 	if got, want := resticCommand(&kubebirdv1.S3BackupSpec{}), "restic --password-file /etc/kubebird/restic/password"; got != want {
 		t.Errorf("resticCommand() = %q, want %q", got, want)
 	}
-	got := resticCommand(&kubebirdv1.S3BackupSpec{ForcePathStyle: true, Region: "eu-west-1"})
-	for _, want := range []string{"-o s3.bucket-lookup=path", "-o s3.region=eu-west-1"} {
+	got := resticCommand(&kubebirdv1.S3BackupSpec{ForcePathStyle: true, Region: "eu-west-1", InsecureSkipTLSVerify: true})
+	for _, want := range []string{"-o s3.bucket-lookup=path", "-o s3.region=eu-west-1", "--insecure-tls"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("resticCommand() = %q, missing %q", got, want)
 		}

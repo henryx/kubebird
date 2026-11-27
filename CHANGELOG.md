@@ -13,7 +13,9 @@
   (or cluster) can be recovered from S3 alone. The repository password comes from a Secret
   (`<name>-restic`, generated when not given) mounted into the restic containers and read with
   `--password-file`; the S3 credentials from a Secret's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
-  keys, or the pod's ambient credentials. Adding an `s3` entry restarts the Firebird pod once.
+  keys, or the pod's ambient credentials. `insecureSkipTLSVerify: true` skips verifying the
+  endpoint's TLS certificate (restic's `--insecure-tls`), e.g. for a self-signed one. Adding an `s3`
+  entry restarts the Firebird pod once.
 - Regular Firebird users. `spec.authentication` now maps each user name to its credentials: `sysdba`
   configures SYSDBA as before, and any other key declares a regular user, whose password comes from
   `secretRef`, or from a generated `<name>-user-<user>` Secret (lowercased, underscores turned
