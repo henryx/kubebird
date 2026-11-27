@@ -21,7 +21,10 @@
   delete-time and major upgrade backups are then the only copy, so they wait until the upload
   succeeds instead of being best effort. A new or recreated `Instance` (or a major upgrade) restores
   from the repository through a temporary `emptyDir`, deleted once every database is restored.
-  `mode.type: physical` still needs a `local` destination, since `nbackup` can't stream.
+  `mode.type: physical` still needs a `local` destination, since `nbackup` can't stream. The
+  snapshots of a run share a `run:<timestamp>` tag.
+- Every S3 snapshot is tagged with the Firebird version its backups were taken with, e.g.
+  `firebird:4.0.3`.
 - Regular Firebird users. `spec.authentication` now maps each user name to its credentials: `sysdba`
   configures SYSDBA as before, and any other key declares a regular user, whose password comes from
   `secretRef`, or from a generated `<name>-user-<user>` Secret (lowercased, underscores turned

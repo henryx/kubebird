@@ -167,11 +167,11 @@ func TestResticUploadScript(t *testing.T) {
 			if got := subcommands(calls); strings.Join(got, ",") != "init,backup,forget" {
 				t.Fatalf("STUB_INIT=%s: calls = %v, want init, backup, forget", init, calls)
 			}
-			wantBackup := `backup --retry-lock 1h --host test --tag hour --exclude .claim-* ` + r.path(scheduledBackupDir(backupFrequencyHour))
+			wantBackup := `backup --retry-lock 1h --host test --tag hour --tag firebird:3.0.14 --exclude .claim-* ` + r.path(scheduledBackupDir(backupFrequencyHour))
 			if calls[1] != wantBackup {
 				t.Errorf("backup call = %q, want %q", calls[1], wantBackup)
 			}
-			if want := "forget --retry-lock 1h --tag hour --group-by tags --keep-within 14d --prune"; calls[2] != want {
+			if want := "forget --retry-lock 1h --tag hour --group-by  --keep-within 14d --prune"; calls[2] != want {
 				t.Errorf("forget call = %q, want %q", calls[2], want)
 			}
 		}
@@ -201,14 +201,14 @@ func TestResticUploadScript(t *testing.T) {
 func TestResticBaseUploadScript(t *testing.T) {
 	s3 := &kubebirdv1.S3BackupSpec{Bucket: testS3Bucket}
 	instance := s3TestInstance(s3)
-	script := resticBaseUploadScript(instance, s3)
+	script := resticBaseUploadScript(instance, s3, testVersion)
 
 	r := newResticScriptRun(t)
 	calls, out, ok := r.run(script, stubInitExists)
 	if !ok || !strings.Contains(out, "Uploaded the backup") {
 		t.Fatalf("script failed:\n%s", out)
 	}
-	if want := "backup --retry-lock 1h --host test --tag base " + r.path(instanceBackupDir()); len(calls) != 2 || calls[1] != want {
+	if want := "backup --retry-lock 1h --host test --tag base --tag firebird:3.0.14 " + r.path(instanceBackupDir()); len(calls) != 2 || calls[1] != want {
 		t.Errorf("calls = %v, want init then %q", calls, want)
 	}
 

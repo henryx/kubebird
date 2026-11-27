@@ -140,11 +140,26 @@ func addStreamingRestic(podSpec *corev1.PodSpec, container *corev1.Container, in
 	)
 }
 
+// resticRunTagPrefix prefixes the tag every snapshot of a streaming run
+// shares, e.g. "run:20261128T000000Z" (the run's UTC start time, in the
+// scheduledBackupTimestampDate format): each holds a single database, so
+// the tag is what lists, or restores, a run's databases together.
+const resticRunTagPrefix = "run:"
+
+// streamingRunScript renders the shell line setting $RUN to the run's
+// start time, for its snapshots' run tag (see streamingBackupCommand).
+func streamingRunScript() string {
+	return fmt.Sprintf("RUN=$(date -u %s)\n", scheduledBackupTimestampDate)
+}
+
 // streamingBackupCommand renders the restic call streaming gbakArgs' backup
-// into a snapshot of the single file file, tagged tag.
-func streamingBackupCommand(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, tag, file, gbakArgs string) string {
-	return fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q --stdin-filename %q --stdin-from-command -- %s %s\n",
-		resticCommandFor(streamingResticBin, s3), resticLockWait, instance.Name, tag, file, binGbak, gbakArgs)
+// into a snapshot of the single file file, tagged tag, with the run tag
+// (see resticRunTagPrefix, expecting $RUN to be set) and the Firebird
+// version tag of version (see firebirdVersionTag).
+func streamingBackupCommand(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, tag, version, file, gbakArgs string) string {
+	return fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q --tag %q --tag %q --stdin-filename %q --stdin-from-command -- %s %s\n",
+		resticCommandFor(streamingResticBin, s3), resticLockWait, instance.Name, tag, resticRunTagPrefix+"$RUN",
+		firebirdVersionTag(instance, version), file, binGbak, gbakArgs)
 }
 
 // streamingScheduledBackupScript renders the script a frequency's Jobs run
@@ -154,7 +169,9 @@ func streamingBackupCommand(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3Back
 // scheduledBackupScript's, but to the client's stdout) is streamed into a
 // snapshot of "<frequency dir>/<database>.fbk", tagged with the frequency;
 // then that frequency's snapshots older than its retention are forgotten,
-// every database's separately (--group-by paths,tags). The file needs no
+// every database's separately (--group-by paths: grouping by tags too
+// would make every run, with its own run tag, a group of its own, never
+// forgotten). The file needs no
 // timestamp: every snapshot is a version of it, and two runs at once just
 // make two. Under set -e, a failed backup fails the Job before forgetting
 // anything. Expects $SYSDBA_PASSWORD to be set.
@@ -164,13 +181,14 @@ func streamingScheduledBackupScript(instance *kubebirdv1.Instance, s3 *kubebirdv
 	dir := scheduledBackupDir(freq.name)
 	var b strings.Builder
 	b.WriteString("set -e\n")
+	b.WriteString(streamingRunScript())
 	b.WriteString(resticEnsureRepositoryScript(restic))
 	for _, name := range instance.Status.Databases {
 		gbakArgs := fmt.Sprintf("-backup -se %s %q %s %s %s %s \"$SYSDBA_PASSWORD\"",
 			conn, path.Join(primaryDataMountPath, name), streamingGbakStdout, flagUser, sysdbaUsername, flagPassword)
-		b.WriteString(streamingBackupCommand(instance, s3, freq.name, path.Join(dir, backupFileName(name)), gbakArgs))
+		b.WriteString(streamingBackupCommand(instance, s3, freq.name, instance.Spec.Version, path.Join(dir, backupFileName(name)), gbakArgs))
 	}
-	fmt.Fprintf(&b, "%s forget --retry-lock %s --tag %q --group-by paths,tags --keep-within %s --prune\n",
+	fmt.Fprintf(&b, "%s forget --retry-lock %s --tag %q --group-by paths --keep-within %s --prune\n",
 		restic, resticLockWait, freq.name, frequencyRetention(instance, freq).resticDuration())
 	return b.String()
 }
@@ -188,13 +206,14 @@ func streamingScheduledBackupScript(instance *kubebirdv1.Instance, s3 *kubebirdv
 func streamingBaseBackupScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, version string) string {
 	var b strings.Builder
 	b.WriteString("set -e\n")
+	b.WriteString(streamingRunScript())
 	b.WriteString(resticEnsureRepositoryScript(resticCommandFor(streamingResticBin, s3)))
 	for _, name := range instance.Status.Databases {
 		gbakArgs := fmt.Sprintf("-backup %q %s", path.Join(primaryDataMountPath, name), streamingGbakStdout)
-		b.WriteString(streamingBackupCommand(instance, s3, resticBaseTag, path.Join(instanceBackupDir(), backupFileName(name)), gbakArgs))
+		b.WriteString(streamingBackupCommand(instance, s3, resticBaseTag, version, path.Join(instanceBackupDir(), backupFileName(name)), gbakArgs))
 	}
 	gbakArgs := fmt.Sprintf("-backup %q %s", path.Join(primaryDataMountPath, securityDatabaseFileNameForVersion(version)), streamingGbakStdout)
-	b.WriteString(streamingBackupCommand(instance, s3, resticBaseTag, securityDatabaseBackupPathForVersion(version), gbakArgs))
+	b.WriteString(streamingBackupCommand(instance, s3, resticBaseTag, version, securityDatabaseBackupPathForVersion(version), gbakArgs))
 	b.WriteString("echo \"Uploaded the backup to the S3 repository\"\n")
 	return b.String()
 }

@@ -120,6 +120,25 @@ func TestResticCommand(t *testing.T) {
 	}
 }
 
+func TestFirebirdVersionTag(t *testing.T) {
+	cases := []struct {
+		name, spec, detected, version, want string
+	}{
+		{"spec.version, not detected yet", testFirebird4Version, "", testFirebird4Version, "firebird:4.0.3"},
+		{"spec.version, detected", testLatestVersion, testFirebird5Version, testLatestVersion, "firebird:5.0.4"},
+		{"a major upgrade's backup of the version upgraded from", testFirebird4Version, testVersion, testVersion, "firebird:3.0.14"},
+		{"the version upgraded from, as an image tag", testFirebird5Version, testFirebird4Version, "4", "firebird:4"},
+	}
+	for _, c := range cases {
+		instance := s3TestInstance(nil)
+		instance.Spec.Version = c.spec
+		instance.Status.FirebirdVersion = c.detected
+		if got := firebirdVersionTag(instance, c.version); got != c.want {
+			t.Errorf("%s: firebirdVersionTag() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestResticDuration(t *testing.T) {
 	cases := []struct {
 		d    retentionDuration
@@ -242,8 +261,8 @@ func TestMutateScheduledBackupCronJobS3(t *testing.T) {
 	}
 	script := upload.Command[2]
 	for _, want := range []string{
-		`backup --retry-lock 1h --host "test" --tag "hour" --exclude ".claim-*" "/var/lib/firebird/backup/hour"`,
-		`forget --retry-lock 1h --tag "hour" --group-by tags --keep-within 2h --prune`,
+		`backup --retry-lock 1h --host "test" --tag "hour" --tag "firebird:3.0.14" --exclude ".claim-*" "/var/lib/firebird/backup/hour"`,
+		`forget --retry-lock 1h --tag "hour" --group-by '' --keep-within 2h --prune`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("upload script missing %q:\n%s", want, script)

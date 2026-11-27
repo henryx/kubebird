@@ -139,6 +139,7 @@ func s3Snapshots(tag string) ([]string, error) {
 type s3Snapshot struct {
 	Time  string   `json:"time"`
 	Paths []string `json:"paths"`
+	Tags  []string `json:"tags"`
 }
 
 // s3SnapshotsFor returns every snapshot tagged tag in instance's
@@ -312,6 +313,11 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(snapshots).To(HaveLen(1))
 			Expect(snapshots[0]).NotTo(HavePrefix("2000-"))
+
+			By("tagging the snapshot with the Firebird version")
+			tagged, err := s3SnapshotsFor(s3InstanceName, "hour")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(tagged[0].Tags).To(ConsistOf("hour", "firebird:"+firebirdVersion))
 
 			By("finding the backup in the repository's latest hourly snapshot")
 			output, err := s3Restic("ls", "latest", "--tag", "hour")
@@ -527,6 +533,8 @@ spec:
 			Expect(snapshots).To(HaveLen(1))
 			Expect(snapshots[0].Time).NotTo(HavePrefix("2000-"))
 			Expect(snapshots[0].Paths).To(Equal([]string{hourBackup}))
+			Expect(snapshots[0].Tags).To(ContainElements("hour", "firebird:"+firebirdVersion))
+			Expect(snapshots[0].Tags).To(ContainElement(MatchRegexp(`^run:[0-9]{8}T[0-9]{6}Z$`)))
 
 			By("having streamed the gbak backup itself, not the planted one")
 			output, err = s3ResticFor(s3StreamingInstanceName, "dump", "latest", "--tag", "hour", hourBackup)
@@ -544,9 +552,17 @@ spec:
 			snapshots, err := s3SnapshotsFor(s3StreamingInstanceName, "base")
 			Expect(err).NotTo(HaveOccurred())
 			var paths []string
+			runs := map[string]bool{}
 			for _, s := range snapshots {
 				paths = append(paths, s.Paths...)
+				Expect(s.Tags).To(ContainElements("base", "firebird:"+firebirdVersion))
+				for _, tag := range s.Tags {
+					if strings.HasPrefix(tag, "run:") {
+						runs[tag] = true
+					}
+				}
 			}
+			Expect(runs).To(HaveLen(1), "every base snapshot of the deletion shares its run tag")
 			Expect(paths).To(ConsistOf(
 				"/var/lib/firebird/backup/base/"+strings.TrimSuffix(s3DatabaseName, ".fdb")+".fbk",
 				"/var/lib/firebird/backup/base/"+securityDatabaseFile(".fbk"),

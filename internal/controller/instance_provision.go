@@ -868,7 +868,7 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 		// missing one can't keep the Pod from starting either.
 		pod.Spec.InitContainers = []corev1.Container{backup}
 		pod.Spec.Containers = []corev1.Container{
-			resticContainer(instance, s3, uploadContainerName, resticBaseUploadScript(instance, s3), false, true),
+			resticContainer(instance, s3, uploadContainerName, resticBaseUploadScript(instance, s3, version), false, true),
 		}
 		pod.Spec.Volumes = append(pod.Spec.Volumes, resticPasswordVolume(instance, s3, true))
 	}

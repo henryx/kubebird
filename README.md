@@ -507,7 +507,9 @@ The S3 credentials come from the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
 for service accounts, an EC2 instance profile, ...). The repository lives under `prefix`
 (`<namespace>/<name>` by default) in `bucket`; restic creates both on first use. The Firebird pods
 and the backup Jobs need network access to the endpoint, so allow that egress if a NetworkPolicy
-restricts it.
+restricts it. Every snapshot is also tagged with the Firebird version its backups were taken with,
+e.g. `firebird:4.0.3`: the version the running server reports (`status.firebirdVersion`), or
+`spec.version` until it's detected, and, for a major upgrade's backup, the version upgraded from.
 
 - **Scheduled backups.** Each `backup.retention` Job takes its backup first, as before, in an init
   container, then an `upload` container (running `image`, `restic/restic:0.19.1` by default) takes a
@@ -538,6 +540,9 @@ its standard output, and restic stores it as a snapshot of a single file, under 
 have had on the backup volume (e.g. `/var/lib/firebird/backup/hour/<database>.fbk`). The Jobs and Pods
 taking backups run the Firebird image (or `backup.image`), with restic's binary copied in by a
 `restic-install` init container from the restic `image`. If `gbak` fails, restic saves no snapshot.
+Since each snapshot holds a single database, every snapshot of a run also carries the same
+`run:<timestamp>` tag, the run's UTC start time (e.g. `run:20261128T000000Z`), so
+`restic snapshots --tag run:20261128T000000Z` lists, and restores, a run's databases together.
 
 - **Scheduled backups.** Each `backup.retention` Job streams every database's backup from the live
   server, one snapshot per database, tagged with the frequency, then forgets that frequency's
@@ -665,7 +670,9 @@ Scheduled backups are kept for you to restore by hand, into a new database or ov
   holds the frequency's whole directory; with `s3` only, every snapshot holds a single database's
   backup, `/var/lib/firebird/backup/<frequency>/<database>.fbk`, e.g.
   `restic dump latest --tag hour --path /var/lib/firebird/backup/hour/instance.fbk /var/lib/firebird/backup/hour/instance.fbk > instance.fbk`
-  (`--path` picks that database's own latest snapshot).
+  (`--path` picks that database's own latest snapshot), and the `run:<timestamp>` tag finds every
+  database of the same run. The `firebird:<version>` tag tells which Firebird version a backup needs
+  to be restored with (that version or a newer one).
 
 ## License
 

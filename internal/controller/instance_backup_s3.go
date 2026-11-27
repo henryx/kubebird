@@ -282,18 +282,38 @@ func (d retentionDuration) resticDuration() string {
 // forgotten, up to twice the retention: in exchange, a backup volume that
 // was lost or emptied doesn't take the repository's copies with it on the
 // next run. Any failure fails the Job, so it shows up like a failed
-// backup. Snapshots are grouped by tag alone, since the host name is the
-// Instance's and the path the frequency's anyway.
+// backup. Each snapshot is also tagged with the Firebird version (see
+// firebirdVersionTag). The frequency's snapshots are forgotten as a single
+// group (--group-by ”), since the host name is the Instance's and the
+// path the frequency's anyway, while grouping by tags would split them at
+// every version change and never forget the older version's.
 func resticUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, frequency string, retention retentionDuration) string {
 	restic := resticCommand(s3)
 	var b strings.Builder
 	b.WriteString("set -e\n")
 	b.WriteString(resticEnsureRepositoryScript(restic))
-	fmt.Fprintf(&b, "%s backup --retry-lock %s --host %q --tag %q --exclude %q %q\n",
-		restic, resticLockWait, instance.Name, frequency, scheduledBackupClaimPrefix+"*", scheduledBackupDir(frequency))
-	fmt.Fprintf(&b, "%s forget --retry-lock %s --tag %q --group-by tags --keep-within %s --prune\n",
+	fmt.Fprintf(&b, "%s backup --retry-lock %s --host %q --tag %q --tag %q --exclude %q %q\n",
+		restic, resticLockWait, instance.Name, frequency, firebirdVersionTag(instance, instance.Spec.Version),
+		scheduledBackupClaimPrefix+"*", scheduledBackupDir(frequency))
+	fmt.Fprintf(&b, "%s forget --retry-lock %s --tag %q --group-by '' --keep-within %s --prune\n",
 		restic, resticLockWait, frequency, retention.resticDuration())
 	return b.String()
+}
+
+// resticVersionTagPrefix prefixes the tag recording the Firebird version a
+// snapshot's backups were taken with, e.g. "firebird:4.0.3".
+const resticVersionTagPrefix = "firebird:"
+
+// firebirdVersionTag returns the tag recording the Firebird version of a
+// backup taken with version: spec.version, or, during a major upgrade's
+// backup, the version upgraded from. For spec.version, it's the version
+// the running server reported (status.firebirdVersion) once detected,
+// since spec.version is only an image tag (e.g. "latest").
+func firebirdVersionTag(instance *kubebirdv1.Instance, version string) string {
+	if version == instance.Spec.Version && instance.Status.FirebirdVersion != "" {
+		version = instance.Status.FirebirdVersion
+	}
+	return resticVersionTagPrefix + version
 }
 
 // resticBaseUploadScript renders the delete-time backup Pod's upload
@@ -303,11 +323,12 @@ func resticUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSp
 // already sits on the backup volume, which deleting the Instance always
 // keeps, so a failed or timed out (resticBaseUploadTimeout) upload is only
 // logged, and the Pod still succeeds rather than holding up the deletion
-// or a major version upgrade.
-func resticBaseUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) string {
+// or a major version upgrade. version is the Firebird version the backup
+// was taken with (see firebirdVersionTag).
+func resticBaseUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, version string) string {
 	upload := "set -e\n" + resticEnsureRepositoryScript(resticCommand(s3)) +
-		fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q %q\n",
-			resticCommand(s3), resticLockWait, instance.Name, resticBaseTag, instanceBackupDir())
+		fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q --tag %q %q\n",
+			resticCommand(s3), resticLockWait, instance.Name, resticBaseTag, firebirdVersionTag(instance, version), instanceBackupDir())
 	return fmt.Sprintf(`if timeout %d sh -c %s; then
 	echo "Uploaded the backup to the S3 repository"
 else

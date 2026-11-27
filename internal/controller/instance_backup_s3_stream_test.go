@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -30,6 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
+)
+
+// Versions the S3 tests tag backups with.
+const (
+	testFirebird4Version = "4.0.3"
+	testLatestVersion    = "latest"
 )
 
 // The databases of s3StreamingTestInstance.
@@ -75,9 +82,34 @@ func TestS3Streaming(t *testing.T) {
 	}
 }
 
+// runTagPattern matches a streaming run's run tag.
+var runTagPattern = regexp.MustCompile(`run:[0-9]{8}T[0-9]{6}Z`)
+
+// sameRun checks every backup call carries the same run tag, and returns
+// the calls with it replaced by "run:RUN".
+func sameRun(t *testing.T, calls []string) []string {
+	t.Helper()
+	run := ""
+	normalized := make([]string, len(calls))
+	for i, c := range calls {
+		if strings.HasPrefix(c, "backup ") {
+			tags := runTagPattern.FindAllString(c, -1)
+			if len(tags) != 1 || (run != "" && tags[0] != run) {
+				t.Fatalf("backup call %q has run tags %v, want the run's single one (%q)", c, tags, run)
+			}
+			run = tags[0]
+		}
+		normalized[i] = runTagPattern.ReplaceAllString(c, "run:RUN")
+	}
+	return normalized
+}
+
 func TestStreamingScheduledBackupScript(t *testing.T) {
 	s3 := &kubebirdv1.S3BackupSpec{Bucket: testS3Bucket, ForcePathStyle: true}
 	instance := s3StreamingTestInstance(s3)
+	// The version tag is the one the server reported, not the image tag.
+	instance.Spec.Version = testLatestVersion
+	instance.Status.FirebirdVersion = testFirebird5Version
 	script := streamingScheduledBackupScript(instance, s3, backupFrequencies[0])
 
 	t.Run("streams every database, then forgets the frequency's expired snapshots", func(t *testing.T) {
@@ -86,15 +118,16 @@ func TestStreamingScheduledBackupScript(t *testing.T) {
 		if !ok {
 			t.Fatalf("script failed:\n%s", out)
 		}
+		calls = sameRun(t, calls)
 		want := make([]string, 0, 4)
 		want = append(want, resticInitCall)
 		for _, db := range []string{"a", "b"} {
-			want = append(want, "backup --retry-lock 1h --host test --tag hour --stdin-filename "+
+			want = append(want, "backup --retry-lock 1h --host test --tag hour --tag run:RUN --tag firebird:5.0.4 --stdin-filename "+
 				r.path(path.Join(scheduledBackupDir(backupFrequencyHour), db+".fbk"))+
 				" --stdin-from-command -- gbak -backup -se test/3050:service_mgr "+
 				r.path(path.Join(primaryDataMountPath, db+".fdb"))+" stdout -user SYSDBA -password s3cr3t")
 		}
-		want = append(want, "forget --retry-lock 1h --tag hour --group-by paths,tags --keep-within 2h --prune")
+		want = append(want, "forget --retry-lock 1h --tag hour --group-by paths --keep-within 2h --prune")
 		if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 			t.Fatalf("calls =\n%s\nwant\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
 		}
@@ -130,15 +163,19 @@ func TestStreamingScheduledBackupScript(t *testing.T) {
 func TestStreamingBaseBackupScript(t *testing.T) {
 	s3 := &kubebirdv1.S3BackupSpec{Bucket: testS3Bucket}
 	instance := s3StreamingTestInstance(s3)
-	script := streamingBaseBackupScript(instance, s3, "3.0.14")
+	// A major upgrade's backup, still with the version upgraded from.
+	instance.Spec.Version = testFirebird4Version
+	instance.Status.FirebirdVersion = testVersion
+	script := streamingBaseBackupScript(instance, s3, testVersion)
 
 	r := newResticScriptRun(t)
 	calls, out, ok := r.run(script, stubInitExists)
 	if !ok || !strings.Contains(out, "Uploaded the backup") {
 		t.Fatalf("script failed:\n%s", out)
 	}
+	calls = sameRun(t, calls)
 	backup := func(file, db string) string {
-		return "backup --retry-lock 1h --host test --tag base --stdin-filename " + r.path(path.Join(instanceBackupDir(), file)) +
+		return "backup --retry-lock 1h --host test --tag base --tag run:RUN --tag firebird:3.0.14 --stdin-filename " + r.path(path.Join(instanceBackupDir(), file)) +
 			" --stdin-from-command -- gbak -backup " + r.path(path.Join(primaryDataMountPath, db)) + " stdout"
 	}
 	want := []string{
