@@ -1023,10 +1023,23 @@ var _ = Describe("Instance Controller", func() {
 			}
 		}
 
-		It("rejects an s3 destination without a local one", func() {
-			err := k8sClient.Create(ctx, instanceWithDestinations("test-s3-no-local", s3("kubebird")))
+		It("accepts an s3 destination without a local one", func() {
+			instance := instanceWithDestinations("test-s3-no-local", s3("kubebird"))
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+		})
+
+		It("rejects physical backups streamed to an s3 destination without a local one", func() {
+			instance := instanceWithDestinations("test-s3-physical", s3("kubebird"))
+			instance.Spec.Backup.Mode.Type = kubebirdv1.BackupModePhysical
+			err := k8sClient.Create(ctx, instance)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("an s3 destination requires a local destination"))
+			Expect(err.Error()).To(ContainSubstring("mode.type physical needs a local destination"))
+
+			instance = instanceWithDestinations("test-s3-physical", local, s3("kubebird"))
+			instance.Spec.Backup.Mode.Type = kubebirdv1.BackupModePhysical
+			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
 		})
 
 		It("rejects two s3 destinations", func() {
@@ -1285,7 +1298,7 @@ var _ = Describe("Instance Controller", func() {
 			Expect(updated.Status.Error).To(ContainSubstring("isn't supported"))
 		})
 
-		It("refuses to upgrade to a newer major version without a local backup volume", func() {
+		It("refuses to upgrade to a newer major version without a backup destination", func() {
 			resource := getInstance()
 			resource.Spec.Backup.Enabled = false
 			resource.Spec.Backup.Destinations = nil
@@ -1294,7 +1307,7 @@ var _ = Describe("Instance Controller", func() {
 
 			_, err := reconcileOnce()
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("needs a local backup volume"))
+			Expect(err.Error()).To(ContainSubstring("needs a backup destination"))
 			Expect(statefulSetImage()).To(Equal(testImage + ":" + upgradeFromVersion))
 		})
 

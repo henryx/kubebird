@@ -87,8 +87,8 @@ func TestS3Destination(t *testing.T) {
 
 	noLocal := s3TestInstance(s3)
 	noLocal.Spec.Backup.Destinations = noLocal.Spec.Backup.Destinations[1:]
-	if got := s3Destination(noLocal); got != nil {
-		t.Errorf("s3Destination() without a local entry = %v, want nil", got)
+	if got := s3Destination(noLocal); got != s3 {
+		t.Errorf("s3Destination() without a local entry = %v, want the s3 entry", got)
 	}
 }
 
@@ -189,8 +189,11 @@ func TestMutateStatefulSetS3(t *testing.T) {
 	if !hasMount(restore, backupVolumeName, backupDataMountPath, false) || !hasMount(restore, resticPasswordVolumeName, resticPasswordMountPath, true) {
 		t.Errorf("backup-restore mounts = %+v", restore.VolumeMounts)
 	}
-	if !strings.Contains(restore.Command[2], "restore latest --tag \"base\"") {
-		t.Errorf("backup-restore script doesn't restore the base snapshot:\n%s", restore.Command[2])
+	if !strings.Contains(restore.Command[2], `snapshots --tag "base" --group-by paths --latest 1 --json`) {
+		t.Errorf("backup-restore script doesn't restore the base snapshots:\n%s", restore.Command[2])
+	}
+	if hasMount(restore, primaryVolumeName, primaryDataMountPath, true) {
+		t.Error("backup-restore mounts the primary volume next to a local destination")
 	}
 	vol := resticVolume(sts.Spec.Template.Spec.Volumes)
 	if vol == nil || vol.Secret.SecretName != "test-restic" || *vol.Secret.Optional {

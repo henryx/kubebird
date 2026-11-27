@@ -229,7 +229,7 @@ func scheduledBackupCronJobName(instance *kubebirdv1.Instance, frequency string)
 
 // reconcileScheduledBackups ensures a CronJob exists for every
 // spec.backup.retention frequency with a non-zero duration, and that none
-// exists for a frequency left disabled (or when no local backup volume is
+// exists for a frequency left disabled (or when no backup destination is
 // configured at all — retention has no effect without one, matching
 // backupOnDelete) — reconciling both directions so turning a frequency
 // back off removes its stale schedule instead of leaving it to keep
@@ -239,12 +239,12 @@ func scheduledBackupCronJobName(instance *kubebirdv1.Instance, frequency string)
 // drives individual runs the way the deletion flow's backupDatabases
 // does for its own helper Pod.
 func (r *InstanceReconciler) reconcileScheduledBackups(ctx context.Context, instance *kubebirdv1.Instance) error {
-	hasVolume := backupVolumeSpec(instance) != nil
+	enabled := hasBackupDestination(instance)
 
 	for _, freq := range backupFrequencies {
 		name := scheduledBackupCronJobName(instance, freq.name)
 
-		if !hasVolume || !frequencyRetention(instance, freq).enabled() {
+		if !enabled || !frequencyRetention(instance, freq).enabled() {
 			cronJob := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace}}
 			if err := r.Delete(ctx, cronJob); err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("failed to delete backup CronJob %q: %w", name, err)
@@ -266,7 +266,8 @@ func (r *InstanceReconciler) reconcileScheduledBackups(ctx context.Context, inst
 // -action_backup writes there directly and expects it to already exist
 // (see scheduledBackupScript) — since retention can be turned on for an
 // already-Ready Instance at any time, long after security-database-init
-// last ran, so nothing else guarantees it's there yet.
+// last ran, so nothing else guarantees it's there yet. Without a local
+// destination, backups are streamed and nothing is written there.
 func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context, instance *kubebirdv1.Instance, freq backupFrequency) error {
 	name := scheduledBackupCronJobName(instance, freq.name)
 	nsName := types.NamespacedName{Name: name, Namespace: instance.Namespace}
@@ -279,7 +280,7 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 		exists = false
 	}
 
-	if !exists {
+	if !exists && backupVolumeSpec(instance) != nil {
 		dir := scheduledBackupDir(freq.name)
 		if err := r.execInPod(ctx, instance.Namespace, firebirdPodName(instance), []string{"mkdir", "-p", dir}, ""); err != nil {
 			return fmt.Errorf("failed to create backup directory %q: %w", dir, err)
@@ -358,7 +359,18 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 		},
 		Containers: []corev1.Container{backup},
 	}
-	if s3 := s3Destination(instance); s3 != nil {
+	switch s3 := s3Destination(instance); {
+	case s3 != nil && s3Streaming(instance):
+		// No backup volume: the Job streams every backup into the
+		// repository (see streamingScheduledBackupScript), so it needs
+		// neither the backup PVC nor to run on the Firebird pod's node.
+		backup.Command = []string{"sh", "-c", streamingScheduledBackupScript(instance, s3, freq)}
+		backup.VolumeMounts = nil
+		podSpec.Affinity = nil
+		podSpec.Volumes = nil
+		addStreamingRestic(&podSpec, &backup, instance, s3)
+		podSpec.Containers = []corev1.Container{backup}
+	case s3 != nil:
 		// The backup runs first, as an initContainer, so the upload only
 		// starts once it succeeded, and a failed backup fails the Job
 		// without uploading anything (see resticUploadScript).

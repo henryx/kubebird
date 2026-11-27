@@ -72,8 +72,9 @@ func statefulSetFirebirdVersion(sts *appsv1.StatefulSet) string {
 //
 // Moving to an older major version is refused: the databases' on-disk
 // structure, and their backups, are only readable by the same or a newer
-// major version. Moving to a newer one needs a local backup volume
-// (backupVolumeSpec) and is recorded in status.upgrade, then follows the
+// major version. Moving to a newer one needs a backup destination
+// (hasBackupDestination: a local backup volume, or an s3 destination the
+// backups are streamed into and restored from) and is recorded in status.upgrade, then follows the
 // same steps as deleting and recreating the Instance, without deleting it:
 //
 //  1. BackingUp: backupDatabases stops the pod and backs up every database
@@ -203,8 +204,8 @@ func (r *InstanceReconciler) startMajorUpgrade(ctx context.Context, instance *ku
 		return false, fmt.Errorf("downgrading Firebird from %s to %s isn't supported: only a newer major version can be upgraded to; set spec.version back to a %d.x release",
 			running, instance.Spec.Version, from)
 	}
-	if backupVolumeSpec(instance) == nil {
-		return false, fmt.Errorf("upgrading Firebird from %s to %s needs a local backup volume (spec.backup.enabled with a local entry in spec.backup.destinations) to back up the databases into",
+	if !hasBackupDestination(instance) {
+		return false, fmt.Errorf("upgrading Firebird from %s to %s needs a backup destination (spec.backup.enabled with a local or s3 entry in spec.backup.destinations) to back up the databases into",
 			running, instance.Spec.Version)
 	}
 

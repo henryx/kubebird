@@ -376,13 +376,18 @@ var _ = Describe("Manager", Ordered, func() {
 		instanceScheduledBackupIncrementalSpecs("5.0.4")
 
 		// instanceS3BackupSpecs (test/e2e/instance_s3_backup_test.go)
-		// exercises the s3 backup destination against Silo, started
-		// through testcontainers on the Kind network: a scheduled
-		// backup and the delete-time backup reach the restic
-		// repository, and, with the backup PVC deleted too, a
-		// recreated Instance restores its database and users from the
-		// repository alone.
+		// exercises the s3 backup destination against Silo, deployed
+		// into the Kind cluster (see setupSilo): a scheduled backup and
+		// the delete-time backup reach the restic repository, and, with
+		// the backup PVC deleted too, a recreated Instance restores its
+		// database and users from the repository alone.
 		instanceS3BackupSpecs()
+
+		// instanceS3StreamingBackupSpecs (same file) exercises an s3
+		// destination without a local one: no backup PVC, scheduled
+		// and delete-time backups streamed into the repository, and a
+		// recreated Instance restoring from it only once.
+		instanceS3StreamingBackupSpecs()
 	})
 })
 

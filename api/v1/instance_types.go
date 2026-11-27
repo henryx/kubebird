@@ -140,6 +140,7 @@ type StorageSpec struct {
 }
 
 // BackupSpec configures backing up the instance's databases.
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || !has(self.mode.type) || self.mode.type != 'physical' || !has(self.destinations) || !self.destinations.exists(d, has(d.s3)) || self.destinations.exists(d, has(d.local))",message="mode.type physical needs a local destination: nbackup backups can't be streamed to an s3 destination"
 // +kubebuilder:validation:XValidation:rule="!has(self.mode) || !has(self.mode.incremental) || !self.mode.incremental || !has(self.retention) || [has(self.retention.hour) ? self.retention.hour : '0', has(self.retention.day) ? self.retention.day : '0', has(self.retention.week) ? self.retention.week : '0', has(self.retention.month) ? self.retention.month : '0', has(self.retention.year) ? self.retention.year : '0'].filter(r, r.matches('[1-9]')).size() <= 1",message="retention can enable at most one frequency when mode.incremental is true"
 type BackupSpec struct {
 	// enabled turns on backing up the instance's databases. It only makes
@@ -154,12 +155,12 @@ type BackupSpec struct {
 
 	// destinations lists the backup destinations to configure: "local" (a
 	// dedicated PVC, where every backup is taken) and "s3" (a restic
-	// repository the local backups are copied to, which requires a local
-	// destination too). Required to be non-empty when enabled is true.
+	// repository; with a local destination too, the local backups are
+	// copied to it, and without one, every backup is streamed straight
+	// into it). Required to be non-empty when enabled is true.
 	// +optional
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=8
-	// +kubebuilder:validation:XValidation:rule="!self.exists(d, has(d.s3)) || self.exists(d, has(d.local))",message="an s3 destination requires a local destination, which stages its backups"
 	// +kubebuilder:validation:XValidation:rule="self.filter(d, has(d.s3)).size() <= 1",message="at most one s3 destination can be configured"
 	Destinations []BackupDestinationSpec `json:"destinations,omitempty"`
 
@@ -171,8 +172,11 @@ type BackupSpec struct {
 
 	// backupOnDelete controls whether deleting the Instance runs one last
 	// backup into destinations before releasing the primary/shadow
-	// storage. Only takes effect when a local backup volume exists (see
-	// destinations); has no effect otherwise. Defaults to true; a pointer
+	// storage. Only takes effect when a destination exists (see
+	// destinations); has no effect otherwise. With an s3 destination and no
+	// local one, the repository then holds the only copy, so deleting the
+	// Instance waits until that backup has been uploaded; set this to
+	// false to delete it without one. Defaults to true; a pointer
 	// so an explicit false is distinguishable from an omitted field once
 	// serialized (a plain bool would otherwise be indistinguishable from
 	// its own zero value and get overwritten back to the default by CRD
@@ -184,8 +188,10 @@ type BackupSpec struct {
 	// compress gzip-compresses every scheduled backup (see retention) once
 	// it's been taken, turning "<database>-<timestamp>.fbk" into
 	// "<database>-<timestamp>.fbk.gz". gzip is used because it's the only
-	// compressor the firebirdsql/firebird image ships. Defaults to false,
-	// leaving backups uncompressed.
+	// compressor the firebirdsql/firebird image ships. Has no effect on
+	// backups streamed to an s3 destination without a local one, which
+	// restic compresses itself. Defaults to false, leaving backups
+	// uncompressed.
 	// +kubebuilder:default=false
 	// +optional
 	Compress bool `json:"compress,omitempty"`
@@ -198,9 +204,9 @@ type BackupSpec struct {
 	Mode BackupModeSpec `json:"mode,omitzero"`
 
 	// retention configures recurring scheduled backups, one frequency at
-	// a time; see RetentionSpec. Only takes effect when a local backup
-	// volume exists (see destinations); has no effect otherwise,
-	// matching backupOnDelete. Defaults to every frequency disabled.
+	// a time; see RetentionSpec. Only takes effect when a destination
+	// exists (see destinations); has no effect otherwise, matching
+	// backupOnDelete. Defaults to every frequency disabled.
 	// +optional
 	Retention RetentionSpec `json:"retention,omitzero"`
 }
@@ -308,24 +314,41 @@ type BackupDestinationSpec struct {
 	// +optional
 	Local *LocalBackupSpec `json:"local,omitempty"`
 
-	// s3 copies the local backup volume's backups into a restic repository
-	// on an S3-compatible object store; see S3BackupSpec. Requires a local
-	// destination, which stays the staging area.
+	// s3 backs up into a restic repository on an S3-compatible object
+	// store; see S3BackupSpec. With a local destination too, the local
+	// backups are copied into it; without one, backups are streamed into
+	// it directly.
 	// +optional
 	S3 *S3BackupSpec `json:"s3,omitempty"`
 }
 
-// S3BackupSpec configures copying backups from the local backup volume to
-// a restic repository in an S3-compatible bucket (AWS S3, MinIO, Silo,
-// Ceph, R2, ...). Every scheduled backup run (see RetentionSpec) takes a
-// restic snapshot of its frequency's directory, tagged with the frequency,
-// and then forgets that frequency's snapshots older than its retention;
-// every delete-time or major upgrade backup takes a snapshot of the "base"
+// S3BackupSpec configures backing up to a restic repository in an
+// S3-compatible bucket (AWS S3, MinIO, Silo, Ceph, R2, ...).
+//
+// With a local destination too, the local backup volume stays the staging
+// area: every scheduled backup run (see RetentionSpec) takes a restic
+// snapshot of its frequency's directory, tagged with the frequency, and
+// then forgets that frequency's snapshots older than its retention; every
+// delete-time or major upgrade backup takes a snapshot of the "base"
 // directory, tagged "base", which is never forgotten. When an Instance
 // starts with an empty backup volume (e.g. it was lost along with its
-// cluster) and the repository holds a "base" snapshot, that snapshot is
-// restored into the backup volume first, so the security database and
-// every database are restored from it as from a local backup.
+// cluster) and the repository holds "base" snapshots, they're restored
+// into the backup volume first, so the security database and every
+// database are restored from them as from a local backup.
+//
+// Without a local destination, no backup volume is created: gbak streams
+// every backup straight into restic, one snapshot per database file, under
+// the path the file would have on the backup volume (e.g.
+// "/var/lib/firebird/backup/hour/<database>.fbk", tagged "hour"). Each
+// frequency keeps every database's snapshots within its retention; the
+// "base" ones are never forgotten. The delete-time and major upgrade
+// backups then hold the only copy, so they wait until the upload
+// succeeds. Whenever the Instance starts on fresh primary storage (a new
+// or recreated Instance, or a major upgrade), the latest "base" snapshots
+// are restored into a temporary volume first, so the security database
+// and every database are restored from them; they're deleted once every
+// database has been restored. mode.type physical needs a local
+// destination.
 type S3BackupSpec struct {
 	// endpoint is the S3 endpoint, as host[:port] (HTTPS) or a full
 	// http:// or https:// URL. Defaults to AWS S3 (s3.amazonaws.com).

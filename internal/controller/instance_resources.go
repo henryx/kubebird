@@ -501,10 +501,11 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 		},
 	}
 	initVolumeMounts := []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}}
-	if backupVolumeSpec(instance) != nil {
+	if hasBackupDestination(instance) {
 		// Lets securityDatabaseInitScript restore a security database
 		// backup left behind by an earlier Instance's backupDatabases
-		// under the same name, instead of always falling back to the
+		// under the same name (or restored from the S3 repository, see
+		// resticBootstrapScript), instead of always falling back to the
 		// image's stock default.
 		initVolumeMounts = append(initVolumeMounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
 	}
@@ -522,12 +523,16 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 	}
 	if s3 := s3Destination(instance); s3 != nil {
 		// Restores the backup volume's base directory from the S3
-		// repository when it comes up empty, before
-		// security-database-init looks for a security database backup in
-		// it (see resticBootstrapScript).
-		sts.Spec.Template.Spec.InitContainers = append([]corev1.Container{
-			resticContainer(instance, s3, backupRestoreInitContainerName, resticBootstrapScript(s3), true, false),
-		}, sts.Spec.Template.Spec.InitContainers...)
+		// repository when it's due, before security-database-init looks
+		// for a security database backup in it (see
+		// resticBootstrapScript).
+		restore := resticContainer(instance, s3, backupRestoreInitContainerName, resticBootstrapScript(instance, s3), true, false)
+		if s3Streaming(instance) {
+			// To find s3RestoredMarker.
+			restore.VolumeMounts = append(restore.VolumeMounts,
+				corev1.VolumeMount{Name: primaryVolumeName, MountPath: primaryDataMountPath, ReadOnly: true})
+		}
+		sts.Spec.Template.Spec.InitContainers = append([]corev1.Container{restore}, sts.Spec.Template.Spec.InitContainers...)
 	}
 	sts.Spec.Template.Spec.Volumes = []corev1.Volume{
 		{
@@ -545,13 +550,8 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 			},
 		},
 	}
-	if backupVolumeSpec(instance) != nil {
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: backupVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)},
-			},
-		})
+	if hasBackupDestination(instance) {
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, backupVolume(instance))
 	}
 	if instance.Spec.Storage.Shadow != nil {
 		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
@@ -578,7 +578,7 @@ func volumeMounts(instance *kubebirdv1.Instance) []corev1.VolumeMount {
 			ReadOnly:  true,
 		},
 	}
-	if backupVolumeSpec(instance) != nil {
+	if hasBackupDestination(instance) {
 		mounts = append(mounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
 	}
 	if instance.Spec.Storage.Shadow != nil {

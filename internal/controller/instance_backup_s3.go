@@ -33,14 +33,17 @@ import (
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
 )
 
-// The local backup volume stays the staging area for every backup: the
-// Firebird server (scheduled backups) and gbak (delete-time and upgrade
-// backups) only write to a filesystem, and the firebirdsql/firebird image
-// ships no S3 client. An s3 destination adds a restic container, running
-// spec.backup.destinations[].s3.image, after each of them, that copies the
-// directory just written into a restic repository in the bucket, and a
-// restic initContainer to the StatefulSet that restores the "base"
-// directory from it when the backup volume comes up empty.
+// With a local destination too, the local backup volume stays the staging
+// area for every backup: the Firebird server (scheduled backups) and gbak
+// (delete-time and upgrade backups) only write to a filesystem, and the
+// firebirdsql/firebird image ships no S3 client. An s3 destination then
+// adds a restic container, running spec.backup.destinations[].s3.image,
+// after each of them, that copies the directory just written into a
+// restic repository in the bucket. Without a local destination, backups
+// are streamed into the repository instead (see instance_backup_s3_stream.go).
+// Either way, a restic initContainer in the StatefulSet restores the "base"
+// snapshots into the backup volume before security-database-init (see
+// resticBootstrapScript).
 const (
 	// defaultResticImage is the restic image used when the s3 destination
 	// doesn't set one.
@@ -95,11 +98,10 @@ const (
 var resticPasswordFile = path.Join(resticPasswordMountPath, resticPasswordKey)
 
 // s3Destination returns the instance's s3 backup destination, or nil when
-// it has none or has no local backup volume (see backupVolumeSpec) to
-// stage its backups in. The CRD only allows a single s3 entry, and only
-// next to a local one.
+// it has none or spec.backup.enabled is false. The CRD only allows a
+// single s3 entry.
 func s3Destination(instance *kubebirdv1.Instance) *kubebirdv1.S3BackupSpec {
-	if backupVolumeSpec(instance) == nil {
+	if !instance.Spec.Backup.Enabled {
 		return nil
 	}
 	for _, d := range instance.Spec.Backup.Destinations {
@@ -163,7 +165,13 @@ func resticRepository(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec
 // before its subcommand: the repository comes from RESTIC_REPOSITORY (see
 // resticEnv), the password from the mounted Secret.
 func resticCommand(s3 *kubebirdv1.S3BackupSpec) string {
-	cmd := fmt.Sprintf("%s --password-file %s", binRestic, resticPasswordFile)
+	return resticCommandFor(binRestic, s3)
+}
+
+// resticCommandFor is resticCommand running the restic binary bin, e.g.
+// the copy streamingResticBin of the containers streaming backups.
+func resticCommandFor(bin string, s3 *kubebirdv1.S3BackupSpec) string {
+	cmd := fmt.Sprintf("%s --password-file %s", bin, resticPasswordFile)
 	if s3.ForcePathStyle {
 		cmd += " -o s3.bucket-lookup=path"
 	}
@@ -243,15 +251,16 @@ func resticContainer(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec,
 // too when it's missing, and fails fast, with "already initialized", on
 // an existing repository, while "restic cat config" retries a missing
 // bucket for about 15 minutes. Two runs initializing at once are fine:
-// the loser sees "already initialized" too.
-func resticEnsureRepositoryScript(s3 *kubebirdv1.S3BackupSpec) string {
+// the loser sees "already initialized" too. restic is the command line
+// to run (see resticCommand).
+func resticEnsureRepositoryScript(restic string) string {
 	return fmt.Sprintf(`if ! OUT=$(%s init 2>&1); then
 	case "$OUT" in
 	*"already initialized"*|*"already exists"*) ;;
 	*) echo "$OUT" >&2; exit 1 ;;
 	esac
 fi
-`, resticCommand(s3))
+`, restic)
 }
 
 // resticDuration renders the retention as a restic duration for forget's
@@ -279,7 +288,7 @@ func resticUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSp
 	restic := resticCommand(s3)
 	var b strings.Builder
 	b.WriteString("set -e\n")
-	b.WriteString(resticEnsureRepositoryScript(s3))
+	b.WriteString(resticEnsureRepositoryScript(restic))
 	fmt.Fprintf(&b, "%s backup --retry-lock %s --host %q --tag %q --exclude %q %q\n",
 		restic, resticLockWait, instance.Name, frequency, scheduledBackupClaimPrefix+"*", scheduledBackupDir(frequency))
 	fmt.Fprintf(&b, "%s forget --retry-lock %s --tag %q --group-by tags --keep-within %s --prune\n",
@@ -296,7 +305,7 @@ func resticUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSp
 // logged, and the Pod still succeeds rather than holding up the deletion
 // or a major version upgrade.
 func resticBaseUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) string {
-	upload := "set -e\n" + resticEnsureRepositoryScript(s3) +
+	upload := "set -e\n" + resticEnsureRepositoryScript(resticCommand(s3)) +
 		fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q %q\n",
 			resticCommand(s3), resticLockWait, instance.Name, resticBaseTag, instanceBackupDir())
 	return fmt.Sprintf(`if timeout %d sh -c %s; then
@@ -309,34 +318,75 @@ exit 0
 }
 
 // resticBootstrapScript renders the StatefulSet's backup-restore
-// initContainer script: when the backup volume's base directory is empty
-// or missing (a new Instance, or the backup volume was lost), it restores
-// the latest snapshot tagged resticBaseTag, if any, into it, so
-// security-database-init and restoreDatabaseIfBackedUp find the backups as
-// if they had been there all along. It never touches a base directory
-// that already holds something, which is always at least as recent as the
-// repository's copy of it. Failing here (e.g. the endpoint is unreachable)
+// initContainer script, which restores the latest "base" snapshots into
+// the backup volume's base directory, so security-database-init and
+// restoreDatabaseIfBackedUp find the backups as if they had been there all
+// along. With a local destination, it only runs when the base directory
+// is empty or missing (a new Instance, or the backup volume was lost),
+// and never touches one that already holds something, which is always at
+// least as recent as the repository's copy of it. Without one (see
+// s3Streaming), the backup volume is a fresh emptyDir on every start, so
+// it runs whenever the primary volume hasn't been restored yet, i.e. holds
+// no s3RestoredMarker (see finishS3Restore).
+//
+// The repository can hold two kinds of "base" snapshots: of the whole
+// base directory (resticBaseUploadScript) and of a single file in it
+// (streamingBaseBackupScript). The latest snapshot of every path is
+// restored, oldest first, so a newer one wins wherever they overlap: a
+// directory snapshot with restore "<id>:<base>", a file one with dump.
+// Any other path, including one escaping base with "..", is skipped.
+// Neither restores the parent directories' metadata, which "--target /"
+// does, and which fails where it can't be set (e.g. SELinux labels).
+// Snapshot paths are absolute, whatever Instance took them (see
+// S3BackupSpec.Prefix). Failing here (e.g. the endpoint is unreachable)
 // fails the pod's start, rather than starting fresh databases where a
-// restore was due. The snapshot is restored at its own absolute path, the
-// base directory, whatever Instance took it (see S3BackupSpec.Prefix).
-func resticBootstrapScript(s3 *kubebirdv1.S3BackupSpec) string {
+// restore was due: the snapshot list is captured into a variable first,
+// so a failed restic command isn't hidden by the pipeline parsing it.
+func resticBootstrapScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) string {
 	restic := resticCommand(s3)
-	return fmt.Sprintf(`set -e
-if [ -n "$(ls -A %[1]q 2>/dev/null)" ]; then
+	base := instanceBackupDir()
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	if s3Streaming(instance) {
+		fmt.Fprintf(&b, `if [ -e %q ]; then
+	echo "The primary volume was already restored; not restoring from the S3 repository"
+	exit 0
+fi
+`, s3RestoredMarker)
+	} else {
+		fmt.Fprintf(&b, `if [ -n "$(ls -A %q 2>/dev/null)" ]; then
 	echo "The backup volume already holds backups; not restoring from the S3 repository"
 	exit 0
 fi
-%[2]sSNAPSHOTS=$(%[3]s snapshots --tag %[4]q --latest 1 --json)
-case "$SNAPSHOTS" in
-*'"id"'*)
-	echo "Restoring the backups from the S3 repository"
-	%[3]s restore latest --tag %[4]q --target /
-	;;
-*)
+`, base)
+	}
+	b.WriteString(resticEnsureRepositoryScript(restic))
+	fmt.Fprintf(&b, `SNAPSHOTS=$(%[1]s snapshots --tag %[2]q --group-by paths --latest 1 --json)
+LIST=$(printf '%%s\n' "$SNAPSHOTS" | grep -o '"\(time\|short_id\)":"[^"]*"\|"paths":\["[^"]*"' | awk -F'"' '$2 == "time" { t = $4 } $2 == "paths" { p = $4 } $2 == "short_id" { print t, $4, p }' | sort)
+if [ -z "$LIST" ]; then
 	echo "The S3 repository holds no backup to restore"
-	;;
-esac
-`, instanceBackupDir(), resticEnsureRepositoryScript(s3), restic, resticBaseTag)
+	exit 0
+fi
+echo "Restoring the backups from the S3 repository"
+mkdir -p %[3]q
+while read -r TIME ID P; do
+	case "$P" in
+	*/..|*/../*)
+		echo "Skipping snapshot $ID of $P, outside the base directory" >&2
+		;;
+	%[3]q)
+		%[1]s restore "$ID:$P" --target "$P"
+		;;
+	%[3]q/*)
+		%[1]s dump "$ID" "$P" > "$P.tmp"
+		mv "$P.tmp" "$P"
+		;;
+	esac
+done <<EOF
+$LIST
+EOF
+`, restic, resticBaseTag, base)
+	return b.String()
 }
 
 // reconcileS3Secrets ensures the Secrets the s3 destination reads exist:

@@ -115,23 +115,9 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 
 	podName := firebirdPodName(instance)
 
-	// Only worth checking when something in spec.databases is actually
-	// being created/restored: that's the event (an Instance recreated, or
-	// a database dropped after spec.backup left its backup behind) this warning
-	// exists to surface, and skipping it otherwise keeps a steady-state
-	// reconcile (pending and removed both empty, returned above) from
-	// paying for an extra exec into the pod.
-	warning := ""
-	if len(pending) > 0 && backupVolumeSpec(instance) != nil {
-		orphaned, err := r.orphanedBackups(ctx, instance, podName)
-		if err != nil {
-			return fmt.Errorf("failed to check for orphaned backups: %w", err)
-		}
-		if len(orphaned) > 0 {
-			warning = fmt.Sprintf(
-				"the backup volume has a backup for %s, but it's no longer in spec.databases, so it wasn't restored",
-				strings.Join(orphaned, ", "))
-		}
+	warning, err := r.orphanedBackupsWarning(ctx, instance, podName, len(pending) > 0)
+	if err != nil {
+		return err
 	}
 
 	for _, name := range removed {
@@ -159,7 +145,7 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 			continue
 		}
 
-		if backupVolumeSpec(instance) != nil {
+		if hasBackupDestination(instance) {
 			restored, err := r.restoreDatabaseIfBackedUp(ctx, instance, podName, password, db)
 			if err != nil {
 				return fmt.Errorf("failed to restore database %q from backup: %w", db.Name, err)
@@ -179,6 +165,12 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 			return fmt.Errorf("failed to create database %q: %w", db.Name, err)
 		}
 		logf.FromContext(ctx).Info("Created database", "database", db.Name, "owner", owner)
+	}
+
+	if len(pending) > 0 && s3Streaming(instance) {
+		if err := r.finishS3Restore(ctx, instance, podName); err != nil {
+			return err
+		}
 	}
 
 	removedSet := make(map[string]bool, len(removed))
@@ -381,7 +373,9 @@ exit;
 // deletion and on a major version upgrade (see reconcileMajorUpgrade), so
 // a freshly created, recreated or upgraded Instance always needs seeding;
 // the check only ever finds one already there across a plain pod restart.
-// When a backup volume exists (backupVolumeSpec), it's seeded from the
+// When a backup volume exists (hasBackupDestination: the backup PVC, or the
+// emptyDir resticBootstrapScript restores the S3 repository's "base"
+// snapshots into), it's seeded from the
 // most recently written security database backup in the backup volume's
 // base subdirectory (backupDatabasesOffline's "security<M>.fbk", see
 // securityDatabaseBackupPathForVersion) of a Firebird major version M no
@@ -419,7 +413,7 @@ exit;
 // status.upgrade, so finishing an upgrade doesn't change the pod template
 // and restart the pod once more.
 func securityDatabaseInitScript(instance *kubebirdv1.Instance) string {
-	if backupVolumeSpec(instance) == nil {
+	if !hasBackupDestination(instance) {
 		return fmt.Sprintf(`set -e
 if [ ! -f %[1]q ]; then
 	cp %[2]q %[1]q
@@ -597,6 +591,28 @@ func (r *InstanceReconciler) orphanedBackups(ctx context.Context, instance *kube
 	}
 	slices.Sort(orphaned)
 	return orphaned, nil
+}
+
+// orphanedBackupsWarning returns status.warning's message about the
+// backups orphanedBackups finds, or "" when there are none. Only worth
+// checking when something in spec.databases is actually being
+// created/restored (pending): that's the event (an Instance recreated, or
+// a database dropped after spec.backup left its backup behind) this
+// warning exists to surface, and skipping it otherwise keeps a
+// steady-state reconcile from paying for an extra exec into the pod.
+func (r *InstanceReconciler) orphanedBackupsWarning(ctx context.Context, instance *kubebirdv1.Instance, podName string, pending bool) (string, error) {
+	if !pending || !hasBackupDestination(instance) {
+		return "", nil
+	}
+	orphaned, err := r.orphanedBackups(ctx, instance, podName)
+	if err != nil {
+		return "", fmt.Errorf("failed to check for orphaned backups: %w", err)
+	}
+	if len(orphaned) == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("the backup volume has a backup for %s, but it's no longer in spec.databases, so it wasn't restored",
+		strings.Join(orphaned, ", ")), nil
 }
 
 // databaseFileExists reports whether filePath already exists inside
@@ -790,19 +806,17 @@ func (r *InstanceReconciler) backupDatabasesOffline(ctx context.Context, instanc
 // databaseBackupScript): spec.version, except while a major version
 // upgrade is still backing up the version it's upgrading from.
 func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instance *kubebirdv1.Instance, version string) error {
-	mounts := []corev1.VolumeMount{
-		{Name: primaryVolumeName, MountPath: primaryDataMountPath},
-		{Name: backupVolumeName, MountPath: backupDataMountPath},
-	}
+	streaming := s3Streaming(instance)
+	mounts := []corev1.VolumeMount{{Name: primaryVolumeName, MountPath: primaryDataMountPath}}
 	volumes := []corev1.Volume{
 		{
 			Name:         primaryVolumeName,
 			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: primaryPVCName(instance)}},
 		},
-		{
-			Name:         backupVolumeName,
-			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupPVCName(instance)}},
-		},
+	}
+	if !streaming {
+		mounts = append(mounts, corev1.VolumeMount{Name: backupVolumeName, MountPath: backupDataMountPath})
+		volumes = append(volumes, backupVolume(instance))
 	}
 	if instance.Spec.Storage.Shadow != nil {
 		// gbak -backup on a shadow: true database also needs its shadow
@@ -839,7 +853,15 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 			Volumes:       volumes,
 		},
 	}
-	if s3 := s3Destination(instance); s3 != nil {
+	switch s3 := s3Destination(instance); {
+	case s3 != nil && streaming:
+		// No backup volume: gbak streams every backup straight into the
+		// repository (see streamingBaseBackupScript), and a failure fails
+		// the Pod, which backupDatabasesOffline retries.
+		container := &pod.Spec.Containers[0]
+		container.Command = []string{"sh", "-c", streamingBaseBackupScript(instance, s3, version)}
+		addStreamingRestic(&pod.Spec, container, instance, s3)
+	case s3 != nil:
 		// gbak runs first, as an initContainer, then restic copies the
 		// base directory to the S3 repository, best effort (see
 		// resticBaseUploadScript): its Secrets are optional too, so a

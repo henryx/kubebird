@@ -16,6 +16,12 @@
   keys, or the pod's ambient credentials. `insecureSkipTLSVerify: true` skips verifying the
   endpoint's TLS certificate (restic's `--insecure-tls`), e.g. for a self-signed one. Adding an `s3`
   entry restarts the Firebird pod once.
+- An `s3` destination no longer needs a `local` one. On its own, no backup PVC is created: `gbak`
+  streams every backup straight into the restic repository, one snapshot per database file. The
+  delete-time and major upgrade backups are then the only copy, so they wait until the upload
+  succeeds instead of being best effort. A new or recreated `Instance` (or a major upgrade) restores
+  from the repository through a temporary `emptyDir`, deleted once every database is restored.
+  `mode.type: physical` still needs a `local` destination, since `nbackup` can't stream.
 - Regular Firebird users. `spec.authentication` now maps each user name to its credentials: `sysdba`
   configures SYSDBA as before, and any other key declares a regular user, whose password comes from
   `secretRef`, or from a generated `<name>-user-<user>` Secret (lowercased, underscores turned

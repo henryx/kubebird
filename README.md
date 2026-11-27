@@ -30,7 +30,7 @@
   Firebird major-version bump (e.g. `3.0.14` to `4.0.3`), since `gbak` restores are forward-compatible
   with backups taken by an older version. Setting `spec.backup.backupOnDelete` to `false` skips that
   final backup while still releasing the primary/shadow storage. Without a backup volume, a
-  recreated `Instance` starts fresh instead.
+  recreated `Instance` starts fresh instead. See "Restoring an Instance" below for every case.
 - Upgrades an `Instance` in place when `spec.version` changes: within a major version it just
   restarts the pod on the new image (downgrades included); to a newer major version it backs up
   every database and the security database with the old version, then restores them onto the new
@@ -177,7 +177,7 @@ spec:
           storage:
             class: ""
             size: 3Gi
-      - s3: # optional; copy every backup to a restic repository in an S3-compatible bucket. requires a local entry
+      - s3: # optional; back up to a restic repository in an S3-compatible bucket. with a local entry, copies its backups; without one, streams them
           endpoint: "" # host[:port] or http(s):// URL; empty means AWS S3
           bucket: kubebird-backups
           prefix: "" # path of the repository in the bucket; defaults to "<namespace>/<name>"
@@ -201,10 +201,10 @@ With this CR, Kubebird can:
 - Deploy an instance of Firebird, in a StatefulSet mode using `image` and `version` specified, in whichever namespace the `Instance` itself is created in. The `firebird` container sets `allowPrivilegeEscalation: false` and a `RuntimeDefault` seccomp profile, satisfying the `baseline` Pod Security Standard; it does **not** run as non-root or drop capabilities, since the `firebirdsql/firebird` image's entrypoint needs root's full DAC override (e.g. to manage files owned by its own `firebird` user) whenever `FIREBIRD_ROOT_PASSWORD` is set, which Kubebird always does — so `Instance` pods can't satisfy the stricter `restricted` standard, and the namespace they run in must enforce `baseline` or looser.
 - Create a service for the instance. Default service type is `ClusterIP`, exposed on `service.port` (defaults to `3050`); the pod's container port is always `3050` regardless of this setting.
 - Define the PVC used for the instance's primary data (`storage.primary`), named `<instance-name>-primary`, with specified size and storage class. If storage class isn't specified, it uses the default storage class. Size must be a valid Kubernetes quantity (e.g. `3Gi`, `500Mi`); the CRD rejects anything else. This PVC isn't owned by the `Instance` (so it isn't garbage-collected alongside it), but Kubebird always deletes it itself when the `Instance` is deleted — see "Deleting an Instance" below.
-- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (an `s3` entry adds a copy of every backup in an S3 bucket, see "Copying backups to S3" below, but still needs the `local` one). `backup.backupOnDelete` (defaults to `true`) controls whether deleting the `Instance` runs one last backup into it first; setting it to `false` skips that final backup, but never affects whether the PVC itself is created or retained. `backup.compress` (defaults to `false`) gzips every scheduled `backup.retention` backup right after it's taken; the delete-time `gbak` backups are never compressed. `backup.mode` picks how the scheduled backups are taken: `gbak` (`type: logical`, the default) or `nbackup` (`type: physical`), the latter optionally `incremental`. See "Backup and restore" below for what Kubebird does with it.
+- Optionally define a `<instance-name>-backup` PVC, mounted into the pod at `/var/lib/firebird/backup`, sized via `backup.destinations[].local.storage` — created only when `backup.enabled` is `true` *and* `backup.destinations` has a `local` entry (an `s3` entry adds a copy of every backup in an S3 bucket, or, without a `local` entry, takes its place; see "Copying backups to S3" below). `backup.backupOnDelete` (defaults to `true`) controls whether deleting the `Instance` runs one last backup into it first; setting it to `false` skips that final backup, but never affects whether the PVC itself is created or retained. `backup.compress` (defaults to `false`) gzips every scheduled `backup.retention` backup right after it's taken; the delete-time `gbak` backups are never compressed, and neither are backups streamed to S3, which restic compresses itself. `backup.mode` picks how the scheduled backups are taken: `gbak` (`type: logical`, the default) or `nbackup` (`type: physical`), the latter optionally `incremental`. See "Backups" and "Restoring an Instance" below for what Kubebird does with it.
 - Declare a list of the databases managed by instance. Based by of the configuration, database can be instantiated in shadow mode; shadow files live on a second, separate PVC (`storage.shadow`, named `<instance-name>-shadow`), which is required if any database has `shadow: true`. Each database can also set `pageSize` (one of `4096`, `8192`, `16384`; defaults to `8192`), `charset` and `collation` (both default to `UTF8`).
 - Register a Firebird alias for each database in `/opt/firebird/databases.conf` using a ConfigMap called `<instance-name>-aliases`, so clients can connect using that alias instead of the in-pod filesystem path. Uses `alias` if set, otherwise falls back to the database's own `name` (e.g. `instance.fdb`). Since this file replaces the image's own `databases.conf` rather than merging with it, Kubebird also adds a `security.db` alias for the instance's security database (`RemoteAccess = false`, so it's only reachable through the embedded/local connection Kubebird itself uses), which the image's default file would otherwise have provided.
-- Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart. A `security-database-init` init container seeds it there — on every fresh primary PVC, since Kubebird always deletes the previous one on `Instance` deletion — before the `firebird` container starts, either restoring it from a backup or seeding the image's own default (see "Backup and restore" below); the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
+- Keep the security database (`securityN.fdb`, `N` being the Firebird major version) on the primary PVC (`/var/lib/firebird/data`) instead of the image's own ephemeral install directory, so it survives a pod restart. A `security-database-init` init container seeds it there — on every fresh primary PVC, since Kubebird always deletes the previous one on `Instance` deletion — before the `firebird` container starts, either restoring it from a backup or seeding the image's own default (see "Restoring an Instance" below); the `security.db` alias above and a `FIREBIRD_CONF_SecurityDatabase` environment variable both point the engine at this same relocated path.
 - Authentication is optional. `authentication` maps each Firebird user name to its credentials: the `sysdba` key configures SYSDBA itself, and any other key (a letter, then letters, digits or underscores, at most 31 characters) declares a regular user. Firebird user names are case-insensitive, so keys differing only in case are rejected. If a user's `secretRef` is specified, that Secret must already exist — Kubebird reads the password from its `password` key as-is (only adding the `kubebird.github.io/firebird-version` label described below) and fails reconciliation if it's missing, rather than creating it; if it isn't specified, Kubebird creates a `<instance-name>-user-<user>` secret (the user name lowercased, underscores turned into dashes, e.g. `<instance-name>-user-sysdba` or `<instance-name>-user-exampleuser`) with a random password if one doesn't already exist. For an `Instance` created by Kubebird 0.4.0 or earlier, whose generated SYSDBA secret is still named `<instance-name>-sysdba`, the new `<instance-name>-user-sysdba` secret is created with that secret's password, so SYSDBA's password doesn't change; the old secret is left in place and can be deleted afterwards. A generated secret has `username` (`SYSDBA`, or the user's key) and `password` keys, and Kubebird never deletes a user's secret, whether on its own or when the `Instance` is deleted — see "Deleting an Instance" below.
 - Create each regular user in the security database once the Firebird pod is ready, through the server's Services API (`fbsvcmgr`), so it works on an `Instance` with no databases too. Changing a regular user's secret applies the new password on the running server, without restarting the pod (unlike SYSDBA's, see below); a password changed by other means is only put back the next time the secret changes. Removing a user from `authentication` deletes it from the security database; Kubebird only ever deletes users it created itself (recorded in `status.users`), never ones created by other means.
 - Create each database as its `owner`: `sysdba` (the default) or a regular user declared in `authentication`, spelled exactly as its key. The database is created, and restored from its backup after a delete/recreate or an upgrade, as that user, so it's owned by it and the user has full rights on it. Firebird can't change a database's owner afterwards, so `owner` can't be set, changed or removed on a database already declared; to change it, remove the database and add it again (which drops it), or delete and recreate the `Instance` with the new owner, which restores it from its backup as the new owner.
@@ -212,10 +212,11 @@ With this CR, Kubebird can:
 - Label the Firebird server pod, the `StatefulSet`, the `Service`, the aliases ConfigMap, the PVCs, the user secrets, the scheduled backup CronJobs and the delete-time backup Pod with `kubebird.github.io/firebird-version: <version>`, the version the running server itself reports (e.g. `3.0.14`), also recorded in `status.firebirdVersion`. It's detected once per server pod, through the Services API (`fbsvcmgr -info_server_version`), so an `Instance` with no databases gets it too, and detected again whenever the pod is recreated (e.g. after changing `spec.version`). The PVCs and the user secrets (including ones you supply via `secretRef`) are created before the server runs and survive deleting the `Instance`, so Kubebird patches just this label onto them once the version is known and keeps it up to date: after recreating an `Instance` with a new `spec.version`, the retained backup PVC and secrets keep the old version's label until the new server's version is detected, then switch to it. That's the only change Kubebird ever makes to an existing PVC or secret.
 - Report the most recent error, if any, in `status.error` — surfaced without needing to check the operator's own logs, via the `MESSAGE` column below. It's cleared automatically once the `Instance` reconciles successfully again.
 - Warn, in `status.warning`, when a database that's provisioned or restored (i.e. `spec.databases` has a pending entry) leaves behind an orphaned backup: a `.fbk` file in the backup volume's `base/` subdirectory whose database is no longer in `spec.databases` — typically because the `Instance` was recreated with a different database list, or a database was dropped after its backup was taken. The security database's own backup (`securityN.fbk`) is never reported this way, even though it sits in that same directory. Cleared automatically once no orphaned backup remains.
-- Optionally copy every backup from the local backup volume to an S3-compatible bucket (AWS S3, MinIO,
-  Silo, Ceph, R2, ...) as an encrypted, deduplicated [restic](https://restic.net) repository, keeping
-  the same retention as locally, and restore an `Instance` from it alone when its backup volume is
-  gone, e.g. in a new cluster. See "Copying backups to S3" below.
+- Optionally back up to an S3-compatible bucket (AWS S3, MinIO, Silo, Ceph, R2, ...) as an encrypted,
+  deduplicated [restic](https://restic.net) repository: either copying every backup from the local
+  backup volume, keeping the same retention as locally, or, without a local backup volume, streaming
+  every backup straight into it. Either way, an `Instance` can be restored from the repository alone,
+  e.g. in a new cluster. See "Copying backups to S3" below.
 - Surface `kubectl get instances` columns beyond the default `NAME`/`AGE`: `VERSION` (the Firebird version deployed, from `spec.version`), `STATUS` (`Provisioning`, `Ready`, or `Deleting`), `DATABASES` (the number of databases currently provisioned, i.e. `len(status.databases)`), and `MESSAGE` (the reconcile error if the last reconcile failed; otherwise `status.warning` if one is set; otherwise, while `Provisioning`/`Ready`, why it's currently in that phase; while `Deleting`, the specific operation deletion is currently performing, e.g. "Backing up databases into the backup volume" — see "Deleting an Instance" below).
 
 ### Object creation flow
@@ -262,8 +263,8 @@ secret, database aliases from the ConfigMap, traffic routing from the Service, p
 data from the PVCs, referenced by name) rather than a separate creation step; the Pod, by contrast,
 is created directly by Kubernetes from the `StatefulSet`'s template. The backup `PVC` only exists
 when `backup.enabled` is set on the `Instance` *and* `backup.destinations` includes a `local` entry
-(an `s3` entry copies its backups to S3, but never replaces it) — `backup.enabled` alone just turns on the
-ability to back up, it doesn't by itself create anything (see "Backup and restore" below). The
+(an `s3` entry alone streams its backups to S3 instead, with no backup `PVC`) — `backup.enabled` alone just turns on the
+ability to back up, it doesn't by itself create anything (see "Backups" below). The
 shadow `PVC` only exists when
 `storage.shadow` is set. Before the `firebird` container in that Pod starts, a `security-database-init`
 init container (mounting the primary PVC, plus the backup PVC too when it exists)
@@ -296,26 +297,23 @@ does depends on how the version changes, compared with the version the `Stateful
   are. Downgrading (e.g. back to `4.0.3`) works the same way.
 - **To a newer major version** (e.g. `3.0.14` to `4.0.3`, or `4.0.3` to `5.0.4`): the on-disk
   structure changes between major versions, so Kubebird moves the data the same way deleting and
-  recreating the `Instance` would, without deleting it. This needs a local backup volume
-  (`backup.enabled` with a `local` entry in `backup.destinations`); without one, the upgrade is
-  refused and reported in `status.error`. `status.phase` is `Upgrading` meanwhile, and
+  recreating the `Instance` would, without deleting it. This needs a backup destination
+  (`backup.enabled` with a `local` or `s3` entry in `backup.destinations`); without one, the upgrade
+  is refused and reported in `status.error`. `status.phase` is `Upgrading` meanwhile, and
   `status.upgrade` records `fromVersion`, `toVersion` and the current `stage`:
   1. `BackingUp`: the pod is stopped and every database, plus the security database, is backed up
      with `gbak` by the old version's own image (the new version's engine can't open the old on-disk
-     structure) into the backup volume's `base/` directory, exactly as on deletion, whatever
-     `backup.backupOnDelete` says.
+     structure) into the backup volume's `base/` directory (or streamed into the S3 repository, with
+     `s3` only), exactly as on deletion, whatever `backup.backupOnDelete` says.
   2. `Releasing`: the primary and shadow PVCs are deleted.
   3. `Restoring`: the new version starts on fresh PVCs, restoring the security database and then
-     every database from those backups. Once it's all `Ready`, `status.upgrade` is cleared.
+     every database from those backups (see "Restoring an Instance" below). Once it's all `Ready`,
+     `status.upgrade` is cleared.
 
-  When upgrading **from Firebird 3**, the security database isn't restored as is: following the
-  [Firebird 4.0 migration guide](https://ib-aid.com/download/docs/fb4migrationguide.html#_migrating_user_list),
-  the new version starts from its own default security database, and the users of the 3.0 one
-  (Srp and Legacy_UserManager alike, passwords included) are copied into it, all but SYSDBA, whose
-  password always comes from the SYSDBA Secret; regular users from `authentication` are among those
-  copied, keeping their passwords. From Firebird 4 on, the security database is restored
-  from its backup like every other database. Keep `spec.version` at the new version until the
-  upgrade finishes; changing it meanwhile is refused.
+  When upgrading **from Firebird 3**, the security database isn't restored as is: its users are
+  migrated into the new version's default security database (see "Restoring an Instance" below).
+  Keep `spec.version` at the new version until the upgrade finishes; changing it meanwhile is
+  refused.
 - **To an older major version** (e.g. `4.0.3` to `3.0.14`): refused, since a database, or a backup,
   written by a newer major version can't be read by an older one. Kubebird reports it in
   `status.error` and leaves the running server alone; set `spec.version` back to clear it.
@@ -334,23 +332,24 @@ Deleting an `Instance` relies on Kubernetes garbage collection of the objects Ku
 it (the aliases ConfigMap, Service and StatefulSet are all owned by the `Instance`); the
 operator itself just logs the deletion, reports `status.phase: Deleting`, and updates
 `status.message` with the specific operation it's currently performing (e.g. "Deleting Instance",
-or one of the backup-related steps described in "Backup and restore" below), while that garbage
+or one of the backup-related steps described in "Backups" below), while that garbage
 collection runs. The user Secrets (SYSDBA's and the regular users') are **not** removed with it —
 Kubebird deliberately never sets an owner reference on them, so an `Instance`'s credentials survive
 its deletion, and are reused, passwords included, if it's recreated. The primary and
 shadow PVCs aren't owner-referenced either, but Kubebird explicitly deletes both of them itself as
-part of every deletion, regardless of `spec.backup` — **without a local backup volume configured,
-deleting an `Instance` permanently destroys its data.** The backup PVC, when it exists, is always
-left behind rather than being deleted along with the primary/shadow storage — see "Backup and
-restore" below. Delete it and the Secrets yourself once you're sure you no longer need them:
+part of every deletion, regardless of `spec.backup` — **without a backup destination (a `local` or
+`s3` entry) configured, deleting an `Instance` permanently destroys its data.** The backup PVC, when it exists, is always
+left behind rather than being deleted along with the primary/shadow storage — see "Backups" below,
+and "Restoring an Instance" for what a recreated `Instance` does with it. Delete it and the Secrets
+yourself once you're sure you no longer need them:
 ```bash
 kubectl delete pvc,secret -l kubebird.github.io/instance=<name>
 ```
 
-### Backup and restore
+### Backups
 
 A local backup volume exists only when `backup.enabled` is `true` *and* `backup.destinations` has a `local`
-entry (an `s3` entry only copies the backups taken there to S3; see "Copying backups to S3" below) — `backup.enabled` alone just turns on
+entry (an `s3` entry copies the backups taken there to S3, and an `s3` entry alone streams them there instead, see "Copying backups to S3" below) — `backup.enabled` alone just turns on
 the ability to back up, it doesn't create anything by itself. When configured, Kubebird provisions
 the `<instance-name>-backup` PVC described above and, like the primary/shadow PVCs, never
 owner-references it — but unlike them, it's also never deleted by Kubebird itself, so once created
@@ -360,7 +359,8 @@ that performs the deletion-time backup below; if unset, it defaults to the same 
 `Instance` itself runs.
 
 **On deletion**, whenever a local backup volume exists *and* `backup.backupOnDelete` is `true` (the
-default), Kubebird backs up every database before releasing the primary/shadow storage (see
+default), Kubebird backs up every database (with an `s3` entry and no `local` one, the same backups
+are streamed into the S3 repository instead; see "S3 without a local destination" below) before releasing the primary/shadow storage (see
 "Deleting an Instance" above): it first stops the pod (scaling the StatefulSet to 0 replicas), since
 `gbak` can't back up a database — the security database included — while a live server still has it
 open, then runs the short-lived helper Pod, mounting the same PVCs, which runs `gbak -backup -verify`
@@ -377,50 +377,19 @@ volume", then, always, "Releasing primary and shadow storage", then "Removing fi
 `kubectl get instances` shows real deletion progress rather than a stale pre-deletion message.
 Setting `backup.backupOnDelete` to `false` skips only that final backup — the primary/shadow PVCs are
 still released immediately regardless, so an already-existing backup PVC keeps whatever was in it
-from an earlier backup, but nothing taken at delete time. Without a local backup volume, none of this
+from an earlier backup, but nothing taken at delete time. Without any backup destination, none of this
 runs at all: the primary and shadow PVCs are released immediately, and the `Instance`'s data (security
 database included) is gone for good.
 
-**On (re)creation**, an `Instance` with the same name only restores its data if a local backup
-volume was configured before deletion: since the backup PVC was left behind, a database not already
-on the (fresh) primary PVC is restored via `gbak -create -verify` from a matching
-`base/<database>.fbk` instead of being created empty, recreating its shadow file too for a
-`shadow: true` database, and the security database is restored the same way by the
-`security-database-init` init container (which runs before the `firebird` container starts, since no
-server is listening yet to `exec` a restore into), carrying over whatever users/roles were created
-directly in it. The init container picks the most recently written `base/securityM.fbk` whose major
-version `M` isn't newer than the version starting, so after a major upgrade (see "Upgrading an
-Instance" above) or a recreate with a bumped `spec.version`, the older version's backup is used; from
-a Firebird 3 backup into a newer version, its users are migrated into the new version's default
-security database rather than restored as is. SYSDBA's own password, meanwhile, always comes from
-the Secret rather than the restored security database — and since the Secret itself also survives the deletion (see "Deleting
-an Instance" above), it's the same password as before the delete/recreate, unless you rotate it
-yourself; see "Rotating the SYSDBA secret's password" above. If the recreated `Instance` declares a
-different `spec.databases` list than the one that was backed up, any `.fbk` file with no matching
-entry is left unrestored and reported in `status.warning` (and thus in the `MESSAGE` column) instead
-of being silently ignored. This also works if the recreated `Instance` sets a different
-`spec.version`: the new version's own `gbak` restores a `.fbk` backed up by the old version's
-`gbak`, so deleting and recreating an `Instance` with a bumped `spec.version` (and the same local
-backup volume configured) doubles as a way to upgrade between Firebird major versions, though
-changing `spec.version` in place does the same without deleting the `Instance` (see "Upgrading an
-Instance" above).
-Without a backup volume, there is nothing to restore from: a recreated `Instance` gets fresh, empty
-primary/shadow storage and a brand-new security database, just like a first-time `Instance` of that
-name.
-
-Regular users from `authentication` live in the security database, so they come back with it.
-Either way, since their secrets survive the deletion, a recreated `Instance` applies every user's
-password from its secret again: with a backup volume, to the users restored with the security
-database; without one, to users created afresh in the brand-new security database (so they can log
-in again, though the databases they owned start empty). A database with an `owner` is restored as
-that user, so it's owned by it even if the backup was taken with a different owner.
+**On (re)creation**, an `Instance` with the same name restores its databases and its security
+database from these backups; see "Restoring an Instance" below.
 
 ### Scheduled backups (`backup.retention`)
 
 `backup.retention` runs recurring backups independently of `backupOnDelete` and the deletion flow
-above, for as long as the `Instance` lives, into the same local backup volume — it requires one just
-the same (`backup.enabled` *and* a `local` entry in `backup.destinations`) and has no effect without
-one. Each of its five fields (`hour`, `day`, `week`, `month`, `year`) is both the switch for that
+above, for as long as the `Instance` lives, into the same local backup volume — it requires a
+backup destination just the same (`backup.enabled` *and* a `local` entry in `backup.destinations`, or
+an `s3` one, see "S3 without a local destination" below) and has no effect without one. Each of its five fields (`hour`, `day`, `week`, `month`, `year`) is both the switch for that
 frequency (empty, the default, or a zero duration such as `0d` disables it) and how long its backups
 are kept, written as `<n><unit>` where the unit is `h` (hours), `d` (days), `w` (weeks), `m` (months)
 or `y` (years). For example, `day: 3d` takes a backup every day at 00:00 UTC and deletes that
@@ -441,7 +410,8 @@ Each run takes a `gbak` backup of every database in `status.databases`, writing
 `hour/instance-20260924T100000Z.fbk`), where `<timestamp>` is the UTC time the run started; when
 `backup.compress` is `true`, each one is then gzip-compressed to `<frequency>/<database>-<timestamp>.fbk.gz`
 (gzip being the only compressor the `firebirdsql/firebird` image ships), otherwise it's left uncompressed.
-Restore one with `gbak -create` (after `gunzip`, if compressed). Once every backup of the run
+Restore one with `gbak -create` (after `gunzip`, if compressed; see "Restoring a scheduled backup by
+hand" below). Once every backup of the run
 has succeeded, the same Job deletes every backup in that frequency's directory whose timestamp is
 older than its retention (months and years follow the calendar rather than a fixed number of days),
 including `.nbk` backups left by Kubebird 0.3.1 and earlier.
@@ -523,12 +493,12 @@ of old record versions until it finishes.
 
 ### Copying backups to S3 (`destinations[].s3`)
 
-An `s3` entry in `backup.destinations` copies the local backup volume's backups to a
-[restic](https://restic.net) repository in an S3-compatible bucket, so they survive losing the
-volume, its node or the whole cluster. The local volume stays where every backup is taken, so an
-`s3` entry needs a `local` one next to it (the CRD rejects it otherwise, and a second `s3` entry
-too). restic encrypts the repository with the password in the `password` key of the
-`repository.secretRef` Secret, which must already exist when set; when empty, Kubebird creates a
+An `s3` entry in `backup.destinations` backs up to a [restic](https://restic.net) repository in an
+S3-compatible bucket, so the backups survive losing the backup volume, its node or the whole cluster.
+Next to a `local` entry, the local volume stays where every backup is taken, and the `s3` entry
+copies them; on its own, every backup is streamed into the repository instead, with no backup volume
+at all (see "S3 without a local destination" below). Only one `s3` entry is allowed. restic
+encrypts the repository with the password in the `password` key of the `repository.secretRef` Secret, which must already exist when set; when empty, Kubebird creates a
 `<name>-restic` Secret with a random password. That Secret is mounted into every restic container
 and read with `--password-file`, and, like the users' Secrets, it's never deleted with the
 `Instance`. **Keep a copy of it outside the cluster**: without it, the repository can't be read.
@@ -551,22 +521,151 @@ restricts it.
   longer than 30 minutes, e.g. because the endpoint is unreachable and restic keeps retrying), the
   failure is only logged and the deletion or upgrade carries on, since the backup is safe on the
   backup volume, which is never deleted.
-- **Restoring from S3.** The Firebird pod gets a `backup-restore` init container, which runs before
-  `security-database-init`: when the backup volume's `base/` directory is empty (a new `Instance`, or
-  one whose backup PVC was deleted), it restores the repository's latest `base` snapshot into it, and
-  the security database and every database are then restored from it exactly as from a local backup
-  (see "Backup and restore" above). It never overwrites a `base/` directory that holds anything. If
-  the repository can't be read, the pod doesn't start, rather than starting with empty databases where
-  a restore was due. To restore into another cluster or namespace, create the `Instance` there with
-  the same `repository.secretRef` password and `prefix` pointing at the original repository.
-  Scheduled backups aren't restored automatically; run `restic restore` by hand for one of those.
-- **The security database** can only be backed up while the server is stopped, so the repository only
-  has the copy taken by the last deletion or major upgrade. Restoring from S3 alone therefore loses
-  users created directly in the security database since then; users declared in `authentication` are
-  put back from their Secrets anyway.
+- **Restoring from S3.** The Firebird pod gets a `backup-restore` init container, which restores the
+  repository's backups into an empty `base/` directory, e.g. after the backup PVC was lost; see
+  "Restoring an Instance" below. Scheduled backups aren't restored automatically.
+- **The security database** is only in the repository as of the last deletion or major upgrade,
+  since it can only be backed up while the server is stopped; see "Restoring an Instance" below for
+  what that means for its users.
 
 Adding an `s3` entry to an existing `Instance` changes the Firebird pod's template, so its pod restarts
 once.
+
+#### S3 without a local destination
+
+With an `s3` entry and no `local` one, Kubebird creates no backup PVC: `gbak` writes each backup to
+its standard output, and restic stores it as a snapshot of a single file, under the path it would
+have had on the backup volume (e.g. `/var/lib/firebird/backup/hour/<database>.fbk`). The Jobs and Pods
+taking backups run the Firebird image (or `backup.image`), with restic's binary copied in by a
+`restic-install` init container from the restic `image`. If `gbak` fails, restic saves no snapshot.
+
+- **Scheduled backups.** Each `backup.retention` Job streams every database's backup from the live
+  server, one snapshot per database, tagged with the frequency, then forgets that frequency's
+  snapshots older than its retention, every database's separately. The Jobs mount no volume, so they
+  can run on any node. `backup.compress` has no effect: restic compresses the repository itself.
+  `backup.mode.type: physical` isn't supported here (`nbackup` can't stream its backups), so the CRD
+  requires a `local` entry for it.
+- **Delete-time and upgrade backups.** The backup Pod streams every database and the security
+  database into `base` snapshots. The primary volume is deleted right after, so these snapshots are
+  the only copy: unlike next to a `local` entry, the upload isn't best effort, and the deletion (or
+  the major upgrade) waits, retrying, until it succeeds. If the bucket is unreachable for good, set
+  `backup.backupOnDelete: false` to delete the `Instance` without that last backup.
+- **Restoring from S3.** Whenever the Firebird pod starts on a fresh primary volume, the backups are
+  restored through a temporary `emptyDir`, deleted once every database is restored; see "Restoring
+  an Instance" below. The node needs enough ephemeral storage for the backups meanwhile.
+
+### Restoring an Instance
+
+Kubebird restores automatically: there's no field asking for a restore. What decides it is what's
+already on the `Instance`'s volumes and what its backup destinations hold.
+
+#### When a restore happens
+
+A restore only ever happens onto a **fresh primary PVC**, which is the case:
+
+- when an `Instance` is created, including one recreated under the name of a deleted one, since
+  deleting an `Instance` always deletes its primary (and shadow) PVC (see "Deleting an Instance"
+  above);
+- during a major version upgrade, whose `Restoring` stage starts the new version on fresh PVCs (see
+  "Upgrading an Instance" above).
+
+A plain restart of the Firebird pod (e.g. after rotating the SYSDBA password, a node drain or a
+minor version change) never restores anything: the security database and the databases are still on
+the primary PVC.
+
+Restored backups are always the "base" ones, `base/<database>.fbk` and `base/security<N>.fbk`, written
+by the delete-time backup and by a major upgrade (see "Backups" above). Scheduled backups are never
+restored automatically (see "Restoring a scheduled backup by hand" below).
+
+#### How it's decided
+
+The Firebird pod goes through three steps before it's `Ready`:
+
+1. **The `backup-restore` init container**, only with an `s3` destination, decides whether to fetch the
+   backups from the repository:
+
+   | Destinations | Doesn't fetch when | Because |
+   |---|---|---|
+   | `local` and `s3` | the backup PVC's `base/` directory holds anything | the local backups are at least as recent as the repository's |
+   | `s3` only | the primary PVC holds `/var/lib/firebird/data/.kubebird-s3-restored` | that primary volume was already restored |
+
+   Otherwise it lists the repository's `base` snapshots. If there are none (a new repository), it
+   logs `The S3 repository holds no backup to restore` and carries on. If there are some, it writes
+   the latest one of every file into `base/` (the backup PVC, or a temporary `emptyDir` with `s3`
+   only), the newer one winning when two hold the same file. If the repository can't be read
+   (unreachable endpoint, wrong credentials), the init container fails and the pod doesn't start: it
+   never assumes there's nothing to restore.
+2. **The `security-database-init` init container** leaves a security database already on the primary
+   PVC alone. Otherwise, with a backup destination, it restores the most recent `base/security<M>.fbk`
+   of a Firebird major version `M` no newer than `spec.version`; from a Firebird 3 backup into a newer
+   version, it migrates its users into the new version's default security database instead,
+   following the
+   [Firebird 4.0 migration guide](https://ib-aid.com/download/docs/fb4migrationguide.html#_migrating_user_list)
+   (Srp and Legacy_UserManager users alike, passwords included, all but SYSDBA). Without a backup
+   destination, or such a backup, it starts from the image's default security database.
+3. **Kubebird itself**, once the pod is ready, goes through every database in `spec.databases` not
+   yet in `status.databases`: one whose file is already on the primary PVC is just registered (this
+   only happens when a previous reconcile was interrupted), one with a `base/<database>.fbk` backup
+   is restored from it with `gbak -create` (as its `owner`, recreating its shadow file for a
+   `shadow: true` database), and any other one is created empty. With `s3` only, once every database
+   is done, the restored copies in `base/` are deleted (they'd only take up the node's disk) and the
+   marker above is written, so a later restart of the pod doesn't need the repository. A pod restarted
+   before that restores again, so a database whose restore failed is restored on the next try rather
+   than created empty. A failed restore is reported in `status.error` and retried.
+
+Users and passwords follow the security database: users created directly in it come back with it,
+and every regular user in `authentication` is then applied again from its Secret, which survives the
+deletion, so they can always log in, even when the security database started fresh. SYSDBA's password
+always comes from its Secret, never from the restored security database. A restored database is owned
+by its `owner`, whoever owned it when it was backed up.
+
+#### Scenarios
+
+| Scenario | What happens |
+|---|---|
+| New `Instance`, no backup destination | Starts fresh: empty databases, the image's default security database. |
+| New `Instance` whose destination holds no backup yet | Starts fresh, the same way. |
+| Recreated under the same name, with a `local` destination | Restores from the backup PVC, which survived the deletion: the delete-time backup, or, with `backupOnDelete: false`, whatever an earlier backup left in `base/` (nothing, the first time). |
+| Recreated under the same name, without a backup destination | Starts fresh: the data was deleted with the primary PVC. Users from `authentication` are created again, owning empty databases. |
+| Recreated with a different `spec.databases` | A database in both lists is restored, a new one is created empty, and the backup of one no longer listed isn't restored but reported in `status.warning` (and the `MESSAGE` column). |
+| Recreated with a newer `spec.version` | Restored as usual: `gbak` restores backups of older versions, and the security database comes from the older version's backup (migrated from Firebird 3). This doubles as a major upgrade, though changing `spec.version` in place does the same without deleting the `Instance`. |
+| Recreated with an older major version | Not supported: a backup written by a newer major version can't be read by an older one. |
+| In-place major upgrade | The `Restoring` stage restores from the backups the `BackingUp` stage just took, the same way (see "Upgrading an Instance" above). |
+| Database added to a running `Instance` | Restored if a `base/<database>.fbk` backup is there (a `local` destination), created empty otherwise. With `s3` only, `base/` is gone once the first restore is done, so it's created empty even if the repository has a backup of it. |
+| Backup PVC lost, with `local` and `s3` | The recreated `Instance` starts with an empty `base/`, so `backup-restore` fills it from the repository first. |
+| `s3` only | Every new or recreated `Instance` (and every major upgrade) checks the repository, since its primary PVC is always fresh. |
+| Another namespace or cluster | Only from S3: create the `Instance` there with the same repository password (`repository.secretRef`) and `prefix` pointing at the original repository. |
+| Pod restart | Nothing is restored (see above). |
+
+Since it's the backups that exist, not whether an `Instance` is meant to be new, that decide:
+
+- **To start fresh under a name already used**, delete the retained backup PVC (`<name>-backup`) and,
+  with `s3`, point `prefix` (or `bucket`) somewhere else or empty the repository first. The S3
+  repository defaults to `<namespace>/<name>` in `bucket`, so it's shared by every `Instance` ever
+  created under that name and namespace.
+- **Keep the restic password.** The `<name>-restic` Secret survives deleting the `Instance`, so a
+  recreated one reads the same repository. If it's deleted, a new `Instance` generates a new password
+  and can't read the existing repository: keep the Secret, and a copy of it outside the cluster.
+- **The security database** can only be backed up while the server is stopped, i.e. at deletion or
+  during a major upgrade, never by scheduled backups. Users created directly in it since the last of
+  those are lost by a restore; users declared in `authentication` are put back from their Secrets
+  anyway.
+
+#### Restoring a scheduled backup by hand
+
+Scheduled backups are kept for you to restore by hand, into a new database or over an existing one:
+
+- a `gbak` backup on the backup volume, `<frequency>/<database>-<timestamp>.fbk[.gz]`, with
+  `gbak -create` (after `gunzip`, if compressed);
+- a physical one, `<frequency>/<database>-<timestamp>.nbk[.gz]`, with `nbackup -R`, or, for
+  `incremental` pools, the pool's level 0 plus a run's level 1 (see "Physical scheduled backups"
+  above);
+- from S3, with `restic restore` or `restic dump` of a snapshot tagged with the frequency, using the
+  repository password from the `<name>-restic` Secret. With a `local` destination too, a snapshot
+  holds the frequency's whole directory; with `s3` only, every snapshot holds a single database's
+  backup, `/var/lib/firebird/backup/<frequency>/<database>.fbk`, e.g.
+  `restic dump latest --tag hour --path /var/lib/firebird/backup/hour/instance.fbk /var/lib/firebird/backup/hour/instance.fbk > instance.fbk`
+  (`--path` picks that database's own latest snapshot).
 
 ## License
 

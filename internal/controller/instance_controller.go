@@ -254,9 +254,10 @@ func (r *InstanceReconciler) reconcileInstance(ctx context.Context, instance *ku
 // reconcileDeletion logs an Instance's deletion, reports status.phase as
 // Deleting and status.message with the specific operation currently
 // underway (see setDeletionMessage), backs up its databases when a backup
-// volume exists (backupVolumeSpec, i.e. spec.backup.enabled is true and
-// spec.backup.destinations has a "local" entry) and spec.backup.backupOnDelete
-// is true (the default) — see backupDatabases — always releases the
+// destination exists (hasBackupDestination, i.e. spec.backup.enabled is
+// true and spec.backup.destinations has a "local" or "s3" entry) and
+// spec.backup.backupOnDelete is true (the default) — see backupDatabases —
+// always releases the
 // primary/shadow PVCs regardless of spec.backup (see
 // releasePrimaryAndShadowStorage — without a backup volume that data is
 // simply gone), and removes the finalizer so the API server can complete
@@ -285,7 +286,7 @@ func (r *InstanceReconciler) reconcileDeletion(ctx context.Context, instance *ku
 	// over it: until the upgrade finishes, it's at most partly restored.
 	upgrade := instance.Status.Upgrade
 	backedUp := upgrade != nil && upgrade.Stage != kubebirdv1.UpgradeStageBackingUp
-	if backupVolumeSpec(instance) != nil && backupOnDelete(instance) && !backedUp {
+	if hasBackupDestination(instance) && backupOnDelete(instance) && !backedUp {
 		version := instance.Spec.Version
 		if upgrade != nil {
 			// Still BackingUp: the databases are the old version's.
@@ -344,9 +345,10 @@ func (r *InstanceReconciler) setDeletionMessage(ctx context.Context, instance *k
 
 // backupDatabases runs a final backup of every database recorded in
 // instance.Status.Databases, plus the instance's security database (see
-// backupDatabasesOffline), into the backup volume. Only called when a
-// backup volume exists (backupVolumeSpec) and spec.backup.backupOnDelete is
-// true — releasePrimaryAndShadowStorage deletes the primary/shadow PVCs
+// backupDatabasesOffline), into the backup volume, or streamed into the
+// S3 repository without one (see streamingBaseBackupScript). Only called
+// when a backup destination exists (hasBackupDestination) and
+// spec.backup.backupOnDelete is true — releasePrimaryAndShadowStorage deletes the primary/shadow PVCs
 // regardless, so without a backup volume, or with backupOnDelete set to
 // false, that data is simply lost.
 //

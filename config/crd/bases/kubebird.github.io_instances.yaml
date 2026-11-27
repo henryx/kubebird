@@ -90,8 +90,11 @@ spec:
                     description: |-
                       backupOnDelete controls whether deleting the Instance runs one last
                       backup into destinations before releasing the primary/shadow
-                      storage. Only takes effect when a local backup volume exists (see
-                      destinations); has no effect otherwise. Defaults to true; a pointer
+                      storage. Only takes effect when a destination exists (see
+                      destinations); has no effect otherwise. With an s3 destination and no
+                      local one, the repository then holds the only copy, so deleting the
+                      Instance waits until that backup has been uploaded; set this to
+                      false to delete it without one. Defaults to true; a pointer
                       so an explicit false is distinguishable from an omitted field once
                       serialized (a plain bool would otherwise be indistinguishable from
                       its own zero value and get overwritten back to the default by CRD
@@ -103,15 +106,18 @@ spec:
                       compress gzip-compresses every scheduled backup (see retention) once
                       it's been taken, turning "<database>-<timestamp>.fbk" into
                       "<database>-<timestamp>.fbk.gz". gzip is used because it's the only
-                      compressor the firebirdsql/firebird image ships. Defaults to false,
-                      leaving backups uncompressed.
+                      compressor the firebirdsql/firebird image ships. Has no effect on
+                      backups streamed to an s3 destination without a local one, which
+                      restic compresses itself. Defaults to false, leaving backups
+                      uncompressed.
                     type: boolean
                   destinations:
                     description: |-
                       destinations lists the backup destinations to configure: "local" (a
                       dedicated PVC, where every backup is taken) and "s3" (a restic
-                      repository the local backups are copied to, which requires a local
-                      destination too). Required to be non-empty when enabled is true.
+                      repository; with a local destination too, the local backups are
+                      copied to it, and without one, every backup is streamed straight
+                      into it). Required to be non-empty when enabled is true.
                     items:
                       description: BackupDestinationSpec selects one backup destination
                         for the instance.
@@ -144,9 +150,10 @@ spec:
                           type: object
                         s3:
                           description: |-
-                            s3 copies the local backup volume's backups into a restic repository
-                            on an S3-compatible object store; see S3BackupSpec. Requires a local
-                            destination, which stays the staging area.
+                            s3 backs up into a restic repository on an S3-compatible object
+                            store; see S3BackupSpec. With a local destination too, the local
+                            backups are copied into it; without one, backups are streamed into
+                            it directly.
                           properties:
                             bucket:
                               description: |-
@@ -234,9 +241,6 @@ spec:
                     type: array
                     x-kubernetes-list-type: atomic
                     x-kubernetes-validations:
-                    - message: an s3 destination requires a local destination, which
-                        stages its backups
-                      rule: '!self.exists(d, has(d.s3)) || self.exists(d, has(d.local))'
                     - message: at most one s3 destination can be configured
                       rule: self.filter(d, has(d.s3)).size() <= 1
                   enabled:
@@ -299,9 +303,9 @@ spec:
                   retention:
                     description: |-
                       retention configures recurring scheduled backups, one frequency at
-                      a time; see RetentionSpec. Only takes effect when a local backup
-                      volume exists (see destinations); has no effect otherwise,
-                      matching backupOnDelete. Defaults to every frequency disabled.
+                      a time; see RetentionSpec. Only takes effect when a destination
+                      exists (see destinations); has no effect otherwise, matching
+                      backupOnDelete. Defaults to every frequency disabled.
                     properties:
                       day:
                         description: |-
@@ -341,6 +345,11 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-validations:
+                - message: 'mode.type physical needs a local destination: nbackup
+                    backups can''t be streamed to an s3 destination'
+                  rule: '!has(self.mode) || !has(self.mode.type) || self.mode.type
+                    != ''physical'' || !has(self.destinations) || !self.destinations.exists(d,
+                    has(d.s3)) || self.destinations.exists(d, has(d.local))'
                 - message: retention can enable at most one frequency when mode.incremental
                     is true
                   rule: '!has(self.mode) || !has(self.mode.incremental) || !self.mode.incremental
