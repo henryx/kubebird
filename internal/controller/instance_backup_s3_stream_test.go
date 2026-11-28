@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path"
 	"regexp"
@@ -29,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
 )
@@ -337,5 +339,71 @@ func checkStreamingPod(t *testing.T, pod corev1.PodSpec, primary bool) {
 	}
 	if vol := resticVolume(pod.Volumes); vol == nil || *vol.Secret.Optional {
 		t.Errorf("restic password volume = %+v, want a required one", vol)
+	}
+}
+
+// s3RestoreTestPod returns instance's Firebird pod, ready unless told
+// otherwise, with the given annotations.
+func s3RestoreTestPod(instance *kubebirdv1.Instance, ready bool, annotations map[string]string) *corev1.Pod {
+	status := corev1.ConditionTrue
+	if !ready {
+		status = corev1.ConditionFalse
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: firebirdPodName(instance), Namespace: instance.Namespace, Annotations: annotations},
+		Status:     corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}},
+	}
+}
+
+// TestReconcileS3RestoreWithoutExec covers the reconcileS3Restore paths
+// that never exec into the pod (the reconciler has no ClientSet, so an
+// exec attempt would panic): waiting for a missing or unready pod, and a
+// pod already annotated as restored with nothing pending, the steady state
+// of an Instance with or without databases.
+func TestReconcileS3RestoreWithoutExec(t *testing.T) {
+	instance := s3StreamingTestInstance(&kubebirdv1.S3BackupSpec{Bucket: testS3Bucket})
+	restored := map[string]string{s3RestoredAnnotationKey: "true"}
+	cases := []struct {
+		name    string
+		pod     *corev1.Pod
+		pending bool
+		waiting bool
+	}{
+		{"no pod", nil, false, true},
+		{"unready pod", s3RestoreTestPod(instance, false, nil), true, true},
+		{"restored, nothing pending", s3RestoreTestPod(instance, true, restored), false, false},
+	}
+	for _, c := range cases {
+		objs := []client.Object{instance}
+		if c.pod != nil {
+			objs = append(objs, c.pod)
+		}
+		cl := versionTestClient(t, objs...)
+		r := &InstanceReconciler{Client: cl, Scheme: cl.Scheme()}
+		err := r.reconcileS3Restore(context.Background(), instance, c.pending)
+		if _, isWaiting := errors.AsType[*waitingError](err); isWaiting != c.waiting || (!c.waiting && err != nil) {
+			t.Errorf("%s: reconcileS3Restore() = %v, want waiting %v", c.name, err, c.waiting)
+		}
+	}
+}
+
+// TestReconcileDatabasesS3StreamingSteadyState checks that an S3-only
+// Instance with nothing to create or drop, whose pod is already annotated
+// as restored, doesn't exec into the pod, whether or not it has databases.
+func TestReconcileDatabasesS3StreamingSteadyState(t *testing.T) {
+	for _, databases := range [][]kubebirdv1.DatabaseSpec{nil, {{Name: streamingTestDatabaseA}}} {
+		instance := s3StreamingTestInstance(&kubebirdv1.S3BackupSpec{Bucket: testS3Bucket})
+		instance.Spec.Databases = databases
+		instance.Status.Databases = nil
+		for _, db := range databases {
+			instance.Status.Databases = append(instance.Status.Databases, db.Name)
+		}
+		pod := s3RestoreTestPod(instance, true, map[string]string{s3RestoredAnnotationKey: "true"})
+		cl := versionTestClient(t, instance, pod)
+		r := &InstanceReconciler{Client: cl, Scheme: cl.Scheme()}
+		sts := &appsv1.StatefulSet{Status: appsv1.StatefulSetStatus{ReadyReplicas: 1}}
+		if err := r.reconcileDatabases(context.Background(), instance, sts); err != nil {
+			t.Errorf("with %d databases: reconcileDatabases() = %v", len(databases), err)
+		}
 	}
 }

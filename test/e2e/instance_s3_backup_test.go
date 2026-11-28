@@ -188,9 +188,16 @@ func waitForS3Instance() {
 // waitForS3InstanceNamed waits until instance has its s3DatabaseName
 // database and s3UserKey user, without a reconcile error.
 func waitForS3InstanceNamed(instance string) {
+	waitForS3InstanceDatabases(instance, s3DatabaseName)
+}
+
+// waitForS3InstanceDatabases waits until instance has databases (its
+// status.databases, space-separated) and its s3UserKey user, without a
+// reconcile error.
+func waitForS3InstanceDatabases(instance, databases string) {
 	Eventually(func(g Gomega) {
 		for path, want := range map[string]string{
-			"{.status.databases[*]}":  s3DatabaseName,
+			"{.status.databases[*]}":  databases,
 			"{.status.users[*].name}": s3UserKey,
 			"{.status.phase}":         "Ready",
 			"{.status.error}":         "",
@@ -390,6 +397,10 @@ const (
 	// s3RestoredMarker must match the operator's own (s3RestoredMarker in
 	// internal/controller).
 	s3RestoredMarker = "/var/lib/firebird/data/.kubebird-s3-restored"
+
+	// s3StreamingOtherDatabase is the database the streaming Instance is
+	// recreated with before s3DatabaseName is added back.
+	s3StreamingOtherDatabase = "other.fdb"
 )
 
 // s3StreamingLogs returns the logs of container in the streaming
@@ -415,13 +426,20 @@ func s3StreamingFileExists(file string) bool {
 // is ever created, a scheduled backup Job streams one snapshot per
 // database into the restic repository and forgets an expired one,
 // deleting the Instance streams the delete-time backup, and a recreated
-// Instance restores its database and users from the repository, then
-// doesn't restore again when its pod restarts.
+// Instance with another database restores the users from the repository;
+// adding the backed-up database back restarts the pod, which restores it,
+// and a later restart doesn't restore again.
 //
 // It must be called from inside the "Manager" Ordered Describe in
 // e2e_test.go, before that Describe's AfterAll tears down the manager.
 func instanceS3StreamingBackupSpecs() {
-	manifest := fmt.Sprintf(`
+	s3Database := fmt.Sprintf(`
+    - name: "%s"
+      owner: %s`, s3DatabaseName, s3UserKey)
+	lateDatabase := fmt.Sprintf(`
+    - name: "%s"`, s3StreamingOtherDatabase)
+	streamingManifest := func(databases string) string {
+		return fmt.Sprintf(`
 apiVersion: kubebird.github.io/v1
 kind: Instance
 metadata:
@@ -430,9 +448,7 @@ metadata:
 spec:
   image: firebirdsql/firebird
   version: %s
-  databases:
-    - name: "%s"
-      owner: %s
+  databases:%s
   storage:
     primary:
       size: 1Gi
@@ -449,8 +465,10 @@ spec:
             secretRef: %s
     retention:
       hour: "2h"
-`, s3StreamingInstanceName, namespace, firebirdVersion, s3DatabaseName, s3UserKey, s3UserKey, siloEndpoint, s3Bucket,
-		s3StreamingCredentials)
+`, s3StreamingInstanceName, namespace, firebirdVersion, databases, s3UserKey, siloEndpoint, s3Bucket,
+			s3StreamingCredentials)
+	}
+	manifest := streamingManifest(s3Database)
 	userSecret := s3StreamingInstanceName + "-user-s3user"
 	hourBackup := "/var/lib/firebird/backup/hour/" + strings.TrimSuffix(s3DatabaseName, ".fdb") + ".fbk"
 
@@ -569,7 +587,7 @@ spec:
 			))
 		})
 
-		It("should restore the database and the users from the repository, and only once", func() {
+		It("should restore a database added after the first restore, restarting the pod once", func() {
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pvc", s3StreamingInstanceName+"-primary", "-n", namespace,
 					"-o", "name", "--ignore-not-found")
@@ -578,9 +596,32 @@ spec:
 				g.Expect(output).To(BeEmpty())
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
-			By("re-applying the identical Instance CR")
-			applyS3Manifest(manifest)
-			waitForS3InstanceNamed(s3StreamingInstanceName)
+			By("re-applying the Instance CR with another database instead")
+			applyS3Manifest(streamingManifest(lateDatabase))
+			waitForS3InstanceDatabases(s3StreamingInstanceName, s3StreamingOtherDatabase)
+			Expect(s3StreamingLogs("backup-restore")).To(ContainSubstring("Restoring the backups from the S3 repository"))
+			cmd := exec.Command("kubectl", "get", "instance", s3StreamingInstanceName, "-n", namespace,
+				"-o", "jsonpath={.status.warning}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring(s3DatabaseName), "the backup of the database left out is orphaned")
+
+			By("deleting the restored backups and marking the primary volume restored")
+			Eventually(func(g Gomega) {
+				g.Expect(s3StreamingFileExists(s3RestoredMarker)).To(BeTrue())
+				g.Expect(s3StreamingFileExists("/var/lib/firebird/backup/base")).To(BeFalse())
+			}, time.Minute, 2*time.Second).Should(Succeed())
+			cmd = exec.Command("kubectl", "get", "pod", s3StreamingPodName, "-n", namespace, "-o", "jsonpath={.metadata.uid}")
+			firstUID, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("adding the backed-up database back, which restarts the pod to restore it from the repository")
+			applyS3Manifest(streamingManifest(lateDatabase + s3Database))
+			waitForS3InstanceDatabases(s3StreamingInstanceName, s3StreamingOtherDatabase+" "+s3DatabaseName)
+			cmd = exec.Command("kubectl", "get", "pod", s3StreamingPodName, "-n", namespace, "-o", "jsonpath={.metadata.uid}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).NotTo(Equal(firstUID), "the pod was restarted")
 			Expect(s3StreamingLogs("backup-restore")).To(ContainSubstring("Restoring the backups from the S3 repository"))
 
 			By("finding the marker row as the regular user, with its retained Secret's password")
@@ -592,14 +633,14 @@ spec:
 				g.Expect(output).To(ContainSubstring("42"))
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
-			By("deleting the restored backups and marking the primary volume restored")
+			By("deleting the restored backups and marking the primary volume restored again")
 			Eventually(func(g Gomega) {
 				g.Expect(s3StreamingFileExists(s3RestoredMarker)).To(BeTrue())
 				g.Expect(s3StreamingFileExists("/var/lib/firebird/backup/base")).To(BeFalse())
 			}, time.Minute, 2*time.Second).Should(Succeed())
 
 			By("not restoring again when the pod restarts")
-			cmd := exec.Command("kubectl", "delete", "pod", s3StreamingPodName, "-n", namespace, "--timeout=2m")
+			cmd = exec.Command("kubectl", "delete", "pod", s3StreamingPodName, "-n", namespace, "--timeout=2m")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Eventually(func(g Gomega) {
@@ -610,7 +651,7 @@ spec:
 				g.Expect(output).To(Equal("true"))
 			}, 3*time.Minute, 2*time.Second).Should(Succeed())
 			Expect(s3StreamingLogs("backup-restore")).To(ContainSubstring("already restored"))
-			output, err := s3LoginTo(s3StreamingInstanceName, s3UserKey, password, "SELECT ID FROM MARKER;")
+			output, err = s3LoginTo(s3StreamingInstanceName, s3UserKey, password, "SELECT ID FROM MARKER;")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(ContainSubstring("42"))
 		})

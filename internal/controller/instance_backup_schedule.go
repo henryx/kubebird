@@ -282,7 +282,7 @@ func (r *InstanceReconciler) reconcileScheduledBackupCronJob(ctx context.Context
 
 	if !exists && backupVolumeSpec(instance) != nil {
 		dir := scheduledBackupDir(freq.name)
-		if err := r.execInPod(ctx, instance.Namespace, firebirdPodName(instance), []string{"mkdir", "-p", dir}, ""); err != nil {
+		if err := r.execInPod(ctx, instance.Namespace, firebirdPodName(instance), []string{"mkdir", "-p", dir}); err != nil {
 			return fmt.Errorf("failed to create backup directory %q: %w", dir, err)
 		}
 	}

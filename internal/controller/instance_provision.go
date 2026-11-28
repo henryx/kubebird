@@ -104,6 +104,10 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 		}
 	}
 
+	if err := r.reconcileS3Restore(ctx, instance, len(pending) > 0); err != nil {
+		return err
+	}
+
 	if len(pending) == 0 && len(removed) == 0 {
 		return nil
 	}
@@ -168,7 +172,7 @@ func (r *InstanceReconciler) reconcileDatabases(ctx context.Context, instance *k
 	}
 
 	if len(pending) > 0 && s3Streaming(instance) {
-		if err := r.finishS3Restore(ctx, instance, podName); err != nil {
+		if err := r.finishS3RestoreOf(ctx, instance, podName); err != nil {
 			return err
 		}
 	}
@@ -460,16 +464,16 @@ fi
 		migrated, source, binIsql, flagUser, sysdbaUsername, fmt.Sprintf(securityMigrationScript, source))
 }
 
-// execInPod runs command inside the firebird container of podName,
-// piping stdin in as its stdin, and discards its stdout. Never put a
-// password in command: use execInPodWithSecrets instead.
-func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName string, command []string, stdin string) error {
-	_, err := r.execInPodOutput(ctx, namespace, podName, command, stdin)
+// execInPod runs command inside the firebird container of podName, with
+// no stdin, and discards its stdout. Never put a password in command: use
+// execInPodWithSecrets instead.
+func (r *InstanceReconciler) execInPod(ctx context.Context, namespace, podName string, command []string) error {
+	_, err := r.execInPodOutput(ctx, namespace, podName, command, "")
 	return err
 }
 
-// execInPodOutput behaves like execInPod, but returns the command's
-// stdout instead of discarding it.
+// execInPodOutput behaves like execInPod, but pipes stdin in as the
+// command's stdin and returns its stdout instead of discarding it.
 func (r *InstanceReconciler) execInPodOutput(ctx context.Context, namespace, podName string, command []string, stdin string) (string, error) {
 	req := r.ClientSet.CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -620,7 +624,7 @@ func (r *InstanceReconciler) orphanedBackupsWarning(ctx context.Context, instanc
 // exit code. Used both for a database's own file (see reconcileDatabases)
 // and for its backup file (see restoreDatabaseIfBackedUp).
 func (r *InstanceReconciler) databaseFileExists(ctx context.Context, namespace, podName, filePath string) (bool, error) {
-	err := r.execInPod(ctx, namespace, podName, []string{"test", "-f", filePath}, "")
+	err := r.execInPod(ctx, namespace, podName, []string{"test", "-f", filePath})
 	if err == nil {
 		return true, nil
 	}

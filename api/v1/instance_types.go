@@ -347,8 +347,9 @@ type BackupDestinationSpec struct {
 // or recreated Instance, or a major upgrade), the latest "base" snapshots
 // are restored into a temporary volume first, so the security database
 // and every database are restored from them; they're deleted once every
-// database has been restored. mode.type physical needs a local
-// destination.
+// database has been restored. A database added to spec.databases later on
+// restarts the pod, so that it's restored the same way. mode.type physical
+// needs a local destination.
 type S3BackupSpec struct {
 	// endpoint is the S3 endpoint, as host[:port] (HTTPS) or a full
 	// http:// or https:// URL. Defaults to AWS S3 (s3.amazonaws.com).

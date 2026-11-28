@@ -558,8 +558,8 @@ restores, a run's databases together.
   the major upgrade) waits, retrying, until it succeeds. If the bucket is unreachable for good, set
   `backup.backupOnDelete: false` to delete the `Instance` without that last backup.
 - **Restoring from S3.** Whenever the Firebird pod starts on a fresh primary volume, the backups are
-  restored through a temporary `emptyDir`, deleted once every database is restored; see "Restoring
-  an Instance" below. The node needs enough ephemeral storage for the backups meanwhile.
+  restored through a temporary `emptyDir`, deleted once every database is restored; a database added
+  later restarts the pod to restore it the same way. See "Restoring an Instance" below. The node needs enough ephemeral storage for the backups meanwhile.
 
 ### Restoring an Instance
 
@@ -618,7 +618,10 @@ The Firebird pod goes through three steps before it's `Ready`:
    is done, the restored copies in `base/` are deleted (they'd only take up the node's disk) and the
    marker above is written, so a later restart of the pod doesn't need the repository. A pod restarted
    before that restores again, so a database whose restore failed is restored on the next try rather
-   than created empty. A failed restore is reported in `status.error` and retried.
+   than created empty. A database added to `spec.databases` after that, with `s3` only, makes Kubebird
+   remove the marker and restart the pod, so step 1 fetches the backups again and it's restored if the
+   repository has a backup of it, as with a `local` destination. A failed restore is reported in
+   `status.error` and retried.
 
 Users and passwords follow the security database: users created directly in it come back with it,
 and every regular user in `authentication` is then applied again from its Secret, which survives the
@@ -638,7 +641,7 @@ by its `owner`, whoever owned it when it was backed up.
 | Recreated with a newer `spec.version` | Restored as usual: `gbak` restores backups of older versions, and the security database comes from the older version's backup (migrated from Firebird 3). This doubles as a major upgrade, though changing `spec.version` in place does the same without deleting the `Instance`. |
 | Recreated with an older major version | Not supported: a backup written by a newer major version can't be read by an older one. |
 | In-place major upgrade | The `Restoring` stage restores from the backups the `BackingUp` stage just took, the same way (see "Upgrading an Instance" above). |
-| Database added to a running `Instance` | Restored if a `base/<database>.fbk` backup is there (a `local` destination), created empty otherwise. With `s3` only, `base/` is gone once the first restore is done, so it's created empty even if the repository has a backup of it. |
+| Database added to a running `Instance` | Restored if there's a `base/<database>.fbk` backup of it, created empty otherwise. With `s3` only, `base/` is gone once the first restore is done, so Kubebird restarts the pod to fetch the repository's backups again first (even when it has none of that database); with a `local` destination, the pod keeps running. |
 | Backup PVC lost, with `local` and `s3` | The recreated `Instance` starts with an empty `base/`, so `backup-restore` fills it from the repository first. |
 | `s3` only | Every new or recreated `Instance` (and every major upgrade) checks the repository, since its primary PVC is always fresh. |
 | Another namespace or cluster | Only from S3: create the `Instance` there with the same repository password (`repository.secretRef`) and `prefix` pointing at the original repository. |

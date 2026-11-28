@@ -23,7 +23,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kubebirdv1 "github.com/henryx/kubebird/api/v1"
@@ -77,7 +79,8 @@ var streamingResticBin = path.Join(streamingResticBinDir, binRestic)
 // backup-restore initContainer doesn't restore from the repository again
 // on every later start of the pod (see resticBootstrapScript). A major
 // upgrade, deleting the Instance or losing the primary volume take it
-// away along with the primary volume, so the next start restores again.
+// away along with the primary volume, so the next start restores again;
+// so does adding a database (see reconcileS3Restore), which removes it.
 var s3RestoredMarker = path.Join(primaryDataMountPath, ".kubebird-s3-restored")
 
 // s3Streaming reports whether the instance streams its backups into an s3
@@ -222,21 +225,110 @@ func streamingBaseBackupScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3B
 	return b.String()
 }
 
-// finishS3Restore runs once reconcileDatabases has restored (or created)
-// every pending database without a local destination: it deletes the
-// "base" backups the backup-restore initContainer restored into the
-// emptyDir, which no longer serve any purpose but take up the node's
-// disk, and leaves s3RestoredMarker on the primary volume, so a later
-// start of the pod doesn't restore them again. Until then, a restarted
-// pod restores them again, so a database whose restore failed is still
-// restored rather than created empty. A database added to spec.databases
-// later on is then created empty, even if the repository has a backup of
-// it.
-func (r *InstanceReconciler) finishS3Restore(ctx context.Context, instance *kubebirdv1.Instance, podName string) error {
+// s3RestoredAnnotationKey marks the Firebird pod once finishS3Restore has
+// run for it, so a steady-state reconcile doesn't exec into the pod to
+// leave s3RestoredMarker again. A pod recreated by the StatefulSet
+// controller comes back without it, so finishS3Restore runs once per pod.
+const s3RestoredAnnotationKey = "kubebird.github.io/s3-restored"
+
+// reconcileS3Restore runs, only without a local destination, before
+// reconcileDatabases creates or restores any database. The backup-restore
+// initContainer only restores the "base" snapshots into the emptyDir when
+// the primary volume lacks s3RestoredMarker (see resticBootstrapScript).
+//
+// With no pending database, there's nothing left to restore (the security
+// database was checked by security-database-init when the pod started), so
+// it leaves the marker through finishS3Restore, once per pod: an Instance
+// with no databases doesn't restore again on every start.
+//
+// With a pending database, it checks the marker: when it's missing, the
+// pod's start restored the base snapshots and reconcileDatabases can
+// restore from them. When it's there, a database was added after the
+// first restore and the base snapshots are gone, while the Firebird
+// container has no restic or S3 credentials to fetch them: so it removes
+// the marker and deletes the pod, whose next start restores them again,
+// then reports that it's waiting. That's a restart for every database
+// added later, even one the repository has no backup of.
+func (r *InstanceReconciler) reconcileS3Restore(ctx context.Context, instance *kubebirdv1.Instance, pending bool) error {
+	if !s3Streaming(instance) {
+		return nil
+	}
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: firebirdPodName(instance)}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return waiting("Waiting for the Firebird pod to start")
+		}
+		return fmt.Errorf("failed to get Firebird pod: %w", err)
+	}
+	if pod.DeletionTimestamp != nil || !podReady(pod) {
+		return waiting("Waiting for the Firebird pod to be ready")
+	}
+
+	if !pending {
+		if pod.Annotations[s3RestoredAnnotationKey] != "" {
+			return nil
+		}
+		return r.finishS3Restore(ctx, instance, pod)
+	}
+
+	restored, err := r.databaseFileExists(ctx, instance.Namespace, pod.Name, s3RestoredMarker)
+	if err != nil {
+		return fmt.Errorf("failed to check for %s: %w", s3RestoredMarker, err)
+	}
+	if !restored {
+		return nil
+	}
+	if err := r.execInPod(ctx, instance.Namespace, pod.Name, []string{"rm", "-f", s3RestoredMarker}); err != nil {
+		return fmt.Errorf("failed to remove %s: %w", s3RestoredMarker, err)
+	}
+	if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("failed to restart the Firebird pod: %w", err)
+	}
+	logf.FromContext(ctx).Info("Restarted the Firebird pod to restore new databases from the S3 repository", "pod", pod.Name)
+	return waiting("Restarting the Firebird pod to restore new databases from the S3 repository")
+}
+
+// podReady reports whether pod's Ready condition is true.
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// finishS3RestoreOf runs finishS3Restore on the pod named podName.
+func (r *InstanceReconciler) finishS3RestoreOf(ctx context.Context, instance *kubebirdv1.Instance, podName string) error {
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: podName}, pod); err != nil {
+		return fmt.Errorf("failed to get Firebird pod: %w", err)
+	}
+	return r.finishS3Restore(ctx, instance, pod)
+}
+
+// finishS3Restore runs once every pending database has been restored (or
+// created) without a local destination, or right away when none is
+// pending: it deletes the "base" backups the backup-restore initContainer
+// restored into the emptyDir, which no longer serve any purpose but take
+// up the node's disk, leaves s3RestoredMarker on the primary volume, so a
+// later start of the pod doesn't restore them again, and annotates the pod
+// with s3RestoredAnnotationKey. Until then, a restarted pod restores them
+// again, so a database whose restore failed is still restored rather than
+// created empty.
+func (r *InstanceReconciler) finishS3Restore(ctx context.Context, instance *kubebirdv1.Instance, pod *corev1.Pod) error {
 	script := fmt.Sprintf("rm -rf %q && touch %q", instanceBackupDir(), s3RestoredMarker)
-	if err := r.execInPod(ctx, instance.Namespace, podName, []string{"sh", "-c", script}, ""); err != nil {
+	if err := r.execInPod(ctx, instance.Namespace, pod.Name, []string{"sh", "-c", script}); err != nil {
 		return fmt.Errorf("failed to clean up the backups restored from the S3 repository: %w", err)
 	}
-	logf.FromContext(ctx).Info("Finished restoring from the S3 repository")
+	patch := client.MergeFrom(pod.DeepCopy())
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[s3RestoredAnnotationKey] = "true"
+	if err := r.Patch(ctx, pod, patch); err != nil {
+		return fmt.Errorf("failed to annotate the Firebird pod as restored: %w", err)
+	}
+	logf.FromContext(ctx).Info("Finished restoring from the S3 repository", "pod", pod.Name)
 	return nil
 }
