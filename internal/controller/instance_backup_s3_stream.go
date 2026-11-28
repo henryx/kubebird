@@ -217,8 +217,9 @@ func streamingBaseBackupScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3B
 		gbakArgs := fmt.Sprintf("-backup %q %s", path.Join(primaryDataMountPath, name), streamingGbakStdout)
 		b.WriteString(streamingBackupCommand(instance, s3, resticBaseTag, version, path.Join(instanceBackupDir(), backupFileName(name)), gbakArgs))
 	}
-	gbakArgs := fmt.Sprintf("-backup %q %s", path.Join(primaryDataMountPath, securityDatabaseFileNameForVersion(version)), streamingGbakStdout)
-	b.WriteString(streamingBackupCommand(instance, s3, resticBaseTag, version, securityDatabaseBackupPathForVersion(version), gbakArgs))
+	src := path.Join(primaryDataMountPath, securityDatabaseFileNameForVersion(version))
+	b.WriteString(ifSecurityDatabaseExists(src, streamingBackupCommand(instance, s3, resticBaseTag, version,
+		securityDatabaseBackupPathForVersion(version), fmt.Sprintf("-backup %q %s", src, streamingGbakStdout))))
 	b.WriteString("echo \"Uploaded the backup to the S3 repository\"\n")
 	return b.String()
 }

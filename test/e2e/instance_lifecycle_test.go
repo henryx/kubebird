@@ -147,17 +147,17 @@ spec:
 			}).Should(Succeed())
 
 			By("creating PVCs named <instance>-primary, <instance>-backup and <instance>-shadow")
-			cmd = exec.Command("kubectl", "get", "pvc", instancePrimaryPVCName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			cmd = exec.Command("kubectl", "get", "pvc", instanceBackupPVCName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			cmd = exec.Command("kubectl", "get", "pvc", instanceShadowPVCName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			// Reconciled right after the ConfigMap and the Service, so not
+			// necessarily there yet.
+			Eventually(func(g Gomega) {
+				for _, pvc := range []string{instancePrimaryPVCName, instanceBackupPVCName, instanceShadowPVCName} {
+					cmd := exec.Command("kubectl", "get", "pvc", pvc, "-n", namespace)
+					_, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred(), pvc)
+				}
+			}).Should(Succeed())
 
-			By("exposing the instance on a ClusterIP Service")
+			By("exposing the instance on a ClusterIP Service, reconciled before the PVCs")
 			cmd = exec.Command("kubectl", "get", "service", instanceName, "-n", namespace,
 				"-o", "jsonpath={.spec.ports[0].port}")
 			output, err := utils.Run(cmd)

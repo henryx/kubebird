@@ -171,6 +171,7 @@ func TestStreamingBaseBackupScript(t *testing.T) {
 	script := streamingBaseBackupScript(instance, s3, testVersion)
 
 	r := newResticScriptRun(t)
+	writeSecurityDatabase(t, r)
 	calls, out, ok := r.run(script, stubInitExists)
 	if !ok || !strings.Contains(out, "Uploaded the backup") {
 		t.Fatalf("script failed:\n%s", out)
@@ -192,9 +193,32 @@ func TestStreamingBaseBackupScript(t *testing.T) {
 
 	// Not best effort: the snapshots are the only copy left.
 	for name, env := range map[string]string{"repository": stubInitDenied, "upload": "STUB_BACKUP_FAIL=1", "gbak": "STUB_GBAK_FAIL=1"} {
-		if _, out, ok := newResticScriptRun(t).run(script, stubInitExists, env); ok {
+		failed := newResticScriptRun(t)
+		writeSecurityDatabase(t, failed)
+		if _, out, ok := failed.run(script, stubInitExists, env); ok {
 			t.Errorf("failed %s: script succeeded:\n%s", name, out)
 		}
+	}
+
+	// Deleted before the Firebird pod ever started: no security database
+	// to back up, and nothing in status.databases either.
+	instance.Status.Databases = nil
+	r = newResticScriptRun(t)
+	calls, out, ok = r.run(streamingBaseBackupScript(instance, s3, testVersion), stubInitExists)
+	if !ok || !strings.Contains(out, "No security database") {
+		t.Fatalf("without a security database, script failed or didn't say so:\n%s", out)
+	}
+	if strings.Join(calls, "\n") != resticInitCall {
+		t.Errorf("without a security database, calls = %v, want only init", calls)
+	}
+}
+
+// writeSecurityDatabase creates an empty testVersion security database
+// file on r's primary volume.
+func writeSecurityDatabase(t *testing.T, r *resticScriptRun) {
+	t.Helper()
+	if err := os.WriteFile(path.Join(r.path(primaryDataMountPath), securityDatabaseFileNameForVersion(testVersion)), nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

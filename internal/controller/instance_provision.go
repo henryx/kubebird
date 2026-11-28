@@ -725,9 +725,25 @@ func databaseBackupScript(instance *kubebirdv1.Instance, version string) string 
 		dst := path.Join(instanceBackupDir(), backupFileName(name))
 		fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak, src, dst)
 	}
-	fmt.Fprintf(&b, "%s -backup -verify %q %q\n", binGbak,
-		path.Join(primaryDataMountPath, securityDatabaseFileNameForVersion(version)), securityDatabaseBackupPathForVersion(version))
+	src := path.Join(primaryDataMountPath, securityDatabaseFileNameForVersion(version))
+	b.WriteString(ifSecurityDatabaseExists(src,
+		fmt.Sprintf("%s -backup -verify %q %q\n", binGbak, src, securityDatabaseBackupPathForVersion(version))))
 	return b.String()
+}
+
+// ifSecurityDatabaseExists wraps command, the backup of the security
+// database at src, so it only runs when src exists. It doesn't when the
+// Instance is deleted before its Firebird pod ever started, since
+// security-database-init never seeded it: gbak would then fail on every
+// retry of the backup Pod, and the deletion would never finish. There's
+// nothing to back up then, and an older backup of it in the base
+// directory is left as it is.
+func ifSecurityDatabaseExists(src, command string) string {
+	return fmt.Sprintf(`if [ -f %[1]q ]; then
+%[2]selse
+	echo "No security database at %[1]s to back up: the Firebird pod never started"
+fi
+`, src, command)
 }
 
 // backupDatabasesOffline gbak-backs-up every database in
