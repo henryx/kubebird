@@ -526,7 +526,7 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 		// repository when it's due, before security-database-init looks
 		// for a security database backup in it (see
 		// resticBootstrapScript).
-		restore := resticContainer(instance, s3, backupRestoreInitContainerName, resticBootstrapScript(instance, s3), true, false)
+		restore := resticContainer(instance, s3, backupRestoreInitContainerName, resticBootstrapScript(instance, s3), true)
 		if s3Streaming(instance) {
 			// To find s3RestoredMarker.
 			restore.VolumeMounts = append(restore.VolumeMounts,
@@ -562,7 +562,7 @@ func (r *InstanceReconciler) mutateStatefulSet(ctx context.Context, sts *appsv1.
 		})
 	}
 	if s3 := s3Destination(instance); s3 != nil {
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, resticPasswordVolume(instance, s3, false))
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, resticPasswordVolume(instance, s3))
 	}
 
 	return controllerutil.SetControllerReference(instance, sts, r.Scheme)

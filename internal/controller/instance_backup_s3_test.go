@@ -160,24 +160,22 @@ func TestResticDuration(t *testing.T) {
 func TestResticEnv(t *testing.T) {
 	s3 := &kubebirdv1.S3BackupSpec{Bucket: testS3Bucket}
 	instance := s3TestInstance(s3)
-	if env := resticEnv(instance, s3, false); len(env) != 1 || env[0].Name != "RESTIC_REPOSITORY" {
+	if env := resticEnv(instance, s3); len(env) != 1 || env[0].Name != "RESTIC_REPOSITORY" {
 		t.Errorf("resticEnv() without credentials = %v, want only RESTIC_REPOSITORY (ambient credentials)", env)
 	}
 
 	s3.Credentials.SecretRef = testS3Credentials
-	for _, optional := range []bool{false, true} {
-		env := resticEnv(instance, s3, optional)
-		keys := map[string]bool{}
-		for _, e := range env[1:] {
-			ref := e.ValueFrom.SecretKeyRef
-			if ref.Name != testS3Credentials || ref.Key != e.Name || *ref.Optional != optional {
-				t.Errorf("env %s = %+v, want key %s of %s, optional %v", e.Name, ref, e.Name, testS3Credentials, optional)
-			}
-			keys[e.Name] = true
+	env := resticEnv(instance, s3)
+	keys := map[string]bool{}
+	for _, e := range env[1:] {
+		ref := e.ValueFrom.SecretKeyRef
+		if ref.Name != testS3Credentials || ref.Key != e.Name || *ref.Optional {
+			t.Errorf("env %s = %+v, want key %s of %s, not optional", e.Name, ref, e.Name, testS3Credentials)
 		}
-		if !keys[s3AccessKeyIDKey] || !keys[s3SecretAccessKeyKey] {
-			t.Errorf("resticEnv() = %v, want both AWS keys", env)
-		}
+		keys[e.Name] = true
+	}
+	if !keys[s3AccessKeyIDKey] || !keys[s3SecretAccessKeyKey] {
+		t.Errorf("resticEnv() = %v, want both AWS keys", env)
 	}
 }
 
@@ -287,7 +285,8 @@ func TestMutateScheduledBackupCronJobS3(t *testing.T) {
 }
 
 // TestCreateDatabaseBackupPodS3 checks the delete-time backup Pod runs gbak
-// as an initContainer, then the best effort upload, its Secrets optional.
+// as an initContainer, then the upload, which fails the Pod when it fails,
+// its Secrets not optional.
 func TestCreateDatabaseBackupPodS3(t *testing.T) {
 	s3 := &kubebirdv1.S3BackupSpec{Bucket: testS3Bucket, Credentials: kubebirdv1.S3CredentialsSpec{SecretRef: testS3Credentials}}
 	instance := s3TestInstance(s3)
@@ -307,16 +306,17 @@ func TestCreateDatabaseBackupPodS3(t *testing.T) {
 		t.Fatalf("containers = %v, want upload", n)
 	}
 	upload := pod.Spec.Containers[0]
-	if !strings.Contains(upload.Command[2], "exit 0") || !strings.Contains(upload.Command[2], `--tag "base"`) {
-		t.Errorf("upload script isn't a best effort upload of base:\n%s", upload.Command[2])
+	if strings.Contains(upload.Command[2], "exit 0") || strings.Contains(upload.Command[2], "timeout") ||
+		!strings.Contains(upload.Command[2], `--tag "base"`) {
+		t.Errorf("upload script isn't a failing upload of base:\n%s", upload.Command[2])
 	}
 	for _, e := range upload.Env[1:] {
-		if !*e.ValueFrom.SecretKeyRef.Optional {
-			t.Errorf("env %s isn't optional", e.Name)
+		if *e.ValueFrom.SecretKeyRef.Optional {
+			t.Errorf("env %s is optional", e.Name)
 		}
 	}
-	if vol := resticVolume(pod.Spec.Volumes); vol == nil || !*vol.Secret.Optional {
-		t.Errorf("restic password volume = %+v, want an optional one", vol)
+	if vol := resticVolume(pod.Spec.Volumes); vol == nil || *vol.Secret.Optional {
+		t.Errorf("restic password volume = %+v, want a required one", vol)
 	}
 }
 

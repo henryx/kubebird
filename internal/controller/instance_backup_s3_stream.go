@@ -117,9 +117,7 @@ func backupVolume(instance *kubebirdv1.Instance) corev1.Volume {
 // addStreamingRestic sets podSpec up for container, one of its containers
 // running the Firebird image, to stream backups with streamingResticBin:
 // an initContainer copying restic's binary into the emptyDir both mount,
-// plus the repository's environment and password. Unlike the best effort
-// upload next to a local destination, nothing here is optional: without a
-// local destination, a backup that can't be uploaded isn't kept anywhere.
+// plus the repository's environment and password.
 func addStreamingRestic(podSpec *corev1.PodSpec, container *corev1.Container, instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) {
 	bin := corev1.VolumeMount{Name: streamingResticBinVolumeName, MountPath: streamingResticBinDir}
 	podSpec.InitContainers = append(podSpec.InitContainers, corev1.Container{
@@ -134,9 +132,9 @@ func addStreamingRestic(podSpec *corev1.PodSpec, container *corev1.Container, in
 	})
 	podSpec.Volumes = append(podSpec.Volumes,
 		corev1.Volume{Name: streamingResticBinVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		resticPasswordVolume(instance, s3, false),
+		resticPasswordVolume(instance, s3),
 	)
-	container.Env = append(container.Env, resticEnv(instance, s3, false)...)
+	container.Env = append(container.Env, resticEnv(instance, s3)...)
 	container.VolumeMounts = append(container.VolumeMounts,
 		corev1.VolumeMount{Name: streamingResticBinVolumeName, MountPath: streamingResticBinDir, ReadOnly: true},
 		corev1.VolumeMount{Name: resticPasswordVolumeName, MountPath: resticPasswordMountPath, ReadOnly: true},
@@ -206,7 +204,7 @@ func streamingScheduledBackupScript(instance *kubebirdv1.Instance, s3 *kubebirdv
 // gbak backups, of every database in status.databases and then the
 // security database, with the server stopped, each streamed into a "base"
 // snapshot of the file databaseBackupScript would have written. Not best
-// effort, unlike resticBaseUploadScript: the primary volume is released
+// effort, like resticBaseUploadScript: the primary volume is released
 // right after, so these snapshots are the only copy left, and any failure
 // fails the Pod, which backupDatabasesOffline then retries. version is as
 // for databaseBackupScript.

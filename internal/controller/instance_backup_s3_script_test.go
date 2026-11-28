@@ -212,11 +212,12 @@ func TestResticBaseUploadScript(t *testing.T) {
 		t.Errorf("calls = %v, want init then %q", calls, want)
 	}
 
-	// Best effort: a failure is only reported.
+	// Not best effort: a failure fails the script, so the Pod fails and
+	// is retried.
 	for name, env := range map[string]string{"repository": stubInitDenied, "backup": "STUB_BACKUP_FAIL=1"} {
 		_, out, ok := newResticScriptRun(t).run(script, stubInitExists, env)
-		if !ok || !strings.Contains(out, "Warning: failed to upload") {
-			t.Errorf("failed %s: script failed or didn't warn:\n%s", name, out)
+		if ok || strings.Contains(out, "Uploaded the backup") {
+			t.Errorf("failed %s: script succeeded:\n%s", name, out)
 		}
 	}
 }

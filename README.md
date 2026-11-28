@@ -519,10 +519,12 @@ e.g. `firebird:4.0.3`: the version the running server reports (`status.firebirdV
   to twice the retention; in exchange, a lost or emptied backup volume doesn't take the S3 copies with
   it. A failed upload fails the Job like a failed backup.
 - **Delete-time and upgrade backups.** The `gbak` backup Pod's `upload` container takes a snapshot of
-  `base/`, tagged `base`, which is never forgotten. This upload is best effort: if it fails (or takes
-  longer than 30 minutes, e.g. because the endpoint is unreachable and restic keeps retrying), the
-  failure is only logged and the deletion or upgrade carries on, since the backup is safe on the
-  backup volume, which is never deleted.
+  `base/`, tagged `base`, which is never forgotten. A failed upload fails the Pod, which Kubebird
+  recreates, running the `gbak` backup and the upload again, so the deletion (or the major upgrade)
+  waits until the upload succeeds, even though the backup is already safe on the backup volume. If
+  the bucket is unreachable for good, set `backup.backupOnDelete: false` to delete the `Instance`
+  without that last backup, or remove the `s3` entry (the only way past a stuck major upgrade, whose
+  backup doesn't depend on `backupOnDelete`).
 - **Restoring from S3.** The Firebird pod gets a `backup-restore` init container, which restores the
   repository's backups into an empty `base/` directory, e.g. after the backup PVC was lost; see
   "Restoring an Instance" below. Scheduled backups aren't restored automatically.
@@ -554,8 +556,8 @@ restores, a run's databases together.
   requires a `local` entry for it.
 - **Delete-time and upgrade backups.** The backup Pod streams every database and the security
   database into `base` snapshots. The primary volume is deleted right after, so these snapshots are
-  the only copy: unlike next to a `local` entry, the upload isn't best effort, and the deletion (or
-  the major upgrade) waits, retrying, until it succeeds. If the bucket is unreachable for good, set
+  the only copy, and the deletion (or the major upgrade) waits, retrying, until the upload succeeds,
+  as next to a `local` entry. If the bucket is unreachable for good, set
   `backup.backupOnDelete: false` to delete the `Instance` without that last backup.
 - **Restoring from S3.** Whenever the Firebird pod starts on a fresh primary volume, the backups are
   restored through a temporary `emptyDir`, deleted once every database is restored; a database added

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"path"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -86,12 +85,6 @@ const (
 	// exclusive repository lock (a forget --prune of another frequency)
 	// instead of failing.
 	resticLockWait = "1h"
-
-	// resticBaseUploadTimeout bounds resticBaseUploadScript: restic retries
-	// an unreachable endpoint, bad credentials or a missing bucket for
-	// about 15 minutes per request, and the delete-time upload must not
-	// keep the Instance's deletion waiting much longer than that.
-	resticBaseUploadTimeout = 30 * time.Minute
 )
 
 // resticPasswordFile is where the repository password is mounted.
@@ -187,10 +180,10 @@ func resticCommandFor(bin string, s3 *kubebirdv1.S3BackupSpec) string {
 // resticEnv returns the restic containers' environment: the repository
 // and, when credentials.secretRef is set, the S3 credentials from it.
 // Without it, restic falls back to the pod's ambient credentials (IAM
-// roles for service accounts and the like). optional makes the
-// credentials Secret's keys optional, for the delete-time backup Pod,
-// whose upload is best effort and so must never keep it from starting.
-func resticEnv(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, optional bool) []corev1.EnvVar {
+// roles for service accounts and the like). The Secret's keys aren't
+// optional: every upload must succeed, so a missing Secret keeps the
+// container from starting rather than running without credentials.
+func resticEnv(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) []corev1.EnvVar {
 	env := []corev1.EnvVar{{Name: "RESTIC_REPOSITORY", Value: resticRepository(instance, s3)}}
 	if s3.Credentials.SecretRef == "" {
 		return env
@@ -202,7 +195,7 @@ func resticEnv(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, optio
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: s3.Credentials.SecretRef},
 					Key:                  key,
-					Optional:             ptr.To(optional),
+					Optional:             ptr.To(false),
 				},
 			},
 		})
@@ -211,8 +204,8 @@ func resticEnv(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, optio
 }
 
 // resticPasswordVolume returns the volume mounting the repository password
-// Secret (see resticPasswordFile). optional is as for resticEnv.
-func resticPasswordVolume(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, optional bool) corev1.Volume {
+// Secret (see resticPasswordFile), not optional either (see resticEnv).
+func resticPasswordVolume(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec) corev1.Volume {
 	return corev1.Volume{
 		Name: resticPasswordVolumeName,
 		VolumeSource: corev1.VolumeSource{
@@ -220,7 +213,7 @@ func resticPasswordVolume(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3Backup
 				SecretName:  resticSecretName(instance, s3),
 				Items:       []corev1.KeyToPath{{Key: resticPasswordKey, Path: resticPasswordKey}},
 				DefaultMode: ptr.To(int32(0o400)),
-				Optional:    ptr.To(optional),
+				Optional:    ptr.To(false),
 			},
 		},
 	}
@@ -229,7 +222,7 @@ func resticPasswordVolume(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3Backup
 // resticContainer returns a restic container running script, with the
 // backup volume mounted at backupDataMountPath (read-only unless
 // writable) and the repository password at resticPasswordMountPath.
-func resticContainer(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, name, script string, writable, optional bool) corev1.Container {
+func resticContainer(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, name, script string, writable bool) corev1.Container {
 	return corev1.Container{
 		Name:  name,
 		Image: resticImage(s3),
@@ -238,7 +231,7 @@ func resticContainer(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec,
 			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
 		Command: []string{"sh", "-c", script},
-		Env:     resticEnv(instance, s3, optional),
+		Env:     resticEnv(instance, s3),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: backupVolumeName, MountPath: backupDataMountPath, ReadOnly: !writable},
 			{Name: resticPasswordVolumeName, MountPath: resticPasswordMountPath, ReadOnly: true},
@@ -319,23 +312,20 @@ func firebirdVersionTag(instance *kubebirdv1.Instance, version string) string {
 // resticBaseUploadScript renders the delete-time backup Pod's upload
 // container script: a snapshot of the base directory, tagged
 // resticBaseTag, never forgotten, so the security database backups of
-// older Firebird versions stay in it too. Best effort: the backup itself
-// already sits on the backup volume, which deleting the Instance always
-// keeps, so a failed or timed out (resticBaseUploadTimeout) upload is only
-// logged, and the Pod still succeeds rather than holding up the deletion
-// or a major version upgrade. version is the Firebird version the backup
-// was taken with (see firebirdVersionTag).
+// older Firebird versions stay in it too. Not best effort (user
+// decision), like streamingBaseBackupScript: a failed upload fails the
+// Pod, which backupDatabasesOffline deletes and recreates, so the
+// deletion, or a major upgrade's BackingUp stage, waits until the upload
+// succeeds, even though the backup is safe on the backup volume; each
+// retry runs gbak again too, since the same Pod does both. Setting
+// backupOnDelete to false, or removing the s3 entry, gets a deletion
+// past it. version is the Firebird version the backup was taken with (see
+// firebirdVersionTag).
 func resticBaseUploadScript(instance *kubebirdv1.Instance, s3 *kubebirdv1.S3BackupSpec, version string) string {
-	upload := "set -e\n" + resticEnsureRepositoryScript(resticCommand(s3)) +
+	return "set -e\n" + resticEnsureRepositoryScript(resticCommand(s3)) +
 		fmt.Sprintf("%s backup --retry-lock %s --host %q --tag %q --tag %q %q\n",
-			resticCommand(s3), resticLockWait, instance.Name, resticBaseTag, firebirdVersionTag(instance, version), instanceBackupDir())
-	return fmt.Sprintf(`if timeout %d sh -c %s; then
-	echo "Uploaded the backup to the S3 repository"
-else
-	echo "Warning: failed to upload the backup to the S3 repository; it is still on the backup volume" >&2
-fi
-exit 0
-`, int(resticBaseUploadTimeout.Seconds()), shellQuote(upload))
+			resticCommand(s3), resticLockWait, instance.Name, resticBaseTag, firebirdVersionTag(instance, version), instanceBackupDir()) +
+		`echo "Uploaded the backup to the S3 repository"` + "\n"
 }
 
 // resticBootstrapScript renders the StatefulSet's backup-restore

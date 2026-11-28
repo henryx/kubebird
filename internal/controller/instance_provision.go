@@ -867,14 +867,14 @@ func (r *InstanceReconciler) createDatabaseBackupPod(ctx context.Context, instan
 		addStreamingRestic(&pod.Spec, container, instance, s3)
 	case s3 != nil:
 		// gbak runs first, as an initContainer, then restic copies the
-		// base directory to the S3 repository, best effort (see
-		// resticBaseUploadScript): its Secrets are optional too, so a
-		// missing one can't keep the Pod from starting either.
+		// base directory to the S3 repository; a failed upload fails the
+		// Pod, which backupDatabasesOffline retries (see
+		// resticBaseUploadScript).
 		pod.Spec.InitContainers = []corev1.Container{backup}
 		pod.Spec.Containers = []corev1.Container{
-			resticContainer(instance, s3, uploadContainerName, resticBaseUploadScript(instance, s3, version), false, true),
+			resticContainer(instance, s3, uploadContainerName, resticBaseUploadScript(instance, s3, version), false),
 		}
-		pod.Spec.Volumes = append(pod.Spec.Volumes, resticPasswordVolume(instance, s3, true))
+		pod.Spec.Volumes = append(pod.Spec.Volumes, resticPasswordVolume(instance, s3))
 	}
 	if err := controllerutil.SetControllerReference(instance, pod, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set owner reference on database backup Pod: %w", err)

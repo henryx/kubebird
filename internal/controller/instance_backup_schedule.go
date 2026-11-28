@@ -377,9 +377,9 @@ func (r *InstanceReconciler) mutateScheduledBackupCronJob(cronJob *batchv1.CronJ
 		podSpec.InitContainers = []corev1.Container{backup}
 		podSpec.Containers = []corev1.Container{
 			resticContainer(instance, s3, uploadContainerName,
-				resticUploadScript(instance, s3, freq.name, frequencyRetention(instance, freq)), false, false),
+				resticUploadScript(instance, s3, freq.name, frequencyRetention(instance, freq)), false),
 		}
-		podSpec.Volumes = append(podSpec.Volumes, resticPasswordVolume(instance, s3, false))
+		podSpec.Volumes = append(podSpec.Volumes, resticPasswordVolume(instance, s3))
 	}
 
 	cronJob.Labels = withFirebirdVersionLabel(instance, labelsForInstance(instance.Name))
