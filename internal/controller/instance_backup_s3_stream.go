@@ -141,15 +141,19 @@ func addStreamingRestic(podSpec *corev1.PodSpec, container *corev1.Container, in
 }
 
 // resticRunTagPrefix prefixes the tag every snapshot of a streaming run
-// shares, e.g. "run:20261128T000000Z" (the run's UTC start time, in the
-// scheduledBackupTimestampDate format): each holds a single database, so
-// the tag is what lists, or restores, a run's databases together.
+// shares, e.g. "run:20261128T000000Z-a1b2c3": the run's UTC start time, in
+// the scheduledBackupTimestampDate format, and 6 random hex digits, since
+// two runs of the same frequency can start within the same second (a Job
+// created from the CronJob by hand next to a scheduled one) and would
+// otherwise share it. Each snapshot holds a single database, so the tag is
+// what lists, or restores, a run's databases together.
 const resticRunTagPrefix = "run:"
 
 // streamingRunScript renders the shell line setting $RUN to the run's
-// start time, for its snapshots' run tag (see streamingBackupCommand).
+// identifier, for its snapshots' run tag (see resticRunTagPrefix and
+// streamingBackupCommand).
 func streamingRunScript() string {
-	return fmt.Sprintf("RUN=$(date -u %s)\n", scheduledBackupTimestampDate)
+	return fmt.Sprintf("RUN=$(date -u %s)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \\n')\n", scheduledBackupTimestampDate)
 }
 
 // streamingBackupCommand renders the restic call streaming gbakArgs' backup

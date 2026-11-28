@@ -63,6 +63,28 @@ const (
 // matching backupFrequencies in internal/controller.
 var concurrentBackupFrequencies = []string{"hour", "day", "week", "month", "year"}
 
+// createDetachedJob creates a Job from cronJob's template, the same way
+// "kubectl create job --from=cronjob/..." does, but without the owner
+// reference that command adds: an owned Job counts towards the CronJob's
+// SuccessfulJobsHistoryLimit (1), so the CronJob controller would delete
+// all but the latest finished one before they could all be checked.
+func createDetachedJob(job, cronJob string) {
+	cmd := exec.Command("kubectl", "create", "job", job, "--from=cronjob/"+cronJob,
+		"-n", namespace, "--dry-run=client", "-o", "json")
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+	var manifest map[string]any
+	Expect(json.Unmarshal([]byte(output), &manifest)).To(Succeed())
+	delete(manifest["metadata"].(map[string]any), "ownerReferences")
+	detached, err := json.Marshal(manifest)
+	Expect(err).NotTo(HaveOccurred())
+
+	cmd = exec.Command("kubectl", "create", "-f", "-")
+	cmd.Stdin = strings.NewReader(string(detached))
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+}
+
 // instanceScheduledBackupConcurrencySpecs exercises spec.backup.retention's
 // scheduled backups running at the same moment — e.g. the hourly and
 // daily CronJobs both firing at 00:00 UTC, or all five on January 1st.
@@ -134,29 +156,6 @@ spec:
 		output, err := podExec(fmt.Sprintf("ls -1 %s/%s", concurrentBackupRoot, frequency))
 		Expect(err).NotTo(HaveOccurred())
 		return strings.Fields(output)
-	}
-
-	// createJobFromCronJob creates a Job from cronJob's template, the same
-	// way "kubectl create job --from=cronjob/..." does, but without the
-	// owner reference that command adds: an owned Job counts towards the
-	// CronJob's SuccessfulJobsHistoryLimit (1), so the CronJob controller
-	// would delete all but the latest finished one before they could all
-	// be checked.
-	createJobFromCronJob := func(job, cronJob string) {
-		cmd := exec.Command("kubectl", "create", "job", job, "--from=cronjob/"+cronJob,
-			"-n", namespace, "--dry-run=client", "-o", "json")
-		output, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-		var manifest map[string]any
-		Expect(json.Unmarshal([]byte(output), &manifest)).To(Succeed())
-		delete(manifest["metadata"].(map[string]any), "ownerReferences")
-		detached, err := json.Marshal(manifest)
-		Expect(err).NotTo(HaveOccurred())
-
-		cmd = exec.Command("kubectl", "create", "-f", "-")
-		cmd.Stdin = strings.NewReader(string(detached))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
 	}
 
 	jobField := func(job, jsonpath string) string {
@@ -248,7 +247,7 @@ echo $! > %[1]s`, concurrentBackupWriterPIDFile, password, concurrentBackupDBCon
 			for _, job := range jobs {
 				// Job names are "<instance>-concurrent-<frequency>[-<n>]".
 				freq := strings.SplitN(strings.TrimPrefix(job, concurrentBackupInstanceName+"-concurrent-"), "-", 2)[0]
-				createJobFromCronJob(job, concurrentBackupInstanceName+"-backup-"+freq)
+				createDetachedJob(job, concurrentBackupInstanceName+"-backup-"+freq)
 			}
 
 			By("waiting for every Job to succeed")

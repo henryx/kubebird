@@ -534,7 +534,7 @@ spec:
 			Expect(snapshots[0].Time).NotTo(HavePrefix("2000-"))
 			Expect(snapshots[0].Paths).To(Equal([]string{hourBackup}))
 			Expect(snapshots[0].Tags).To(ContainElements("hour", "firebird:"+firebirdVersion))
-			Expect(snapshots[0].Tags).To(ContainElement(MatchRegexp(`^run:[0-9]{8}T[0-9]{6}Z$`)))
+			Expect(snapshots[0].Tags).To(ContainElement(MatchRegexp(`^run:[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$`)))
 
 			By("having streamed the gbak backup itself, not the planted one")
 			output, err = s3ResticFor(s3StreamingInstanceName, "dump", "latest", "--tag", "hour", hourBackup)

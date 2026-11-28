@@ -541,8 +541,10 @@ have had on the backup volume (e.g. `/var/lib/firebird/backup/hour/<database>.fb
 taking backups run the Firebird image (or `backup.image`), with restic's binary copied in by a
 `restic-install` init container from the restic `image`. If `gbak` fails, restic saves no snapshot.
 Since each snapshot holds a single database, every snapshot of a run also carries the same
-`run:<timestamp>` tag, the run's UTC start time (e.g. `run:20261128T000000Z`), so
-`restic snapshots --tag run:20261128T000000Z` lists, and restores, a run's databases together.
+`run:<timestamp>-<random>` tag: the run's UTC start time and 6 random hex digits, so two runs
+starting in the same second (e.g. a Job created by hand next to a scheduled one) never share it
+(e.g. `run:20261128T000000Z-a1b2c3`). `restic snapshots --tag run:20261128T000000Z-a1b2c3` lists, and
+restores, a run's databases together.
 
 - **Scheduled backups.** Each `backup.retention` Job streams every database's backup from the live
   server, one snapshot per database, tagged with the frequency, then forgets that frequency's
@@ -670,7 +672,7 @@ Scheduled backups are kept for you to restore by hand, into a new database or ov
   holds the frequency's whole directory; with `s3` only, every snapshot holds a single database's
   backup, `/var/lib/firebird/backup/<frequency>/<database>.fbk`, e.g.
   `restic dump latest --tag hour --path /var/lib/firebird/backup/hour/instance.fbk /var/lib/firebird/backup/hour/instance.fbk > instance.fbk`
-  (`--path` picks that database's own latest snapshot), and the `run:<timestamp>` tag finds every
+  (`--path` picks that database's own latest snapshot), and the `run:<timestamp>-<random>` tag finds every
   database of the same run. The `firebird:<version>` tag tells which Firebird version a backup needs
   to be restored with (that version or a newer one).
 

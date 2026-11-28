@@ -388,6 +388,14 @@ var _ = Describe("Manager", Ordered, func() {
 		// and delete-time backups streamed into the repository, and a
 		// recreated Instance restoring from it only once.
 		instanceS3StreamingBackupSpecs()
+
+		// instanceS3StreamingLoadSpecs
+		// (test/e2e/instance_s3_streaming_load_test.go) streams every
+		// frequency's backup to S3 at once, plus extra hourly runs,
+		// while a writer keeps committing: no Job fails, the writer
+		// never stops, every run gets its own run tag, and every
+		// snapshot restores to a consistent database.
+		instanceS3StreamingLoadSpecs()
 	})
 })
 

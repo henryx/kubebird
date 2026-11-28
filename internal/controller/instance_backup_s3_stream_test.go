@@ -83,7 +83,7 @@ func TestS3Streaming(t *testing.T) {
 }
 
 // runTagPattern matches a streaming run's run tag.
-var runTagPattern = regexp.MustCompile(`run:[0-9]{8}T[0-9]{6}Z`)
+var runTagPattern = regexp.MustCompile(`run:[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}`)
 
 // sameRun checks every backup call carries the same run tag, and returns
 // the calls with it replaced by "run:RUN".
